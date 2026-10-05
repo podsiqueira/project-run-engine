@@ -69,7 +69,8 @@
     "build": "tsc -p tsconfig.build.json && cp -R templates dist/ && chmod +x dist/cli/project-run-cli.js",
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {},
   "devDependencies": {
