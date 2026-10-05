@@ -1,0 +1,85 @@
+{
+  "name": "@incito-labs/project-run-engine",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Provider-agnostic agent orchestration engine for portable workflow execution",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/podsiqueira/incito.git",
+    "directory": "packages/project-run-engine"
+  },
+  "bugs": {
+    "url": "https://github.com/podsiqueira/incito/issues"
+  },
+  "homepage": "https://github.com/podsiqueira/incito/tree/main/packages/project-run-engine#readme",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "project-run": "./dist/cli/project-run-cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./domain": {
+      "types": "./dist/domain/index.d.ts",
+      "import": "./dist/domain/index.js",
+      "default": "./dist/domain/index.js"
+    },
+    "./coordinator": {
+      "types": "./dist/coordinator/index.d.ts",
+      "import": "./dist/coordinator/index.js",
+      "default": "./dist/coordinator/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime/index.d.ts",
+      "import": "./dist/runtime/index.js",
+      "default": "./dist/runtime/index.js"
+    },
+    "./skills": {
+      "types": "./dist/skills/index.d.ts",
+      "import": "./dist/skills/index.js",
+      "default": "./dist/skills/index.js"
+    },
+    "./presets": {
+      "types": "./dist/presets/index.d.ts",
+      "import": "./dist/presets/index.js",
+      "default": "./dist/presets/index.js"
+    },
+    "./project": {
+      "types": "./dist/project/index.d.ts",
+      "import": "./dist/project/index.js",
+      "default": "./dist/project/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "templates",
+    "LICENSE",
+    "README.md",
+    "ARCHITECTURE.md",
+    "CONSUMER-GUIDE.md",
+    "PACKAGING.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && cp -R templates dist/ && chmod +x dist/cli/project-run-cli.js",
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean",
+    "test": "vitest run"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "Apache-2.0"
+}
