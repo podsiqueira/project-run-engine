@@ -410,7 +410,14 @@ export class CoordinatorDecisionEngine {
         };
 
       case "CLARIFY":
-        if (context.blockingAmbiguity) {
+        // Blocking ambiguity is represented the same way every other blocking
+        // condition in this state machine is represented: as a StructuredFinding
+        // on the agent result (see ANALYZE below, and INDEPENDENT_REVIEW/RE_REVIEW/
+        // CONVERGE). `context.blockingAmbiguity` remains a supported explicit
+        // override for a host that wants to force the gate, but it must never be
+        // the ONLY path to detecting a blocking condition — a finding the
+        // Specification agent actually returned must never be lost here.
+        if (context.blockingAmbiguity || hasBlockingFindings(context)) {
           return {
             action: "REQUIRE_HUMAN_INTERVENTION",
             from: "CLARIFY",

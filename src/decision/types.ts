@@ -106,7 +106,20 @@ export interface CoordinatorExecutionContext {
   };
   gateStatus?: "PASS" | "FAIL" | "PENDING" | "BLOCKED";
   findings?: FindingInput[];
+  /**
+   * Explicit host override to force CLARIFY into HUMAN_INTERVENTION_REQUIRED.
+   * This is NOT the primary signal: the decision engine always derives blocking
+   * ambiguity from `findings`/`result.findings` via `hasBlockingFindings()`, the
+   * same mechanism every other blocking gate (ANALYZE, INDEPENDENT_REVIEW,
+   * RE_REVIEW, CONVERGE) uses. Set this only when a host needs to force the gate
+   * for a reason that cannot be expressed as a StructuredFinding.
+   */
   blockingAmbiguity?: boolean;
+  /**
+   * Explicit host override to force ANALYZE into HUMAN_INTERVENTION_REQUIRED.
+   * Same caveat as `blockingAmbiguity` above: `hasBlockingFindings()` is the
+   * primary signal and already derives this from `findings`/`result.findings`.
+   */
   blockingFindings?: boolean;
   human_approved?: boolean;
   human_resolved?: boolean;

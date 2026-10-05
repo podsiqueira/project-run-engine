@@ -18,7 +18,7 @@ import {
   type StepRecord,
   Coordinator,
 } from "../coordinator/coordinator.js";
-import { CoordinatorDecisionEngine } from "../decision/decision-engine.js";
+import { CoordinatorDecisionEngine, hasBlockingFindings } from "../decision/decision-engine.js";
 import { AgentRegistry } from "../agents/agent-registry.js";
 import { AgentDispatcher } from "../agents/agent-dispatcher.js";
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
@@ -396,9 +396,24 @@ export async function executeProjectResume(
   // outcome does not represent the newly modified codebase. We clear context.result
   // so the review/convergence agent is re-dispatched to verify the human fix, and
   // reset remediation_iteration to 0 to grant a fresh budget following human intervention.
+  //
+  // CLARIFY is included in this same treatment, but only when the suspension was
+  // actually caused by a blocking finding (as opposed to some unrelated reason while
+  // CLARIFY's own last result was already clean) — otherwise a clean, already-completed
+  // CLARIFY result would be wastefully (and incorrectly) discarded and the Specification
+  // agent would be re-dispatched for no reason on every resume.
+  const clarifySuspendedByBlockingFinding =
+    resumeState === "CLARIFY" &&
+    hasBlockingFindings({
+      result: persisted.last_result,
+      findings: persisted.findings as FindingInput[] | undefined,
+    });
+
   const isPostHumanEvaluation =
     persisted.state === "HUMAN_INTERVENTION_REQUIRED" &&
-    (resumeState === "RE_REVIEW" || resumeState === "CONVERGE");
+    (resumeState === "RE_REVIEW" ||
+      resumeState === "CONVERGE" ||
+      clarifySuspendedByBlockingFinding);
 
   const remediationIteration = isPostHumanEvaluation
     ? 0
@@ -417,8 +432,11 @@ export async function executeProjectResume(
     findings: persisted.findings as FindingInput[] | undefined,
     human_approved: true,
     human_resolved: true,
-    blockingAmbiguity: undefined,
-    blockingFindings: undefined,
+    // blockingAmbiguity/blockingFindings are intentionally left unset here: they are
+    // derived from `findings` by the decision engine (hasBlockingFindings), not stored
+    // independently. Resetting them to `undefined` previously gave the false impression
+    // that blocking state was being cleared on resume; it is `findings` + `result` above
+    // that actually carry (and, for CLARIFY/RE_REVIEW/CONVERGE, correctly clear) that state.
     execution: {
       execution_id: persisted.execution_id,
       feature: persisted.feature,
