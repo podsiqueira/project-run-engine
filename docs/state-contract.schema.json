@@ -1,0 +1,406 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://incito.local/schemas/coordinator/state-contract-v1.json",
+  "title": "Incito Coordinator State Contract",
+  "description": "Persistent execution state contract for the Incito V1 Coordinator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "execution",
+    "artifacts",
+    "gates",
+    "findings",
+    "evidence",
+    "git",
+    "history"
+  ],
+  "properties": {
+    "version": {
+      "const": "1.0"
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "feature",
+        "branch",
+        "state",
+        "iteration",
+        "remediation_iteration"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "feature": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "INTAKE",
+            "SPECIFY",
+            "CLARIFY",
+            "PLAN",
+            "TASKS",
+            "ANALYZE",
+            "IMPLEMENT",
+            "INDEPENDENT_REVIEW",
+            "REMEDIATION",
+            "RE_REVIEW",
+            "CONVERGE",
+            "READY_FOR_PR",
+            "HUMAN_INTERVENTION_REQUIRED"
+          ]
+        },
+        "iteration": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "remediation_iteration": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "spec": {
+          "$ref": "#/$defs/artifact"
+        },
+        "plan": {
+          "$ref": "#/$defs/artifact"
+        },
+        "tasks": {
+          "$ref": "#/$defs/artifact"
+        },
+        "research": {
+          "$ref": "#/$defs/artifact"
+        },
+        "data_model": {
+          "$ref": "#/$defs/artifact"
+        },
+        "quickstart": {
+          "$ref": "#/$defs/artifact"
+        },
+        "contracts": {
+          "$ref": "#/$defs/artifact"
+        },
+        "checklists": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "specification",
+        "planning",
+        "tasks",
+        "analyze",
+        "implementation",
+        "review",
+        "convergence"
+      ],
+      "properties": {
+        "specification": {
+          "$ref": "#/$defs/gateStatus"
+        },
+        "planning": {
+          "$ref": "#/$defs/gateStatus"
+        },
+        "tasks": {
+          "$ref": "#/$defs/gateStatus"
+        },
+        "analyze": {
+          "$ref": "#/$defs/gateStatus"
+        },
+        "implementation": {
+          "$ref": "#/$defs/gateStatus"
+        },
+        "review": {
+          "$ref": "#/$defs/gateStatus"
+        },
+        "convergence": {
+          "$ref": "#/$defs/gateStatus"
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "commit",
+        "working_tree"
+      ],
+      "properties": {
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "working_tree": {
+          "type": "string",
+          "enum": [
+            "CLEAN",
+            "DIRTY",
+            "KNOWN",
+            "UNKNOWN"
+          ]
+        }
+      }
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stateTransition"
+      }
+    }
+  },
+  "$defs": {
+    "gateStatus": {
+      "type": "string",
+      "enum": [
+        "PENDING",
+        "PASS",
+        "FAIL",
+        "BLOCKED"
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "status"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "$ref": "#/$defs/gateStatus"
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "severity",
+        "category",
+        "status",
+        "evidence",
+        "expected",
+        "actual",
+        "required_remediation"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "FUNCTIONAL",
+            "SECURITY",
+            "ARCHITECTURE",
+            "TEST",
+            "REGRESSION",
+            "CONTRACT",
+            "SPECIFICATION",
+            "OTHER"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "OPEN",
+            "IN_REMEDIATION",
+            "RESOLVED",
+            "WONT_FIX"
+          ]
+        },
+        "location": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "file": {
+              "type": "string",
+              "minLength": 1
+            },
+            "line": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "file"
+          ]
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actual": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required_remediation": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "description",
+        "status",
+        "timestamp"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "FILE",
+            "COMMAND",
+            "TEST",
+            "BUILD",
+            "LINT",
+            "TYPECHECK",
+            "ARTIFACT",
+            "GIT"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reference": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "FAIL"
+          ]
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "stateTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to",
+        "triggeredBy",
+        "evidenceIds",
+        "timestamp"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/state"
+        },
+        "to": {
+          "$ref": "#/$defs/state"
+        },
+        "triggeredBy": {
+          "type": "string",
+          "enum": [
+            "SYSTEM",
+            "AGENT",
+            "GATE",
+            "HUMAN"
+          ]
+        },
+        "agent": {
+          "type": "string"
+        },
+        "evidenceIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "INTAKE",
+        "SPECIFY",
+        "CLARIFY",
+        "PLAN",
+        "TASKS",
+        "ANALYZE",
+        "IMPLEMENT",
+        "INDEPENDENT_REVIEW",
+        "REMEDIATION",
+        "RE_REVIEW",
+        "CONVERGE",
+        "READY_FOR_PR",
+        "HUMAN_INTERVENTION_REQUIRED"
+      ]
+    }
+  }
+}
