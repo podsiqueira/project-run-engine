@@ -11,6 +11,7 @@ import type {
   HostExecutionOptions,
   RoleSkillMetadata,
 } from "../domain/types.js";
+import type { HumanAnswerRecord } from "./human-intervention.js";
 
 export type CoordinatorDecisionAction =
   | "DISPATCH_AGENT"
@@ -123,6 +124,15 @@ export interface CoordinatorExecutionContext {
   blockingFindings?: boolean;
   human_approved?: boolean;
   human_resolved?: boolean;
+  /**
+   * The running, append-only record of every human answer supplied so far across
+   * this execution's resumes. Carried forward on the context object (not cleared on
+   * TRANSITION, unlike `result`/`gateStatus`) purely so `Coordinator.checkpoint()`
+   * can keep re-persisting it on every subsequent checkpoint of this run — the
+   * state store itself has no merge-on-save semantics, so whatever isn't present
+   * on the context at checkpoint time would otherwise be dropped from the file.
+   */
+  humanAnswers?: HumanAnswerRecord[];
   executionOptions?: HostExecutionOptions;
 }
 

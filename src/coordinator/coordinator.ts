@@ -15,6 +15,7 @@ import type {
   RequireHumanInterventionDecision,
 } from "../decision/types.js";
 import { CoordinatorDecisionEngine } from "../decision/decision-engine.js";
+import { deriveHumanQuestions, type HumanInterventionRequired } from "../decision/human-intervention.js";
 import { AgentDispatcher } from "../agents/agent-dispatcher.js";
 import type {
   ExecutionLifecycleState,
@@ -138,6 +139,27 @@ export class Coordinator {
       0;
 
     const rawState = context.execution?.state ?? context.state ?? "INTAKE";
+    const findings = (context.result?.findings ?? context.findings) as
+      | (StructuredFinding | unknown)[]
+      | undefined;
+
+    // Human-in-the-Loop record: computed here, once, from the same findings/reason
+    // the decision that caused this checkpoint already evaluated, so the persisted
+    // record and the structured response a host receives are always derived
+    // identically (see `deriveHumanQuestions`). Only recomputed when we are actually
+    // suspending for human intervention; an in-progress checkpoint leaves any
+    // previously recorded intervention untouched by omitting the field here, since
+    // `human_intervention` describes the MOST RECENT suspension, not the full history.
+    const humanIntervention: HumanInterventionRequired | undefined =
+      status === "HUMAN_INTERVENTION_REQUIRED"
+        ? {
+            executionId,
+            suspendedFrom: suspendedFrom ?? rawState,
+            reason: terminalReason ?? "Human intervention required",
+            questions: deriveHumanQuestions(terminalReason ?? "", findings ?? []),
+            findings: (findings ?? []) as StructuredFinding[],
+          }
+        : undefined;
 
     try {
       await this.stateStore.save({
@@ -155,7 +177,13 @@ export class Coordinator {
         preset,
         context: context.context,
         last_result: (lastResult ?? context.result) as AgentResult | undefined,
-        findings: (context.result?.findings ?? context.findings) as (StructuredFinding | unknown)[] | undefined,
+        findings,
+        human_intervention: humanIntervention,
+        // Carried forward from the context (see CoordinatorExecutionContext.humanAnswers)
+        // since the state store overwrites the whole record on every save rather than
+        // merging — this is what keeps previously recorded answers from being dropped
+        // by a later checkpoint within the same (resumed) run.
+        human_answers: context.humanAnswers,
         terminal_reason: terminalReason,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),

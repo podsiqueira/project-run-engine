@@ -18,7 +18,8 @@ import {
   type StepRecord,
   Coordinator,
 } from "../coordinator/coordinator.js";
-import { CoordinatorDecisionEngine, hasBlockingFindings } from "../decision/decision-engine.js";
+import { CoordinatorDecisionEngine, hasBlockingFindings, isExplicitlyBlocked } from "../decision/decision-engine.js";
+import type { HumanAnswer, HumanAnswerRecord } from "../decision/human-intervention.js";
 import { AgentRegistry } from "../agents/agent-registry.js";
 import { AgentDispatcher } from "../agents/agent-dispatcher.js";
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
@@ -90,6 +91,14 @@ export interface ProjectResumeOptions {
   decisionEngine?: CoordinatorDecisionEngine;
   maxSteps?: number;
   onStep?: (record: StepRecord) => void | Promise<void>;
+  /**
+   * Human answers to the questions returned on the prior HUMAN_INTERVENTION_REQUIRED
+   * suspension (see `HumanInterventionRequired.questions`). Persisted durably on the
+   * execution's checkpoint record for audit purposes (what was asked/answered/when).
+   * Answers do NOT directly mutate findings or force a particular transition — the
+   * responsible agent is still re-dispatched to independently verify the human's fix.
+   */
+  humanAnswers?: HumanAnswer[];
 }
 
 /**
@@ -309,6 +318,48 @@ export async function executeProjectRun(
 }
 
 /**
+ * States whose HUMAN_INTERVENTION_REQUIRED exit is reached EXCLUSIVELY via a blocking
+ * condition (findings, FAIL, or BLOCKED) under the current decision engine — there is
+ * no code path in this preset that suspends from these states for an unrelated reason.
+ * Their stale result can therefore always be safely cleared on resume, forcing a fresh
+ * re-verification dispatch, without first checking the persisted snapshot.
+ */
+const ALWAYS_REVERIFY_ON_RESUME: ReadonlySet<CoordinatorState> = new Set(["RE_REVIEW", "CONVERGE"]);
+
+/**
+ * States whose HUMAN_INTERVENTION_REQUIRED exit MAY also be reached via an explicit
+ * host-supplied override (e.g. `blockingAmbiguity`/`blockingFindings`) or some other
+ * reason unrelated to the agent's own result — so an already-clean persisted result
+ * must not be discarded unconditionally. Resume only forces re-verification here when
+ * the persisted snapshot itself still shows a genuine blocking condition.
+ */
+const CONDITIONALLY_REVERIFY_ON_RESUME: ReadonlySet<CoordinatorState> = new Set(["CLARIFY", "ANALYZE"]);
+
+/**
+ * Determines whether a HUMAN_INTERVENTION_REQUIRED suspension from `resumeState` should
+ * force the responsible agent to be re-dispatched and re-verified on resume, as opposed
+ * to trusting the already-persisted (clean) result and letting the decision engine
+ * transition past it immediately.
+ *
+ * Extracted as a single, reusable mechanism — rather than duplicated per-state checks —
+ * specifically so that extending this behavior to a new gate (as this function already
+ * does for both CLARIFY and ANALYZE) never again requires rediscovering and copying the
+ * CLARIFY-specific logic that originally lived inline here.
+ */
+function shouldReverifyOnResume(
+  resumeState: CoordinatorState,
+  snapshot: { result?: PersistedExecutionState["last_result"]; findings?: FindingInput[] },
+): boolean {
+  if (ALWAYS_REVERIFY_ON_RESUME.has(resumeState)) {
+    return true;
+  }
+  if (CONDITIONALLY_REVERIFY_ON_RESUME.has(resumeState)) {
+    return isExplicitlyBlocked(snapshot) || hasBlockingFindings(snapshot);
+  }
+  return false;
+}
+
+/**
  * Resumes an existing execution that was suspended or reached HUMAN_INTERVENTION_REQUIRED.
  * Restores context without re-executing already completed agents.
  */
@@ -392,32 +443,46 @@ export async function executeProjectResume(
     options.runtime ?? persisted.runtime ?? config.runtime.default_runtime ?? "ANTIGRAVITY";
 
   // For states where human intervention was required because an evaluation gate failed
-  // (e.g. RE_REVIEW or CONVERGE reached max remediation limit), the previous failure
-  // outcome does not represent the newly modified codebase. We clear context.result
-  // so the review/convergence agent is re-dispatched to verify the human fix, and
-  // reset remediation_iteration to 0 to grant a fresh budget following human intervention.
-  //
-  // CLARIFY is included in this same treatment, but only when the suspension was
-  // actually caused by a blocking finding (as opposed to some unrelated reason while
-  // CLARIFY's own last result was already clean) — otherwise a clean, already-completed
-  // CLARIFY result would be wastefully (and incorrectly) discarded and the Specification
-  // agent would be re-dispatched for no reason on every resume.
-  const clarifySuspendedByBlockingFinding =
-    resumeState === "CLARIFY" &&
-    hasBlockingFindings({
+  // (e.g. RE_REVIEW or CONVERGE reached max remediation limit, or CLARIFY/ANALYZE hit a
+  // blocking condition), the previous failure outcome does not represent the human's
+  // fix. We clear context.result so the responsible agent is re-dispatched to verify
+  // the fix rather than trusting the stale blocking result, and reset
+  // remediation_iteration to 0 to grant a fresh budget following human intervention.
+  const isPostHumanEvaluation =
+    persisted.state === "HUMAN_INTERVENTION_REQUIRED" &&
+    shouldReverifyOnResume(resumeState, {
       result: persisted.last_result,
       findings: persisted.findings as FindingInput[] | undefined,
     });
 
-  const isPostHumanEvaluation =
-    persisted.state === "HUMAN_INTERVENTION_REQUIRED" &&
-    (resumeState === "RE_REVIEW" ||
-      resumeState === "CONVERGE" ||
-      clarifySuspendedByBlockingFinding);
-
   const remediationIteration = isPostHumanEvaluation
     ? 0
     : (persisted.remediation_iteration ?? 0);
+
+  // Human-in-the-Loop answers: persist them durably, immediately, before anything else
+  // happens — so the audit trail (what was asked, what was answered, when) survives
+  // even if the resumed run below fails again right away. Answers are NEVER used to
+  // mutate the original finding or to force a particular outcome; the responsible
+  // agent is still re-dispatched (above) and its fresh result is what the decision
+  // engine actually trusts, consistent with the Finding Contract's "a finding may be
+  // marked RESOLVED only after ... the Independent Review Agent has verified the
+  // correction" — the same principle extended to a human's clarification answer.
+  const existingAnswers = persisted.human_answers ?? [];
+  const newAnswers: HumanAnswerRecord[] = (options.humanAnswers ?? []).map((answer: HumanAnswer) => ({
+    ...answer,
+    recordedAt: new Date().toISOString(),
+  }));
+  const mergedAnswers = [...existingAnswers, ...newAnswers];
+
+  if (newAnswers.length > 0) {
+    try {
+      await stateStore.save({ ...persisted, human_answers: mergedAnswers });
+    } catch {
+      // Non-fatal: the resume attempt below still proceeds. A failure to persist the
+      // answer record is reported as part of the FAILED result if the resume itself
+      // then also fails, but must never block a resume that would otherwise succeed.
+    }
+  }
 
   const context: CoordinatorExecutionContext = {
     execution_id: persisted.execution_id,
@@ -432,11 +497,13 @@ export async function executeProjectResume(
     findings: persisted.findings as FindingInput[] | undefined,
     human_approved: true,
     human_resolved: true,
+    humanAnswers: mergedAnswers.length > 0 ? mergedAnswers : undefined,
     // blockingAmbiguity/blockingFindings are intentionally left unset here: they are
     // derived from `findings` by the decision engine (hasBlockingFindings), not stored
     // independently. Resetting them to `undefined` previously gave the false impression
     // that blocking state was being cleared on resume; it is `findings` + `result` above
-    // that actually carry (and, for CLARIFY/RE_REVIEW/CONVERGE, correctly clear) that state.
+    // that actually carry (and, for CLARIFY/ANALYZE/RE_REVIEW/CONVERGE, correctly clear)
+    // that state.
     execution: {
       execution_id: persisted.execution_id,
       feature: persisted.feature,

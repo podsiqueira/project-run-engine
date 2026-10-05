@@ -3,12 +3,17 @@
 
 import * as path from "node:path";
 import { runProjectDoctor, formatDoctorReport } from "../project/doctor.js";
-import {
-  executeProjectRun,
-  executeProjectResume,
-} from "../project/project-run.js";
 import { runProjectInit, formatInitReport } from "../project/bootstrap.js";
+import { startProjectRun, resumeProjectRun } from "../host/project-run-host.js";
 import type { AgentRuntime } from "../domain/types.js";
+
+// The CLI is one possible consumer of the engine's public orchestration API, not the
+// orchestration layer itself: `run`/`resume` below go through the same host-facing
+// `startProjectRun`/`resumeProjectRun` entry points any interactive coding-agent host
+// (Claude Code, Cursor, Antigravity, Codex) would use, rather than calling
+// `executeProjectRun`/`executeProjectResume` (or Coordinator internals) directly. No
+// runtime adapters are wired in here, matching this binary's existing behavior: a real
+// deployment supplies its own adapters via the programmatic API (see CONSUMER-GUIDE.md).
 
 function printHelp(): void {
   console.log(`
@@ -119,10 +124,11 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     }
 
     try {
-      const result = await executeProjectResume({
+      const result = await resumeProjectRun({
         projectRoot,
         executionId,
         runtime,
+        adapters: [],
       });
 
       if (result.status === "BLOCKED_MISSING_SKILLS") {
@@ -163,15 +169,12 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
   }
 
   try {
-    const result = await executeProjectRun({
+    const result = await startProjectRun({
       projectRoot,
-      explicitFeature,
-      explicitBranch,
-      context: {
-        state: "INTAKE",
-        runtime,
-      },
+      feature: explicitFeature,
+      branch: explicitBranch,
       runtime,
+      adapters: [],
     });
 
     if (result.status === "BLOCKED_MISSING_SKILLS") {

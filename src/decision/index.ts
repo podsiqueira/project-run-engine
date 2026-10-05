@@ -2,3 +2,4 @@
 
 export * from "./types.js";
 export * from "./decision-engine.js";
+export * from "./human-intervention.js";

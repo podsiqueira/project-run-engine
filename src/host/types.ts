@@ -1,0 +1,106 @@
+// packages/project-run-engine/src/host/types.ts
+//
+// Provider-agnostic Host Skill Contract.
+//
+// This is the public interface a host agent (Claude Code, Cursor, Antigravity, Codex,
+// or any other interactive coding-agent environment) uses to invoke Project Run
+// without parsing CLI stdout and without reimplementing the coordinator/state-machine.
+//
+// The engine owns: workflow state, coordinator decisions, state transitions,
+// checkpoints/persistence, clarification gates, human-in-the-loop suspension/resume,
+// role dispatch contracts, workflow sequencing, and convergence rules.
+//
+// The host owns: the conversational interface, the actual slash command/tool/skill
+// registration (e.g. `/project-engine-run "<feature>"`), presenting questions to the
+// human, collecting human answers, invoking/resuming the engine, and providing the
+// runtime-specific agent execution mechanism (an `AgentRuntimeAdapter[]`, exactly as
+// the pre-existing programmatic API already requires).
+
+import type {
+  AgentRole,
+  AgentRuntime,
+  AgentSkillRequirement,
+  CoordinatorState,
+  HostExecutionOptions,
+  StructuredFinding,
+} from "../domain/types.js";
+import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
+import type { StepRecord } from "../coordinator/coordinator.js";
+import type { ProjectWorkflowConfig } from "../project/project-config.js";
+import type { HumanAnswer, HumanInterventionRequired } from "../decision/human-intervention.js";
+import type { ProjectRunEvent } from "./events.js";
+
+export interface ProjectRunHostRequest {
+  /** Workspace root. Defaults to `process.cwd()`. */
+  projectRoot?: string;
+  /** Feature identifier. Auto-discovered from the git branch/specs/ when omitted. */
+  feature?: string;
+  /** Git branch. Auto-discovered when omitted. */
+  branch?: string;
+  /** Execution identifier. A new one is generated when omitted. */
+  executionId?: string;
+  runtime?: AgentRuntime;
+  /**
+   * The host's runtime-specific agent execution mechanism — exactly the same
+   * `AgentRuntimeAdapter[]` the pre-existing `executeProjectRun` already accepts.
+   * This is how the host provides "how Claude/Cursor/Antigravity/Codex executes a
+   * role's work," without the engine ever needing to know which one it is.
+   */
+  adapters: AgentRuntimeAdapter[];
+  config?: ProjectWorkflowConfig;
+  configPath?: string;
+  executionOptions?: HostExecutionOptions;
+  maxSteps?: number;
+  /** Optional progress/event sink — see `ProjectRunEvent` in `./events.js`. */
+  onEvent?: (event: ProjectRunEvent) => void | Promise<void>;
+}
+
+export interface ProjectRunResumeRequest {
+  executionId: string;
+  projectRoot?: string;
+  adapters: AgentRuntimeAdapter[];
+  runtime?: AgentRuntime;
+  config?: ProjectWorkflowConfig;
+  configPath?: string;
+  executionOptions?: HostExecutionOptions;
+  maxSteps?: number;
+  /**
+   * Structured answers to the questions returned on the prior
+   * HUMAN_INTERVENTION_REQUIRED suspension. See `ProjectRunHostResponse.humanIntervention`.
+   */
+  humanAnswers?: HumanAnswer[];
+  onEvent?: (event: ProjectRunEvent) => void | Promise<void>;
+}
+
+export type ProjectRunHostStatus =
+  | "COMPLETED"
+  | "HUMAN_INTERVENTION_REQUIRED"
+  | "BLOCKED_MISSING_SKILLS"
+  | "FAILED";
+
+export interface ProjectRunHostResponse {
+  status: ProjectRunHostStatus;
+  executionId: string;
+  state: CoordinatorState;
+  stepsCount: number;
+  history: StepRecord[];
+  findings: StructuredFinding[];
+  /** Present if and only if `status === "HUMAN_INTERVENTION_REQUIRED"`. */
+  humanIntervention?: HumanInterventionRequired;
+  /** Present if and only if `status === "BLOCKED_MISSING_SKILLS"`. */
+  role?: AgentRole;
+  missingSkills?: AgentSkillRequirement["id"][];
+  /** Present if and only if `status === "FAILED"` (or "BLOCKED_MISSING_SKILLS"). */
+  failureReason?: string;
+}
+
+/**
+ * The provider-agnostic Host Skill Contract itself. A host agent's slash command /
+ * tool / skill implementation calls `start()` once per new execution and `resume()`
+ * whenever the human has answered a `HUMAN_INTERVENTION_REQUIRED` request (or simply
+ * wants to retry a previously interrupted run).
+ */
+export interface ProjectRunHost {
+  start(request: ProjectRunHostRequest): Promise<ProjectRunHostResponse>;
+  resume(request: ProjectRunResumeRequest): Promise<ProjectRunHostResponse>;
+}

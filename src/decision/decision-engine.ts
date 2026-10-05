@@ -174,6 +174,30 @@ export function hasActionableFindings(context: CoordinatorExecutionContext): boo
   return false;
 }
 
+/**
+ * Evaluates whether the execution context carries a blocking condition that must
+ * prevent a transition from silently proceeding as if the agent had returned PASS.
+ *
+ * A blocking condition exists when any of the following is true:
+ * 1. The result (or context) carries at least one actionable, blocking finding
+ *    (CRITICAL/HIGH/MEDIUM by default, or any finding explicitly marked `blocking: true`).
+ * 2. The result's `status` is `"FINDINGS"` with an (unusually) empty findings array —
+ *    treated as blocking rather than silently passed, since the agent explicitly
+ *    reported findings exist.
+ * 3. The result's `status` is `"FAIL"` — the agent could not complete its assigned
+ *    activity. A flat failure must never be silently treated as a passed gate.
+ *
+ * Note: `status === "BLOCKED"` is deliberately NOT folded in here — see
+ * `isExplicitlyBlocked()` below for why it is treated as a distinct, higher-priority
+ * signal rather than just another case of "blocking findings."
+ *
+ * This is the single source of truth every findings/FAIL-driven gate in the state
+ * machine consults (directly or via a state-specific OR with an explicit host
+ * override). Extending it here — rather than adding ad hoc status checks per state —
+ * is what makes the FAIL fix apply uniformly everywhere a blocking condition can
+ * occur, without resurrecting the class of bug where one gate's wiring silently
+ * diverges from every other gate's (see CLARIFY's historical `blockingAmbiguity` defect).
+ */
 export function hasBlockingFindings(context: CoordinatorExecutionContext): boolean {
   const checkList = (list: unknown[] | undefined): boolean => {
     if (!Array.isArray(list) || list.length === 0) return false;
@@ -181,15 +205,21 @@ export function hasBlockingFindings(context: CoordinatorExecutionContext): boole
   };
 
   if (context.result) {
+    const status = context.result.status;
+
+    if (status === "FAIL") {
+      return true;
+    }
+
     if (Array.isArray(context.result.findings)) {
       if (context.result.findings.length > 0) {
         return checkList(context.result.findings as unknown[]);
       }
-      if (context.result.status !== "FINDINGS") {
+      if (status !== "FINDINGS") {
         return false;
       }
     }
-    if (context.result.status === "FINDINGS") {
+    if (status === "FINDINGS") {
       return true;
     }
   }
@@ -199,6 +229,24 @@ export function hasBlockingFindings(context: CoordinatorExecutionContext): boole
   }
 
   return false;
+}
+
+/**
+ * Evaluates whether the agent explicitly reported that it cannot safely continue
+ * without a human decision (`status: "BLOCKED"`, per the Agent Contract).
+ *
+ * This is deliberately a SEPARATE, higher-priority signal from `hasBlockingFindings()`:
+ * a blocking finding or a flat FAIL describes a problem that remediation (an automated
+ * retry/fix cycle) might reasonably address, so at INDEPENDENT_REVIEW / RE_REVIEW /
+ * CONVERGE those route into the bounded remediation loop before escalating to a human.
+ * BLOCKED describes the opposite situation — the agent is explicitly saying a human
+ * decision is required right now — so routing it into a remediation loop would just
+ * waste an iteration re-running an agent that already said it cannot proceed without
+ * a human. BLOCKED therefore always bypasses the remediation loop and goes straight
+ * to REQUIRE_HUMAN_INTERVENTION, at every state.
+ */
+export function isExplicitlyBlocked(context: CoordinatorExecutionContext): boolean {
+  return context.result?.status === "BLOCKED";
 }
 
 /**
@@ -402,6 +450,17 @@ export class CoordinatorDecisionEngine {
       }
 
       case "SPECIFY":
+        // SPECIFY has no findings-based gate by design (the preset expects a plain
+        // PASS here), but a BLOCKED or FAIL result from the Specification agent must
+        // still never be silently treated as PASS.
+        if (isExplicitlyBlocked(context) || hasBlockingFindings(context)) {
+          return {
+            action: "REQUIRE_HUMAN_INTERVENTION",
+            from: "SPECIFY",
+            state: "HUMAN_INTERVENTION_REQUIRED",
+            reason: "Specification agent could not safely complete this state",
+          };
+        }
         return {
           action: "TRANSITION",
           from: "SPECIFY",
@@ -417,7 +476,7 @@ export class CoordinatorDecisionEngine {
         // override for a host that wants to force the gate, but it must never be
         // the ONLY path to detecting a blocking condition — a finding the
         // Specification agent actually returned must never be lost here.
-        if (context.blockingAmbiguity || hasBlockingFindings(context)) {
+        if (context.blockingAmbiguity || isExplicitlyBlocked(context) || hasBlockingFindings(context)) {
           return {
             action: "REQUIRE_HUMAN_INTERVENTION",
             from: "CLARIFY",
@@ -433,6 +492,14 @@ export class CoordinatorDecisionEngine {
         };
 
       case "PLAN":
+        if (isExplicitlyBlocked(context) || hasBlockingFindings(context)) {
+          return {
+            action: "REQUIRE_HUMAN_INTERVENTION",
+            from: "PLAN",
+            state: "HUMAN_INTERVENTION_REQUIRED",
+            reason: "Architecture agent could not safely complete planning",
+          };
+        }
         return {
           action: "TRANSITION",
           from: "PLAN",
@@ -441,6 +508,14 @@ export class CoordinatorDecisionEngine {
         };
 
       case "TASKS":
+        if (isExplicitlyBlocked(context) || hasBlockingFindings(context)) {
+          return {
+            action: "REQUIRE_HUMAN_INTERVENTION",
+            from: "TASKS",
+            state: "HUMAN_INTERVENTION_REQUIRED",
+            reason: "Architecture agent could not safely complete task breakdown",
+          };
+        }
         return {
           action: "TRANSITION",
           from: "TASKS",
@@ -449,7 +524,7 @@ export class CoordinatorDecisionEngine {
         };
 
       case "ANALYZE":
-        if (context.blockingFindings || hasBlockingFindings(context)) {
+        if (context.blockingFindings || isExplicitlyBlocked(context) || hasBlockingFindings(context)) {
           return {
             action: "REQUIRE_HUMAN_INTERVENTION",
             from: "ANALYZE",
@@ -465,6 +540,14 @@ export class CoordinatorDecisionEngine {
         };
 
       case "IMPLEMENT":
+        if (isExplicitlyBlocked(context) || hasBlockingFindings(context)) {
+          return {
+            action: "REQUIRE_HUMAN_INTERVENTION",
+            from: "IMPLEMENT",
+            state: "HUMAN_INTERVENTION_REQUIRED",
+            reason: "Implementation agent could not safely complete implementation",
+          };
+        }
         return {
           action: "TRANSITION",
           from: "IMPLEMENT",
@@ -473,6 +556,14 @@ export class CoordinatorDecisionEngine {
         };
 
       case "INDEPENDENT_REVIEW":
+        if (isExplicitlyBlocked(context)) {
+          return {
+            action: "REQUIRE_HUMAN_INTERVENTION",
+            from: "INDEPENDENT_REVIEW",
+            state: "HUMAN_INTERVENTION_REQUIRED",
+            reason: "Independent Review agent requires a human decision before continuing",
+          };
+        }
         if (hasBlockingFindings(context)) {
           return {
             action: "TRANSITION",
@@ -489,6 +580,14 @@ export class CoordinatorDecisionEngine {
         };
 
       case "REMEDIATION":
+        if (isExplicitlyBlocked(context) || hasBlockingFindings(context)) {
+          return {
+            action: "REQUIRE_HUMAN_INTERVENTION",
+            from: "REMEDIATION",
+            state: "HUMAN_INTERVENTION_REQUIRED",
+            reason: "Remediation agent could not safely complete remediation",
+          };
+        }
         return {
           action: "TRANSITION",
           from: "REMEDIATION",
@@ -497,6 +596,14 @@ export class CoordinatorDecisionEngine {
         };
 
       case "RE_REVIEW":
+        if (isExplicitlyBlocked(context)) {
+          return {
+            action: "REQUIRE_HUMAN_INTERVENTION",
+            from: "RE_REVIEW",
+            state: "HUMAN_INTERVENTION_REQUIRED",
+            reason: "Independent Review agent requires a human decision before continuing",
+          };
+        }
         if (hasBlockingFindings(context)) {
           if (remediationIteration < this.maxRemediationIterations) {
             return {
@@ -522,6 +629,14 @@ export class CoordinatorDecisionEngine {
         };
 
       case "CONVERGE":
+        if (isExplicitlyBlocked(context)) {
+          return {
+            action: "REQUIRE_HUMAN_INTERVENTION",
+            from: "CONVERGE",
+            state: "HUMAN_INTERVENTION_REQUIRED",
+            reason: "Convergence agent requires a human decision before continuing",
+          };
+        }
         if (hasBlockingFindings(context) || context.result?.status === "FAIL") {
           if (remediationIteration < this.maxRemediationIterations) {
             return {

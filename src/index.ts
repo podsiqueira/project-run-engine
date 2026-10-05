@@ -23,3 +23,6 @@ export * from "./presets/index.js";
 
 // Project configuration, runner, and doctor
 export * from "./project/index.js";
+
+// Provider-agnostic Host Skill Contract (Claude Code / Cursor / Antigravity / Codex)
+export * from "./host/index.js";

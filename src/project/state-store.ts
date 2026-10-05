@@ -14,6 +14,7 @@ import {
   StateVersionUnsupportedError,
 } from "../domain/types.js";
 import type { StepRecord } from "../coordinator/coordinator.js";
+import type { HumanInterventionRequired, HumanAnswerRecord } from "../decision/human-intervention.js";
 
 export const CURRENT_STATE_SCHEMA_VERSION = 1;
 
@@ -42,6 +43,22 @@ export interface PersistedExecutionState {
   findings?: (StructuredFinding | unknown)[];
   history?: StepRecord[];
   terminal_reason?: string;
+  /**
+   * The most recent Human-in-the-Loop request the engine raised: why the workflow
+   * stopped (`reason`), which state it stopped in (`suspendedFrom`), and the
+   * structured questions a host must present. Overwritten each time a new
+   * HUMAN_INTERVENTION_REQUIRED suspension occurs; the running audit trail of
+   * answers lives separately in `human_answers` (below), which is append-only.
+   */
+  human_intervention?: HumanInterventionRequired;
+  /**
+   * Append-only record of every human answer ever supplied for this execution,
+   * across every resume. Persisted durably as soon as a resume request supplies
+   * answers, independent of whether the resumed run subsequently succeeds — so the
+   * audit trail (what was asked, what was answered, when) survives even if the
+   * resumed execution immediately fails again.
+   */
+  human_answers?: HumanAnswerRecord[];
   created_at: string;
   updated_at: string;
 }
