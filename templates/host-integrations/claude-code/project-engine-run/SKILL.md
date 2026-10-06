@@ -29,6 +29,29 @@ and never calls any Claude/Anthropic API.** Every piece of role-specific work be
 performed by continuing to use your own Read/Edit/Bash/Grep tools in this same
 conversation — exactly as you would for any other task the user asked you to do.
 
+## Truthfulness (read before performing any step)
+
+The engine trusts the `AgentResult` you submit as the authoritative record of what
+happened. It does not re-run your tests, re-check your files, or verify your claims
+for most states — your honesty at this boundary is what keeps the whole workflow
+trustworthy. Therefore:
+
+> **Never claim that a command, test, file change, review, or validation was
+> performed unless you actually performed it in the current session.**
+
+Concretely:
+- Only set `status: "PASS"` after you actually did the work and it actually succeeded.
+- Only report a passing test in `evidence` after you actually ran it in this session —
+  quote the real command and its real output, not a plausible-sounding one.
+- Only list a file as created/modified/reviewed if you actually used a tool to do so —
+  check your own tool-call history for this step before writing the result, don't
+  rely on memory or assumption.
+- If something is uncertain, incomplete, or you ran out of time/context to verify it,
+  report that honestly (`"FAIL"` or a `"FINDINGS"` entry describing exactly what's
+  unverified) rather than rounding up to `"PASS"`.
+- Never populate `findings`/`evidence` with content you did not derive from genuine
+  work in this step. An empty `evidence: []` is honest; a fabricated one is not.
+
 ## User Input
 
 ```text

@@ -346,11 +346,38 @@ project-run engine submit-step --json '{"executionId":"...","stepId":"...","resu
 project-run engine start --json '{"feature":"004-campaigns-and-lead-attribution"}' --dir <repo>
 ```
 
+Note that every example above omits `"runtime"` from the JSON payload entirely — this
+is intentional, not an oversight. The engine resolves the runtime to use from
+`.project-run/config.json`'s `runtime.default_runtime` whenever a call doesn't specify
+one explicitly:
+
+```text
+explicit "runtime" in this call's JSON payload
+    ?? a runtime already recorded on the execution (e.g. resuming one)
+    ?? this project's configured runtime.default_runtime
+    ?? the engine's historical fallback
+```
+
+So a project whose `.project-run/config.json` sets
+`"runtime": { "default_runtime": "CLAUDE_CODE" }` never needs `"runtime":"CLAUDE_CODE"`
+repeated on every `next-step`/`submit-step`/`start` call — set it once, in config, and
+omit it from every call thereafter. Pass `"runtime"` explicitly only when a single call
+needs to override the project's configured default (see `ARCHITECTURE.md` §4.14 for the
+full precedence and where it's resolved).
+
 See `templates/host-integrations/claude-code/project-engine-run/SKILL.md` for a
 complete reference skill built on the pull-based step API — it drives the full
 workflow, including the Human-in-the-Loop round trip, entirely within the same Claude
 Code session, with no nested agent process ever spawned. See `ARCHITECTURE.md` §4.11
 for the full step contract and why pull-mode is what makes this possible.
+
+The engine never knows which host is calling it: the host is solely responsible for
+performing the requested role's work (using whatever tools it has) and returning an
+honest `AgentResult`. This holds identically whether the host is Claude Code (the only
+one genuinely validated so far — see `ARCHITECTURE.md` §4.12–§4.13), Antigravity (a
+supported runtime identifier and integration target, not yet live-validated), or a
+future Cursor/Codex/MCP integration (tracked as backlog in `docs/backlog.md`, not
+implemented in this package).
 
 ---
 
