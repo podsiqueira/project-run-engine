@@ -72,7 +72,23 @@ export interface ProjectRunResumeRequest {
   onEvent?: (event: ProjectRunEvent) => void | Promise<void>;
 }
 
+export interface ProjectRunStatusRequest {
+  executionId: string;
+  projectRoot?: string;
+}
+
+/**
+ * - `RUNNING`: a persisted execution mid-sequence, observable only via `status()` —
+ *   `start()`/`resume()` always run the coordinator loop to a terminal or paused point
+ *   before returning, so neither ever itself returns `RUNNING`; `status()` can, if the
+ *   process driving a previous `start()`/`resume()` call exited (crashed, was killed,
+ *   or simply disappeared) between two checkpoints.
+ * - `HUMAN_INTERVENTION_REQUIRED` / `BLOCKED_MISSING_SKILLS`: non-terminal, actionable —
+ *   see `ProjectRunHostResponse.terminal`.
+ * - `COMPLETED` / `FAILED`: terminal — no further `resume()` call will progress them.
+ */
 export type ProjectRunHostStatus =
+  | "RUNNING"
   | "COMPLETED"
   | "HUMAN_INTERVENTION_REQUIRED"
   | "BLOCKED_MISSING_SKILLS"
@@ -80,6 +96,14 @@ export type ProjectRunHostStatus =
 
 export interface ProjectRunHostResponse {
   status: ProjectRunHostStatus;
+  /**
+   * `true` for `COMPLETED`/`FAILED` (no further `resume()` call can progress this
+   * execution); `false` for every other status, including `BLOCKED_MISSING_SKILLS`
+   * (resuming again after the host installs the missing skill is expected to work,
+   * since the underlying suspended checkpoint — if any — was never touched by the
+   * failed attempt).
+   */
+  terminal: boolean;
   executionId: string;
   state: CoordinatorState;
   stepsCount: number;
@@ -96,11 +120,15 @@ export interface ProjectRunHostResponse {
 
 /**
  * The provider-agnostic Host Skill Contract itself. A host agent's slash command /
- * tool / skill implementation calls `start()` once per new execution and `resume()`
+ * tool / skill implementation calls `start()` once per new execution, `resume()`
  * whenever the human has answered a `HUMAN_INTERVENTION_REQUIRED` request (or simply
- * wants to retry a previously interrupted run).
+ * wants to retry a previously interrupted run), and `status()` to read back a
+ * persisted execution's current state without attempting to advance it — the
+ * mechanism that lets a different process/host instance recover an execution it did
+ * not itself start (see `ARCHITECTURE.md` §4.4, "Restart and multi-host recovery").
  */
 export interface ProjectRunHost {
   start(request: ProjectRunHostRequest): Promise<ProjectRunHostResponse>;
   resume(request: ProjectRunResumeRequest): Promise<ProjectRunHostResponse>;
+  status(request: ProjectRunStatusRequest): Promise<ProjectRunHostResponse>;
 }

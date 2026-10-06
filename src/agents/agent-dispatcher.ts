@@ -38,22 +38,28 @@ export class AgentDispatcher {
     this.adapters.set(adapter.runtime, adapter);
   }
 
-  async dispatch(
+  /**
+   * Resolves the agent role/runtime, enriches the request with capability/skill
+   * metadata, and validates required skills — everything `dispatch()` does EXCEPT
+   * looking up and invoking a runtime adapter.
+   *
+   * Extracted so the pull-based step API (`Coordinator.prepareNextAction()`,
+   * `src/host/project-run-step.ts`) can reuse the exact same enrichment and skill
+   * validation `dispatch()` performs — including the Phase 3 Closure fix preferring
+   * the registry definition's skills over the preset's defaults — without requiring
+   * a real `AgentRuntimeAdapter` to exist at all. A pull-based host IS the agent
+   * runtime for this execution; there is nothing for an adapter to do here.
+   *
+   * Throws `SkillValidationError` exactly as `dispatch()` does when a required skill
+   * is unavailable. Throws the same `AgentRegistry.resolve()` error for an
+   * unsupported role/runtime combination.
+   */
+  async prepareRequest(
     request: AgentDispatchRequest,
     runtime: AgentRuntime,
-    options?: HostExecutionOptions,
-  ): Promise<AgentResult> {
-    // Resolve the agent first so unsupported role/runtime combinations
-    // fail before any runtime adapter is considered for execution.
+  ): Promise<AgentDispatchRequest> {
+    // Resolve the agent first so unsupported role/runtime combinations fail fast.
     const definition = this.registry.resolve(request.role, runtime);
-
-    const adapter = this.adapters.get(runtime);
-
-    if (!adapter) {
-      throw new Error(
-        `No runtime adapter registered for runtime: ${runtime}`,
-      );
-    }
 
     // Enrich request with capability, skill, and skill metadata from registered definition
     // when they are not explicitly specified on the incoming request, preserving object identity.
@@ -67,7 +73,14 @@ export class AgentDispatcher {
       request.skill_metadata = definition.skillMetadata;
     }
 
-    const rawSkills = request.skills ?? definition.skills ?? [];
+    // Prefer the registry definition's skills (built from the consuming project's own
+    // `.project-run/config.json`, including any explicit `required: false` override)
+    // over the decision engine's preset-derived defaults on `request.skills`. For the
+    // default registry (no custom config), these are identical content anyway — the
+    // preset is literally what `createDefaultAgentRegistry()` derives definitions
+    // from — so this only changes behavior when a consumer actually customizes their
+    // config, which is precisely when their customization should take effect.
+    const rawSkills = definition.skills ?? request.skills ?? [];
 
     // Validate required skills before executing the agent
     if (this.skillValidator) {
@@ -115,7 +128,33 @@ export class AgentDispatcher {
       request.required_skills = normalizedSkills;
     }
 
-    const effectiveOptions = options ?? request.options;
-    return adapter.execute(request, effectiveOptions);
+    return request;
+  }
+
+  async dispatch(
+    request: AgentDispatchRequest,
+    runtime: AgentRuntime,
+    options?: HostExecutionOptions,
+  ): Promise<AgentResult> {
+    // Resolve the agent first so unsupported role/runtime combinations fail before
+    // any runtime adapter is considered for execution (preserved precedence from
+    // before this method was split — registry.resolve() is called again inside
+    // prepareRequest() below, but it is a cheap Map lookup, not a correctness
+    // concern, and keeping it there is what lets prepareRequest() be called
+    // standalone, without dispatch(), from the pull-based step API).
+    this.registry.resolve(request.role, runtime);
+
+    const adapter = this.adapters.get(runtime);
+
+    if (!adapter) {
+      throw new Error(
+        `No runtime adapter registered for runtime: ${runtime}`,
+      );
+    }
+
+    const enrichedRequest = await this.prepareRequest(request, runtime);
+
+    const effectiveOptions = options ?? enrichedRequest.options;
+    return adapter.execute(enrichedRequest, effectiveOptions);
   }
 }

@@ -95,6 +95,12 @@ Section 4 below.
 
 ## 4. Host-Agent Orchestration Model
 
+> **Project Run is an agent-orchestrated workflow capability, not fundamentally a CLI
+> application.** The CLI (`project-run-cli.ts`) is a compatibility/debugging/local
+> development interface built on top of the same `ProjectRunHost` contract an AI
+> coding-agent host uses — it is one consumer of the capability, not the capability
+> itself. See §4.5.
+
 `project-run-engine` is designed to be invoked interactively from an AI coding-agent
 environment — Claude Code, Cursor, Antigravity, Codex, or any other host capable of
 running a slash command / tool / skill and executing role-specific work. The intended
@@ -103,6 +109,15 @@ end-user experience is conceptually:
 ```text
 /project-engine-run "004-campaigns-and-lead-attribution"
 ```
+
+**`/project-engine-run` is a host-level invocation convention; `project-engine-run`
+(no slash) is the provider-neutral semantic capability this package exposes.** The two
+are not the same thing. The engine API never encodes a `/`, never assumes a
+conversational command syntax, and never assumes English-language argument parsing —
+it exposes exactly one machine-readable capability (`projectEngineRun()`, §4.2) that a
+host's own slash command, native tool, or skill definition calls into after doing
+whatever host-specific parsing turned `/project-engine-run "<feature>"` (or a tool
+call, or a skill invocation) into a structured `{ action, ... }` payload.
 
 **The slash command itself is a host responsibility.** This package does not, and will
 not, implement `/project-engine-run` as a Claude/Cursor/Antigravity/Codex-specific
@@ -122,11 +137,11 @@ provider-neutral interface a host's own slash-command implementation calls into.
 │   - the actual /project-engine-run command/tool/skill│
 │   - presenting HumanQuestion[] to the human           │
 │   - collecting the human's answers                    │
-│   - invoking start()/resume() below                   │
+│   - invoking start()/resume()/status() below          │
 │   - the runtime-specific AgentRuntimeAdapter(s)       │
 └───────────────────────────┬───────────────────────────┘
                             │ ProjectRunHost (src/host/)
-                            │ .start() / .resume()
+                            │ .start() / .resume() / .status()
                             ▼
 ┌─────────────────────────────────────────────────────┐
 │               PROJECT RUN ENGINE (this package)       │
@@ -160,14 +175,44 @@ it only ever calls `start()`/`resume()` and renders whatever comes back.
 interface ProjectRunHost {
   start(request: ProjectRunHostRequest): Promise<ProjectRunHostResponse>;
   resume(request: ProjectRunResumeRequest): Promise<ProjectRunHostResponse>;
+  status(request: ProjectRunStatusRequest): Promise<ProjectRunHostResponse>;
 }
 ```
 
-`ProjectRunHostResponse.status` is one of `COMPLETED | HUMAN_INTERVENTION_REQUIRED |
-BLOCKED_MISSING_SKILLS | FAILED` — never a string a host must parse human-readable
-prose out of. When `status === "HUMAN_INTERVENTION_REQUIRED"`, the response carries a
-structured `humanIntervention: HumanInterventionRequired` with a `HumanQuestion[]` the
-host renders directly:
+`status()` is read-only: it loads the persisted checkpoint and translates it into the
+exact same `ProjectRunHostResponse` shape `start()`/`resume()` return, without ever
+touching the Coordinator, the decision engine, or any `AgentRuntimeAdapter`. It is what
+makes the restart/multi-host scenario in §4.6 possible, and it is safe to call as often
+as a host likes — it never mutates state.
+
+For hosts that prefer a single action-discriminated entry point (the natural shape for
+most tool-calling conventions — one tool, one input schema, dispatch on a field) over
+three separate methods, `src/host/project-engine-run.ts` exposes the same three
+operations as one function, purely as routing with no duplicated orchestration logic:
+
+```typescript
+function projectEngineRun(input:
+  | { action: "start";  /* ...ProjectRunHostRequest */ }
+  | { action: "resume"; /* ...ProjectRunResumeRequest */ }
+  | { action: "status"; /* ...ProjectRunStatusRequest */ }
+): Promise<ProjectRunHostResponse>;
+```
+
+This is the literal shape of the `project-engine-run` capability named in §4's opening
+note — `ProjectRunHost` and `projectEngineRun()` are two equivalent entry points onto
+identical behavior; a host integration can use whichever fits its own calling
+convention better.
+
+`ProjectRunHostResponse.status` is one of `RUNNING | COMPLETED |
+HUMAN_INTERVENTION_REQUIRED | BLOCKED_MISSING_SKILLS | FAILED` — never a string a host
+must parse human-readable prose out of. `response.terminal` is explicit about which of
+these a host can still act on: `true` for `COMPLETED`/`FAILED` (nothing further to do),
+`false` for everything else (including `BLOCKED_MISSING_SKILLS` — retriable once the
+host installs the missing skill). `RUNNING` is only ever observed via `status()`;
+`start()`/`resume()` always run to a terminal or paused point before returning, so
+neither itself produces it. When `status === "HUMAN_INTERVENTION_REQUIRED"`, the
+response carries a structured `humanIntervention: HumanInterventionRequired` with a
+`HumanQuestion[]` the host renders directly:
 
 ```text
 Project Run needs your input before continuing.
@@ -205,7 +250,119 @@ Project Run
 ⏸ Waiting for your input
 ```
 
-### 4.4 Conceptual host integrations (not implemented in this package)
+### 4.4 Restart and multi-host recovery
+
+The engine, not any in-memory host object, is the source of truth for an execution's
+state. This is what makes the following scenario work without any new persistence
+system beyond the existing `FileExecutionStateStore`:
+
+```text
+Host A                              Host B
+  │                                   │
+  │ start({ feature })                │
+  │ → executionId = X                 │
+  │ → HUMAN_INTERVENTION_REQUIRED     │
+  │                                   │
+  ✕ (process exits / crashes /        │
+     is simply a different host       │
+     invocation entirely)             │
+                                       │ status({ executionId: X })
+                                       │ → HUMAN_INTERVENTION_REQUIRED,
+                                       │   same questions Host A saw
+                                       │
+                                       │ resume({ executionId: X, humanAnswers })
+                                       │ → COMPLETED
+```
+
+Host B never needs anything from Host A beyond the `executionId` and the shared
+`projectRoot` — both execution identity and progress are entirely recoverable from
+`.project-run/runs/<executionId>.json`. This is also exactly how a single host
+recovers from its own crash: there is no in-memory-only state anywhere in this
+architecture that isn't also checkpointed.
+
+**Known limitation**: the persisted checkpoint does not currently retain full
+step-by-step `history` (only a live `Coordinator.run()` call's in-memory result does).
+`status()` therefore returns `history: []` and an approximate `stepsCount`. A host that
+needs the exact step sequence of a run must observe it live via `onEvent` during the
+`start()`/`resume()` call that produced it — see the Phase 2 report's Findings for why
+this wasn't changed in this phase.
+
+### 4.5 Host adapter responsibilities
+
+A provider-specific host integration (built outside this repository, in each host's
+own configuration) is responsible for:
+
+1. Exposing `project-engine-run` as that host's native invocation mechanism (slash
+   command, tool, skill — see §4.6).
+2. Translating the host's own invocation payload into a `ProjectEngineRunInput` (or
+   the equivalent `ProjectRunHost` call).
+3. Supplying an `AgentRuntimeAdapter[]` — the actual mechanism by which that host
+   executes a dispatched role's work and returns a structured `AgentResult`. This is
+   necessarily host-specific code, since "how Claude Code executes a role's work" and
+   "how Cursor executes a role's work" are different by construction; the engine only
+   ever sees the resulting `AgentResult`, never how it was produced.
+4. Rendering `ProjectRunHostResponse.humanIntervention.questions` to the user and
+   collecting their answers.
+5. Retaining `executionId` across turns/sessions so it can call `resume()`/`status()`
+   later — including, per §4.4, from a different process entirely.
+6. Rendering `onEvent` callbacks as live progress, if the host's UX supports it.
+
+What a host adapter must **not** do: it must not import from `src/coordinator/`,
+`src/decision/decision-engine.js`, or `src/project/state-store.js`, must not attempt to
+compute a state transition itself, and must not mutate a persisted checkpoint directly
+— every one of those remains strictly engine-owned. `tests/host-isolation.test.ts`
+proves a complete host adapter is implementable using only `src/host/` plus the
+dispatch-contract types (`AgentRuntimeAdapter`, `AgentDispatchRequest`, `AgentResult`).
+
+### 4.6 Provider-neutral skill/tool schema
+
+`src/host/project-engine-run.ts` exports `PROJECT_ENGINE_RUN_TOOL_SCHEMA` — a single,
+plain-JSON-Schema tool/skill description for the `project_engine_run` capability. JSON
+Schema is the one input format Claude's `tool_use`, OpenAI/Codex function calling, and
+MCP tool definitions all already consume, so this one artifact can back a Claude Code
+Skill, a Cursor tool, an MCP server, or an Antigravity tool definition without being
+specific to any of them — which is why this repository does **not** ship four
+provider-specific files (no `.claude/commands/project-engine-run.md`, no Cursor rule,
+no MCP server, no Antigravity tool definition). A provider-neutral artifact genuinely
+represents the capability; building four parallel, hand-maintained copies of the same
+tool description would not add anything this shared schema doesn't already provide.
+
+The schema is deliberately scoped to the JSON-serializable subset of the input
+(`action`, `executionId`, `feature`, `humanAnswers`, ...) — `adapters` (live functions)
+can never cross a tool-calling wire, so whatever process receives a `project_engine_run`
+tool call and holds the real `AgentRuntimeAdapter` implementation calls
+`projectEngineRun()` directly, in-process, supplying its own adapters alongside the
+JSON-decoded fields from the tool call. That in-process call site is the host adapter
+described in §4.5 — it is genuinely unavoidable, and is the one piece of integration
+work every host still needs, regardless of transport.
+
+### 4.7 Provider analysis (informational — no implementation here)
+
+Based on each platform's publicly known, general tool/skill-calling model (not this
+repository's internals): Claude Code, Cursor, and Codex all support registering custom
+tools/skills backed by local process execution and consuming structured (JSON) tool
+output — which is exactly what `project_engine_run`'s schema (§4.6) assumes. Antigravity
+exposes its own subagent/tool definition mechanism with a comparable shape. All four
+can, in principle, represent `HumanQuestion[]` as a conversational prompt back to the
+user, and all four can retain an opaque string (`executionId`) across turns for later
+`resume()`/`status()` calls — exactly the properties the Host Skill Contract depends on
+and nothing more exotic. MCP is a relevant, commonly supported transport across Cursor
+and Codex in particular, and could carry `PROJECT_ENGINE_RUN_TOOL_SCHEMA` as one MCP
+tool definition; it is not required by the contract itself, since a host capable of
+local process execution and JSON tool output needs nothing beyond that. Exact,
+version-specific API details for each platform should be verified against that
+platform's current documentation before building its adapter — this analysis is
+necessarily general, not a substitute for that verification, and intentionally stops
+short of it since no provider-specific integration is implemented in this phase.
+
+All four fall into the **interactive agent host** category defined in §4.10, not the
+programmatic-import category: none of them extend themselves primarily by importing an
+npm package into a running Node process on the user's behalf. All four therefore reach
+this capability via `project-run engine` (§4.10) or an equivalent local-process/MCP
+transport carrying the same JSON contract — never via direct `import
+{ projectRunHost }`.
+
+### 4.8 Conceptual host integrations (not implemented in this package)
 
 | Host | Conceptual integration |
 |---|---|
@@ -218,12 +375,150 @@ None of the above are implemented in this repository. Only the engine-side contr
 `src/host/` — is. Provider-specific slash commands, MCP servers, and IDE integrations
 belong to each host's own integration work, built on top of this contract.
 
-### 4.5 CLI role
+### 4.9 CLI role
 
-The CLI (`project-run-cli.ts`) is one possible consumer of this same orchestration
-API, not the core interface: `project-run`/`project-run resume` call
-`startProjectRun`/`resumeProjectRun` (`src/host/project-run-host.ts`) rather than
-touching `Coordinator` internals directly. It remains useful for local development,
-debugging, and CI/batch execution, but a host agent integration should call the
-`ProjectRunHost` contract directly rather than shelling out to the CLI and parsing its
-output.
+The CLI (`project-run-cli.ts`) is a compatibility/debugging/local development
+interface, not a second orchestration implementation: `project-run` / `project-run
+resume` / `project-run status` call `startProjectRun` / `resumeProjectRun` /
+`statusProjectRun` (`src/host/`) — the exact same functions `ProjectRunHost` and
+`projectEngineRun()` call — rather than touching `Coordinator` internals or
+`executeProjectRun`/`executeProjectResume` directly. There is one orchestration path;
+the CLI, `ProjectRunHost`, and `projectEngineRun()` are three equally-thin ways to
+reach it. A **programmatic** host integration (one that can `import` this package)
+should call `ProjectRunHost`/`projectEngineRun` directly rather than shelling out to
+the CLI and parsing output. An **interactive agent** host (a Claude Code Skill, a
+Cursor tool, or similar — see §4.10) structurally cannot `import` anything; for that
+category, `project-run engine` (§4.10) *is* the intended way to drive it, not merely a
+debugging fallback.
+
+### 4.10 Two categories of host, and the `project-run engine` CLI transport
+
+§4.2–§4.9 describe the contract assuming a host that can `import` TypeScript/JS and
+hold a live `AgentRuntimeAdapter` function in memory. That assumption holds for a
+**programmatic host** — a Node service, a custom orchestration backend — but not for
+an **interactive agent host** (Claude Code, Cursor, Codex, Antigravity): these extend
+themselves through Skills/tools that are instructions for the agent to follow using its
+*own* general-purpose tools (running commands, reading/writing files), not a place to
+import and call a TypeScript function. For this category, `project-run engine
+<start|resume|status>` is the transport:
+
+```bash
+project-run engine start --json '{"feature":"004-campaigns-and-lead-attribution"}' --dir <repo>
+# -> prints exactly one JSON line: a ProjectRunHostResponse
+```
+
+- Exactly one JSON line per invocation, to stdout.
+- Exit code reflects only whether the *CLI invocation itself* was well-formed (bad/
+  missing `--json` → exit 1); the workflow's actual outcome (`COMPLETED` /
+  `HUMAN_INTERVENTION_REQUIRED` / `BLOCKED_MISSING_SKILLS` / `FAILED`) is always in the
+  printed JSON's `status` field, never encoded as a differentiated exit code — a host
+  parses JSON, not exit codes, to decide what to do next.
+- `adapters` cannot be passed through `--json` (a live function cannot be serialized
+  across a command-line boundary). See `templates/host-integrations/claude-code/
+  project-engine-run/SKILL.md` for the one reference artifact this repository ships,
+  and its explicit, honest documentation of what remains unsolved by this transport
+  alone: *how the dispatched role's actual work gets done* is still a host-specific
+  decision (§4.5), not something `project-run engine` resolves for you. The reference
+  skill's `--mock-scenario` flag exists solely to demonstrate the control-flow contract
+  (start → response → human intervention → resume → continue) and is documented in
+  `--help` as demo/test-only — it must never be used outside of trying the skill out.
+
+The design question raised when this section was first written — how an interactive
+agent host performs dispatched work *inline, in the same session*, without spawning a
+nested agent process per dispatch — is resolved by the pull-based step API. See §4.11.
+
+### 4.11 The pull-based step API: same-session execution without nested spawning
+
+> **The engine does not execute the provider's agent. The host executes the agent and
+> submits the resulting `AgentResult` back to the engine.**
+
+`start()`/`resume()` (§4.1–§4.2) run the Coordinator loop to completion internally,
+which needs a real `AgentRuntimeAdapter` for every dispatch — something a single,
+synchronous host-tool invocation (one Bash call from an interactive session) cannot
+supply, because that call cannot pause mid-loop and have the *calling* session itself
+reason about something and hand the answer back. The only way to make push-mode work
+for a live session is to have its adapter spawn a *separate* nested agent process per
+dispatch — exactly the fresh-session-per-dispatch, no-durable-conversation,
+no-cost-tracking anti-pattern this whole engine evolution exists to move away from.
+
+The pull-based step API avoids this entirely by changing the unit of control from "run
+the whole workflow" to "tell me one thing to do":
+
+```typescript
+interface ProjectRunStepResponse {
+  // discriminated on `status`:
+  //   "AGENT_ACTION_REQUIRED"      — request: AgentDispatchRequest; stepId: string
+  //   "HUMAN_INTERVENTION_REQUIRED" — humanIntervention: HumanInterventionRequired
+  //   "BLOCKED_MISSING_SKILLS"     — role, missingSkills
+  //   "COMPLETED"                  — result: ProjectRunHostResponse
+  //   "FAILED"                     — failureReason; terminal: boolean
+}
+
+function nextProjectRunStep(request: {
+  executionId?: string;       // omit to start fresh; provide to recover/advance/resume
+  feature?: string; branch?: string; runtime?: AgentRuntime;
+  humanAnswers?: HumanAnswer[]; // supplying these against a suspended execution resumes it
+  /* …projectRoot, config, maxSteps, etc. */
+}): Promise<ProjectRunStepResponse>;
+
+function submitProjectRunStep(request: {
+  executionId: string;
+  stepId: string;             // must match the pending action's stepId
+  result: AgentResult;        // the host's own work, reported honestly
+}): Promise<ProjectRunStepResponse>;
+```
+
+```text
+host calls next-step
+        ↓
+AGENT_ACTION_REQUIRED { request }
+        ↓
+host performs `request`'s role using ITS OWN tools, in this same session
+        ↓
+host calls submit-step({ stepId, result })
+        ↓
+engine applies result → re-evaluates via the SAME CoordinatorDecisionEngine
+        ↓
+AGENT_ACTION_REQUIRED (next role) | HUMAN_INTERVENTION_REQUIRED | COMPLETED | FAILED
+```
+
+**This is not a second Coordinator or a second orchestration implementation.** Every
+piece of this is reused, not reimplemented:
+
+| Reused from | For |
+|---|---|
+| `Coordinator.prepareNextAction()` (new method, same class) | Evaluating decisions, auto-advancing pure `TRANSITION`s, checkpointing — identical to `step()`/`run()`, except a `DISPATCH_AGENT` decision is returned to the caller instead of acted on. |
+| `Coordinator.applyExternalResult()` (new method, same class) | Applying a host-submitted result — `step()` itself now calls this too, so push-mode and pull-mode apply a result through one code path, not two. |
+| `AgentDispatcher.prepareRequest()` (extracted from `dispatch()`) | The exact same capability/skill enrichment and skill-requirement validation a real dispatch would perform — a pull-mode host sees an identical, validated request, and a missing required skill is still caught before the host is asked to do undefined work. |
+| `resolveConfig`, `buildEngineServices`, `reconstructStartContext`, `reconstructResumeContext` (extracted from `executeProjectRun`/`executeProjectResume`) | Identical config loading, context discovery, execution identity, and — critically — the exact Phase 0–2 resume safety logic (`shouldReverifyOnResume`, durable human-answer persistence) when a step-mode host resumes a suspended execution. |
+| `statusProjectRun()` (Phase 2) | Translating a just-checkpointed terminal/HITL state into a response, rather than re-deriving that translation a second time. |
+
+**Persistence**: a pending action is persisted literally (`PersistedExecutionState.
+pending_action: { step_id, role, runtime, request, requested_at }`), not re-derived, so
+a host that restarted after `next-step` but before `submit-step` recovers the exact
+same `stepId`/`request` from disk — proven by a dedicated restart test spawning two
+independent "host" calls with zero shared JS object references.
+
+**Safety** (all re-verified against the Phase 0–2 test suite, unmodified):
+
+- A submission is rejected (`FAILED`, `terminal: false`) when: the execution has no
+  pending action (`NO_PENDING_ACTION`), the `stepId` doesn't match the current pending
+  one (`STALE_STEP` — rejects duplicate/replayed submissions), or the result's
+  `execution_id` doesn't match (`INVALID_RESULT`).
+- A submission against an already-completed or already-failed execution is rejected
+  (`EXECUTION_NOT_RESUMABLE`, `terminal: true`).
+- There is no "desired next state" field on `AgentResult` for a host to forge — the
+  decision engine derives the transition purely from `status`/`findings`, exactly as
+  it always has.
+- Human answers resume through `reconstructResumeContext()` unchanged: they are
+  persisted for audit, never mutate a finding directly, and the responsible role is
+  always re-dispatched (returned as a fresh `AGENT_ACTION_REQUIRED`) to independently
+  verify — the human's answer informs what the host does differently, it does not
+  substitute for redoing the work.
+
+**CLI transport**: `project-run engine next-step`/`submit-step` expose this over the
+same JSON transport `start`/`resume`/`status` use (§4.10) — this is how the reference
+Claude Code skill (`templates/host-integrations/claude-code/project-engine-run/
+SKILL.md`) drives the workflow: no `--mock-scenario`, no adapter of any kind, because
+in pull-mode the skill itself — the live, already-running session — *is* the agent
+runtime.

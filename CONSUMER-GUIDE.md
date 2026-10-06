@@ -296,3 +296,69 @@ console.log(formatDoctorReport(report));
 - **Incito (`Consumer #1`)**: Full application consumer under repository root. Consumes `@incito-labs/project-run-engine` as a package dependency via `"@incito-labs/project-run-engine": "file:packages/project-run-engine"`. Provides consumer-specific CLI wrapper in `src/core/agent-orchestration/cli/project-run-cli.ts` without internal engine duplication.
 - **demo-service (`Consumer #2`)**: Standalone consumer example in `examples/project-run-consumer/`. Demonstrates zero-dependency integration, custom runtime registration (`CI_AGENT`), and offline skill discovery.
 
+---
+
+## 9. Integrating an AI Coding-Agent Host (Claude Code, Cursor, Antigravity, Codex)
+
+Sections 1–8 above describe the `HostAgentDispatcher`/`HostDispatchAdapter` pattern and
+the CLI — both still fully supported. Which one applies to you depends on whether your
+integration can `import` this package (see `ARCHITECTURE.md` §4.10 for the full
+distinction):
+
+### 9.1 Programmatic host (can `import` this package)
+
+A custom Node orchestration service, a backend that drives agent calls itself, etc.
+Start from the provider-agnostic Host Skill Contract instead of `executeProjectRun`
+directly:
+
+```typescript
+import { projectRunHost } from "@incito-labs/project-run-engine/host";
+// or the single action-discriminated entry point:
+import { projectEngineRun } from "@incito-labs/project-run-engine/host";
+
+const response = await projectRunHost.start({
+  feature: "004-campaigns-and-lead-attribution",
+  adapters: [myAdapter], // same HostAgentDispatcher/AgentRuntimeAdapter from §4
+});
+
+if (response.status === "HUMAN_INTERVENTION_REQUIRED") {
+  // Present response.humanIntervention.questions to the user, collect their answers,
+  // then: await projectRunHost.resume({ executionId: response.executionId, adapters, humanAnswers });
+}
+```
+
+### 9.2 Interactive agent host (Claude Code, Cursor, Antigravity, Codex)
+
+These extend themselves through Skills/tools — instructions for the agent to follow
+using its own general-purpose tools (running commands, reading files), not a place to
+`import` a TypeScript function. Use the JSON transport instead — and prefer the
+**pull-based step API** (`next-step`/`submit-step`) over push-mode (`start`/`resume`)
+whenever the host itself is the live session that should perform each role's work:
+
+```bash
+# Pull-mode (recommended for a same-session interactive host): the host performs each
+# role's work itself and reports the result back — no adapter needed or accepted.
+project-run engine next-step --json '{"feature":"004-campaigns-and-lead-attribution"}' --dir <repo>
+project-run engine submit-step --json '{"executionId":"...","stepId":"...","result":{...}}' --dir <repo>
+
+# Push-mode: runs the whole workflow in one call; requires a real AgentRuntimeAdapter
+# (a separate process/session — see §9.1), or is useful for CI/batch automation.
+project-run engine start --json '{"feature":"004-campaigns-and-lead-attribution"}' --dir <repo>
+```
+
+See `templates/host-integrations/claude-code/project-engine-run/SKILL.md` for a
+complete reference skill built on the pull-based step API — it drives the full
+workflow, including the Human-in-the-Loop round trip, entirely within the same Claude
+Code session, with no nested agent process ever spawned. See `ARCHITECTURE.md` §4.11
+for the full step contract and why pull-mode is what makes this possible.
+
+---
+
+See `ARCHITECTURE.md` §4 for the full contract (`start`/`resume`/`status`, progress
+events, the Human-in-the-Loop flow, and what a host adapter is and isn't responsible
+for), §4.8 for conceptual integration notes per host, and §4.10 for the programmatic
+vs. interactive-agent distinction and the `project-run engine` CLI transport. This
+package does not ship `.claude/commands/...`, a Cursor rule, an MCP server, or an
+Antigravity tool definition — those are built in each host's own configuration using
+the contract described there.
+

@@ -5,6 +5,10 @@
 // `startProjectRun`/`resumeProjectRun` (src/host/project-run-host.ts) instead of
 // `executeProjectRun`/`executeProjectResume` directly. This suite proves the existing
 // CLI behavior (exit codes, stderr/stdout messages) is unchanged by that refactor.
+//
+// Phase 2 adds `project-run status`, routed through the same `statusProjectRun`
+// function `projectRunHost.status()` uses — the CLI is a complete reflection of the
+// host capability (start/resume/status), not a partial one.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "node:fs";
@@ -145,6 +149,79 @@ describe("Phase 1 — CLI compatibility through the new host/orchestration layer
 
   it("`project-run resume` without --execution-id still fails fast with exit 1 before touching the orchestration layer (unchanged)", async () => {
     const code = await main(["resume", "--dir", tmpDir]);
+
+    expect(code).toBe(1);
+    const stderr = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(stderr).toContain("--execution-id");
+  });
+
+  it("`project-run status --execution-id <id>` reports a completed execution's state without attempting to advance it (new in Phase 2)", async () => {
+    const executionId = "exec-cli-status-completed";
+    const stateStore = new FileExecutionStateStore(tmpDir);
+    await stateStore.save({
+      version: 1,
+      execution_id: executionId,
+      project: "svc",
+      feature: "feat",
+      branch: "feat/feat",
+      state: "READY_FOR_PR",
+      lifecycle_status: "COMPLETED",
+      runtime: "MOCK",
+      iteration: 10,
+      remediation_iteration: 0,
+      preset: "v1",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const code = await main(["status", "--execution-id", executionId, "--dir", tmpDir]);
+
+    expect(code).toBe(0);
+    const stdout = logSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(stdout).toContain("COMPLETED");
+    expect(stdout).toContain("terminal: true");
+  });
+
+  it("`project-run status --execution-id <id>` surfaces the pending questions for a suspended execution", async () => {
+    const executionId = "exec-cli-status-hitl";
+    const stateStore = new FileExecutionStateStore(tmpDir);
+    await stateStore.save({
+      version: 1,
+      execution_id: executionId,
+      project: "svc",
+      feature: "feat",
+      branch: "feat/feat",
+      state: "HUMAN_INTERVENTION_REQUIRED",
+      suspended_from: "CLARIFY",
+      lifecycle_status: "HUMAN_INTERVENTION_REQUIRED",
+      runtime: "MOCK",
+      iteration: 2,
+      remediation_iteration: 0,
+      preset: "v1",
+      findings: [{ id: "AMB-1", severity: "CRITICAL", status: "OPEN", required_remediation: "Pick an auth model" }],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const code = await main(["status", "--execution-id", executionId, "--dir", tmpDir]);
+
+    expect(code).toBe(0);
+    const stdout = logSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(stdout).toContain("HUMAN_INTERVENTION_REQUIRED");
+    expect(stdout).toContain("AMB-1");
+  });
+
+  it("`project-run status --execution-id <unknown>` fails with EXECUTION_NOT_FOUND and exits 1", async () => {
+    const code = await main(["status", "--execution-id", "exec-does-not-exist", "--dir", tmpDir]);
+
+    expect(code).toBe(1);
+    const stderr = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(stderr).toContain("Project status lookup failed");
+    expect(stderr).toContain("EXECUTION_NOT_FOUND");
+  });
+
+  it("`project-run status` without --execution-id fails fast with exit 1", async () => {
+    const code = await main(["status", "--dir", tmpDir]);
 
     expect(code).toBe(1);
     const stderr = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");

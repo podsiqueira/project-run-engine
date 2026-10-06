@@ -3,6 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+  AgentDispatchRequest,
   AgentRole,
   AgentRuntime,
   AgentResult,
@@ -20,9 +21,28 @@ export const CURRENT_STATE_SCHEMA_VERSION = 1;
 
 export type ExecutionLifecycleState =
   | "IN_PROGRESS"
+  | "AWAITING_AGENT_ACTION"
   | "HUMAN_INTERVENTION_REQUIRED"
   | "COMPLETED"
   | "FAILED";
+
+/**
+ * A pending, not-yet-fulfilled agent dispatch request raised by the pull-based step
+ * API (`nextProjectRunStep`/`submitProjectRunStep` — see `ARCHITECTURE.md` §4.11).
+ * Persisted literally (not re-derived) so a host that restarted after `prepareNextAction`
+ * checkpointed it, but before submitting a result, can recover exactly what was asked
+ * without depending on re-deriving an identical decision from the decision engine.
+ *
+ * `step_id` is the correlation token `submitProjectRunStep` must echo back — this is
+ * what lets duplicate or stale submissions be rejected (see `applyExternalResult`).
+ */
+export interface PersistedPendingAction {
+  step_id: string;
+  role: AgentRole;
+  runtime: AgentRuntime;
+  request: AgentDispatchRequest;
+  requested_at: string;
+}
 
 export interface PersistedExecutionState {
   version: number;
@@ -59,6 +79,14 @@ export interface PersistedExecutionState {
    * resumed execution immediately fails again.
    */
   human_answers?: HumanAnswerRecord[];
+  /**
+   * The current outstanding agent dispatch request, if `lifecycle_status ===
+   * "AWAITING_AGENT_ACTION"`. Cleared (omitted) by every other checkpoint — it
+   * describes a single in-flight request, not a history, and `submitProjectRunStep`
+   * requires the submission's `step_id` to match this exact record before accepting
+   * a result, which is what makes duplicate/stale submissions rejectable.
+   */
+  pending_action?: PersistedPendingAction;
   created_at: string;
   updated_at: string;
 }

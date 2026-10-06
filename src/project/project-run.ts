@@ -102,6 +102,119 @@ export interface ProjectResumeOptions {
 }
 
 /**
+ * Resolves the project's `.project-run/config.json` (or an explicitly provided
+ * config object), returning a simple ok/error result rather than throwing.
+ *
+ * Extracted as the single, reusable config-resolution step shared by
+ * `executeProjectRun`, `reconstructResumeContext`, and the pull-based step API
+ * (`nextProjectRunStep`/`submitProjectRunStep`) — see `ARCHITECTURE.md` §4.11.
+ */
+export async function resolveConfig(
+  projectRoot: string,
+  providedConfig: ProjectWorkflowConfig | undefined,
+  configPath: string | undefined,
+): Promise<{ ok: true; config: ProjectWorkflowConfig } | { ok: false; failureReason: string }> {
+  try {
+    const config = providedConfig ?? (await loadProjectConfig(projectRoot, configPath));
+    return { ok: true, config };
+  } catch (err) {
+    return { ok: false, failureReason: `Configuration error: ${(err as Error).message}` };
+  }
+}
+
+export interface EngineServices {
+  resolver: SkillResolver;
+  validator: SkillValidator;
+  registry: AgentRegistry;
+}
+
+/**
+ * Builds the skill resolver/validator/agent registry trio from a resolved config,
+ * honoring any explicit overrides a caller supplied. Extracted for the same reason
+ * as `resolveConfig` above: every orchestration entry point needs the identical
+ * construction, and duplicating it per entry point is exactly the class of drift
+ * this refactor exists to prevent.
+ */
+export function buildEngineServices(
+  projectRoot: string,
+  config: ProjectWorkflowConfig,
+  overrides: { resolver?: SkillResolver; validator?: SkillValidator; registry?: AgentRegistry },
+): EngineServices {
+  const searchPaths = config.skills?.search_paths ?? [];
+  const resolver = overrides.resolver ?? new SkillResolver({ projectRoot, searchPaths });
+  const validator = overrides.validator ?? new SkillValidator(resolver);
+  const registry = overrides.registry ?? buildRegistryFromConfig(config);
+  return { resolver, validator, registry };
+}
+
+/**
+ * Reconstructs (in place, mutating `context`) the execution identity for a FRESH
+ * execution: auto-discovers feature/branch when not already supplied, then assigns
+ * an execution id and builds `context.execution` if it doesn't already exist.
+ *
+ * Extracted from `executeProjectRun`'s former inline steps 1.1–1.2 so the pull-based
+ * step API (`nextProjectRunStep`, starting a new execution) reuses the identical
+ * logic rather than a second, independently-maintained copy.
+ */
+export function reconstructStartContext(options: {
+  projectRoot: string;
+  context: CoordinatorExecutionContext;
+  executionId?: string;
+  explicitFeature?: string;
+  explicitBranch?: string;
+  config: ProjectWorkflowConfig;
+}): { ok: true; executionId: string } | { ok: false; failureReason: string } {
+  const { context, projectRoot, config } = options;
+  const currentFeature = context.execution?.feature ?? context.feature;
+  const currentBranch = context.execution?.branch ?? context.branch;
+
+  if (!currentFeature || !currentBranch) {
+    const discovery = discoverProjectContext({
+      projectRoot,
+      explicitBranch: options.explicitBranch,
+      explicitFeature: options.explicitFeature,
+      config,
+    });
+
+    if (!discovery.success) {
+      return { ok: false, failureReason: `${discovery.error}: ${discovery.reason}` };
+    }
+
+    if (!currentBranch) {
+      context.branch = discovery.context.branch;
+      if (context.execution) context.execution.branch = discovery.context.branch;
+    }
+    if (!currentFeature) {
+      context.feature = discovery.context.feature;
+      if (context.execution) context.execution.feature = discovery.context.feature;
+    }
+  }
+
+  const executionId =
+    options.executionId ??
+    context.execution?.execution_id ??
+    context.execution?.id ??
+    context.execution_id ??
+    `exec-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  context.execution_id = executionId;
+  if (!context.execution) {
+    context.execution = {
+      execution_id: executionId,
+      feature: context.feature ?? "",
+      branch: context.branch ?? "",
+      state: context.state ?? "INTAKE",
+      iteration: context.iteration ?? 1,
+      remediation_iteration: context.remediation_iteration ?? 0,
+    };
+  } else {
+    context.execution.execution_id = executionId;
+  }
+
+  return { ok: true, executionId };
+}
+
+/**
  * Portable /project-run entry point bootstrap.
  *
  * Coordinates:
@@ -124,10 +237,8 @@ export async function executeProjectRun(
   const decisionEngine = options.decisionEngine ?? new CoordinatorDecisionEngine();
 
   // 1. Resolve Project Configuration
-  let config: ProjectWorkflowConfig;
-  try {
-    config = options.config ?? (await loadProjectConfig(projectRoot, options.configPath));
-  } catch (err) {
+  const resolvedConfig = await resolveConfig(projectRoot, options.config, options.configPath);
+  if (!resolvedConfig.ok) {
     const rawState = context.execution?.state ?? context.state ?? "INTAKE";
     return {
       status: "FAILED",
@@ -135,76 +246,39 @@ export async function executeProjectRun(
       agentExecuted: false,
       stepsCount: 0,
       history: [],
-      failureReason: `Configuration error: ${(err as Error).message}`,
+      failureReason: resolvedConfig.failureReason,
     };
   }
+  const config = resolvedConfig.config;
 
-  // 1.1 Context Auto-Discovery (Branch & Feature)
-  const currentFeature = context.execution?.feature ?? context.feature;
-  const currentBranch = context.execution?.branch ?? context.branch;
-
-  if (!currentFeature || !currentBranch) {
-    const discovery = discoverProjectContext({
-      projectRoot,
-      explicitBranch: options.explicitBranch,
-      explicitFeature: options.explicitFeature,
-      config,
-    });
-
-    if (!discovery.success) {
-      const rawState = context.execution?.state ?? context.state ?? "INTAKE";
-      return {
-        status: "FAILED",
-        state: rawState,
-        agentExecuted: false,
-        stepsCount: 0,
-        history: [],
-        failureReason: `${discovery.error}: ${discovery.reason}`,
-      };
-    }
-
-    if (!currentBranch) {
-      context.branch = discovery.context.branch;
-      if (context.execution) context.execution.branch = discovery.context.branch;
-    }
-    if (!currentFeature) {
-      context.feature = discovery.context.feature;
-      if (context.execution) context.execution.feature = discovery.context.feature;
-    }
-  }
-
-  // 1.2 Execution Identity
-  const executionId =
-    options.executionId ??
-    context.execution?.execution_id ??
-    context.execution?.id ??
-    context.execution_id ??
-    `exec-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-
-  context.execution_id = executionId;
-  if (!context.execution) {
-    context.execution = {
-      execution_id: executionId,
-      feature: context.feature ?? "",
-      branch: context.branch ?? "",
-      state: context.state ?? "INTAKE",
-      iteration: context.iteration ?? 1,
-      remediation_iteration: context.remediation_iteration ?? 0,
+  // 1.1–1.2 Context Auto-Discovery (Branch & Feature) & Execution Identity
+  const started = reconstructStartContext({
+    projectRoot,
+    context,
+    executionId: options.executionId,
+    explicitFeature: options.explicitFeature,
+    explicitBranch: options.explicitBranch,
+    config,
+  });
+  if (!started.ok) {
+    const rawState = context.execution?.state ?? context.state ?? "INTAKE";
+    return {
+      status: "FAILED",
+      state: rawState,
+      agentExecuted: false,
+      stepsCount: 0,
+      history: [],
+      failureReason: started.failureReason,
     };
-  } else {
-    context.execution.execution_id = executionId;
   }
+  const executionId = started.executionId;
 
-  // 2. Setup Skill System
-  const searchPaths = config.skills?.search_paths ?? [];
-  const resolver =
-    options.resolver ??
-    new SkillResolver({
-      projectRoot,
-      searchPaths,
-    });
-
-  const validator = options.validator ?? new SkillValidator(resolver);
+  // 2. Setup Skill System & 4. Resolve / Build Agent Registry
+  const { resolver, validator, registry } = buildEngineServices(projectRoot, config, {
+    resolver: options.resolver,
+    validator: options.validator,
+    registry: options.registry,
+  });
 
   // 3. Resolve Runtime
   const runtime: AgentRuntime =
@@ -212,9 +286,6 @@ export async function executeProjectRun(
     context.runtime ??
     config.runtime.default_runtime ??
     "ANTIGRAVITY";
-
-  // 4. Resolve / Build Agent Registry
-  const registry = options.registry ?? buildRegistryFromConfig(config);
 
   // 5. Pre-flight Guard Check
   // Determine if the next action requires an agent dispatch. If so, validate required skills BEFORE starting.
@@ -363,75 +434,78 @@ function shouldReverifyOnResume(
  * Resumes an existing execution that was suspended or reached HUMAN_INTERVENTION_REQUIRED.
  * Restores context without re-executing already completed agents.
  */
-export async function executeProjectResume(
-  options: ProjectResumeOptions,
-): Promise<ProjectRunExecutionResult> {
-  const projectRoot = options.projectRoot ?? process.cwd();
-  const stateStore = options.stateStore ?? new FileExecutionStateStore(projectRoot);
+export interface ResumeContextOptions {
+  executionId: string;
+  projectRoot: string;
+  stateStore: ExecutionStateStore;
+  config?: ProjectWorkflowConfig;
+  configPath?: string;
+  runtime?: AgentRuntime;
+  humanAnswers?: HumanAnswer[];
+  executionOptions?: HostExecutionOptions;
+}
+
+export type ResumeContextResult =
+  | { ok: true; context: CoordinatorExecutionContext; config: ProjectWorkflowConfig; persisted: PersistedExecutionState }
+  | { ok: false; failureReason: string; state: CoordinatorState };
+
+/**
+ * Loads a persisted execution, validates it is actually resumable, resolves project
+ * configuration, and reconstructs the `CoordinatorExecutionContext` to resume from —
+ * including the re-verification-on-resume logic (`shouldReverifyOnResume`) and durable,
+ * immediate persistence of any newly supplied human answers.
+ *
+ * Extracted from `executeProjectResume`'s former inline steps 1–4 so the pull-based
+ * step API (`nextProjectRunStep`/`submitProjectRunStep`, when continuing an existing
+ * execution) reuses the IDENTICAL reconstruction logic — including every resume safety
+ * guarantee from Phase 0–2 — rather than a second, independently-maintained copy that
+ * could silently drift from it. `executeProjectResume` itself is now just this function
+ * plus a hand-off into `executeProjectRun`'s push-based Coordinator loop (step 5).
+ */
+export async function reconstructResumeContext(
+  options: ResumeContextOptions,
+): Promise<ResumeContextResult> {
+  const { executionId, projectRoot, stateStore } = options;
 
   // 1. Load persisted state
   let persisted: PersistedExecutionState | null;
   try {
-    persisted = await stateStore.load(options.executionId);
+    persisted = await stateStore.load(executionId);
   } catch (err) {
-    return {
-      status: "FAILED",
-      state: "HUMAN_INTERVENTION_REQUIRED",
-      agentExecuted: false,
-      stepsCount: 0,
-      history: [],
-      failureReason: (err as Error).message,
-    };
+    return { ok: false, state: "HUMAN_INTERVENTION_REQUIRED", failureReason: (err as Error).message };
   }
 
   if (!persisted) {
     return {
-      status: "FAILED",
+      ok: false,
       state: "HUMAN_INTERVENTION_REQUIRED",
-      agentExecuted: false,
-      stepsCount: 0,
-      history: [],
-      failureReason: `EXECUTION_NOT_FOUND: Execution '${options.executionId}' not found in state store`,
+      failureReason: `EXECUTION_NOT_FOUND: Execution '${executionId}' not found in state store`,
     };
   }
 
   // 2. Validate resumability
   if (persisted.state === "READY_FOR_PR" || persisted.lifecycle_status === "COMPLETED") {
     return {
-      status: "FAILED",
+      ok: false,
       state: "READY_FOR_PR",
-      agentExecuted: false,
-      stepsCount: 0,
-      history: [],
-      failureReason: `EXECUTION_NOT_RESUMABLE: Cannot resume completed execution '${options.executionId}' in terminal state 'READY_FOR_PR'.`,
+      failureReason: `EXECUTION_NOT_RESUMABLE: Cannot resume completed execution '${executionId}' in terminal state 'READY_FOR_PR'.`,
     };
   }
 
   if (persisted.lifecycle_status === "FAILED") {
     return {
-      status: "FAILED",
+      ok: false,
       state: persisted.state,
-      agentExecuted: false,
-      stepsCount: 0,
-      history: [],
-      failureReason: `EXECUTION_NOT_RESUMABLE: Execution '${options.executionId}' has failed terminally: ${persisted.terminal_reason ?? "unknown error"}.`,
+      failureReason: `EXECUTION_NOT_RESUMABLE: Execution '${executionId}' has failed terminally: ${persisted.terminal_reason ?? "unknown error"}.`,
     };
   }
 
   // 3. Resolve Project Configuration
-  let config: ProjectWorkflowConfig;
-  try {
-    config = options.config ?? (await loadProjectConfig(projectRoot, options.configPath));
-  } catch (err) {
-    return {
-      status: "FAILED",
-      state: persisted.state,
-      agentExecuted: false,
-      stepsCount: 0,
-      history: [],
-      failureReason: `Configuration error: ${(err as Error).message}`,
-    };
+  const resolvedConfig = await resolveConfig(projectRoot, options.config, options.configPath);
+  if (!resolvedConfig.ok) {
+    return { ok: false, state: persisted.state, failureReason: resolvedConfig.failureReason };
   }
+  const config = resolvedConfig.config;
 
   // 4. Reconstruct Context
   const resumeState: CoordinatorState =
@@ -515,13 +589,46 @@ export async function executeProjectResume(
     executionOptions: options.executionOptions,
   };
 
+  return { ok: true, context, config, persisted };
+}
+
+export async function executeProjectResume(
+  options: ProjectResumeOptions,
+): Promise<ProjectRunExecutionResult> {
+  const projectRoot = options.projectRoot ?? process.cwd();
+  const stateStore = options.stateStore ?? new FileExecutionStateStore(projectRoot);
+
+  const reconstructed = await reconstructResumeContext({
+    executionId: options.executionId,
+    projectRoot,
+    stateStore,
+    config: options.config,
+    configPath: options.configPath,
+    runtime: options.runtime,
+    humanAnswers: options.humanAnswers,
+    executionOptions: options.executionOptions,
+  });
+
+  if (!reconstructed.ok) {
+    return {
+      status: "FAILED",
+      state: reconstructed.state,
+      agentExecuted: false,
+      stepsCount: 0,
+      history: [],
+      failureReason: reconstructed.failureReason,
+    };
+  }
+
+  const { context, config } = reconstructed;
+
   // 5. Continue execution using Coordinator via executeProjectRun
   return executeProjectRun({
     projectRoot,
     config,
     context,
-    runtime,
-    executionId: persisted.execution_id,
+    runtime: context.runtime as AgentRuntime | undefined,
+    executionId: context.execution_id,
     adapters: options.adapters,
     stateStore,
     resolver: options.resolver,

@@ -11,6 +11,7 @@ import type {
   CoordinatorDecision,
   CoordinatorExecutionContext,
   CompleteDecision,
+  DispatchAgentDecision,
   FindingInput,
   RequireHumanInterventionDecision,
 } from "../decision/types.js";
@@ -20,6 +21,7 @@ import { AgentDispatcher } from "../agents/agent-dispatcher.js";
 import type {
   ExecutionLifecycleState,
   ExecutionStateStore,
+  PersistedPendingAction,
 } from "../project/state-store.js";
 
 export type CoordinatorExecutionStatus =
@@ -49,6 +51,18 @@ export interface CoordinatorStepResult {
   terminal: boolean;
 }
 
+/**
+ * The result of `Coordinator.prepareNextAction()` — the pull-based counterpart to
+ * `step()`. `DISPATCH_PENDING` is returned instead of a dispatched `AgentResult`
+ * whenever the decision engine says a role needs to execute: the caller (a host that
+ * IS its own agent runtime, e.g. an interactive coding-agent session) performs the
+ * work itself and reports back via `applyExternalResult()`, rather than the
+ * Coordinator calling an `AgentDispatcher` on the caller's behalf.
+ */
+export type PreparedAction =
+  | { kind: "DISPATCH_PENDING"; stepId: string; request: AgentDispatchRequest; runtime: AgentRuntime; decision: DispatchAgentDecision }
+  | { kind: "TERMINAL"; decision: CompleteDecision | RequireHumanInterventionDecision };
+
 export interface CoordinatorExecutionMetadata {
   executionId: string;
   project: string;
@@ -68,6 +82,17 @@ export interface CoordinatorOptions {
 }
 
 export const DEFAULT_MAX_STEPS = 100;
+
+/**
+ * Generates a correlation token for a pending agent action. Uses only `Date.now()` +
+ * `Math.random()` — the same pattern `executeProjectRun` already uses for execution
+ * ids — rather than `node:crypto`'s `randomUUID`, to preserve this package's strict,
+ * test-enforced dependency boundary (only `node:fs`/`node:path` built-ins permitted;
+ * see `tests/package-boundary.test.ts` and `PACKAGING.md`).
+ */
+function generateStepId(): string {
+  return `step-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 /**
  * Coordinator Execution Loop.
@@ -105,6 +130,7 @@ export class Coordinator {
     lastResult?: AgentResult,
     terminalReason?: string,
     suspendedFrom?: CoordinatorState,
+    pendingAction?: PersistedPendingAction,
   ): Promise<void> {
     if (!this.stateStore) return;
 
@@ -184,6 +210,12 @@ export class Coordinator {
         // merging — this is what keeps previously recorded answers from being dropped
         // by a later checkpoint within the same (resumed) run.
         human_answers: context.humanAnswers,
+        // Only set on the one checkpoint call that raises it (prepareNextAction's
+        // DISPATCH_AGENT case); every other checkpoint call omits it, which correctly
+        // clears a previously pending action the moment it's no longer outstanding —
+        // unlike human_intervention/human_answers, a pending action is NOT an audit
+        // trail entry and must not be carried forward once resolved.
+        pending_action: pendingAction,
         terminal_reason: terminalReason,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
@@ -233,13 +265,7 @@ export class Coordinator {
           decision.request.options,
         );
 
-        // Store result in context so next iteration has outcome for transition evaluation
-        context.result = result;
-        if (Array.isArray(result.findings)) {
-          context.findings = result.findings as FindingInput[];
-        }
-
-        await this.checkpoint(context, "IN_PROGRESS", result);
+        await this.applyExternalResult(context, result);
 
         return {
           decision,
@@ -272,6 +298,116 @@ export class Coordinator {
         throw new Error(`Unexpected coordinator decision action: ${unexpected.action}`);
       }
     }
+  }
+
+  /**
+   * Applies a host-submitted `AgentResult` exactly as `step()`'s `DISPATCH_AGENT`
+   * branch does after a real `AgentDispatcher.dispatch()` call — WITHOUT ever calling
+   * the dispatcher. This is the "submit" half of the pull-based step contract
+   * (`src/host/project-run-step.ts`): the host IS the agent runtime for this
+   * execution and already has the result in hand, so there is nothing for an
+   * `AgentDispatcher`/`AgentRuntimeAdapter` to do here.
+   *
+   * Reused by `step()` itself (see above) so the push-based and pull-based paths
+   * apply a result identically — one implementation, not two.
+   */
+  async applyExternalResult(context: CoordinatorExecutionContext, result: AgentResult): Promise<void> {
+    context.result = result;
+    if (Array.isArray(result.findings)) {
+      context.findings = result.findings as FindingInput[];
+    }
+    await this.checkpoint(context, "IN_PROGRESS", result);
+  }
+
+  /**
+   * The pull-based counterpart to `step()`/`run()`: evaluates decisions and applies
+   * every one that needs no agent work (`TRANSITION`) automatically, exactly as
+   * `run()`'s loop would — but the moment a `DISPATCH_AGENT` decision is reached, it
+   * returns the request to the caller instead of invoking an `AgentDispatcher`,
+   * checkpointing `AWAITING_AGENT_ACTION` so the pending request survives a restart.
+   * Terminal decisions (`COMPLETE`/`REQUIRE_HUMAN_INTERVENTION`) are checkpointed and
+   * returned exactly as `step()` already does.
+   *
+   * This is deliberately NOT a second Coordinator: it reuses the same
+   * `CoordinatorDecisionEngine`, the same `syncState`/`syncRemediationIteration`
+   * helpers, and the same `checkpoint()` method `step()`/`run()` use — the only
+   * difference is that a `DISPATCH_AGENT` decision is reported rather than acted on.
+   */
+  async prepareNextAction(
+    context: CoordinatorExecutionContext,
+    maxSteps: number = this.maxSteps,
+  ): Promise<PreparedAction> {
+    for (let i = 0; i < maxSteps; i++) {
+      const decision = this.decisionEngine.decide(context);
+
+      switch (decision.action) {
+        case "COMPLETE": {
+          this.syncState(context, "READY_FOR_PR");
+          await this.checkpoint(context, "COMPLETED", undefined, decision.reason);
+          return { kind: "TERMINAL", decision };
+        }
+
+        case "REQUIRE_HUMAN_INTERVENTION": {
+          this.syncState(context, "HUMAN_INTERVENTION_REQUIRED");
+          await this.checkpoint(
+            context,
+            "HUMAN_INTERVENTION_REQUIRED",
+            undefined,
+            decision.reason,
+            decision.from,
+          );
+          return { kind: "TERMINAL", decision };
+        }
+
+        case "DISPATCH_AGENT": {
+          // Enrich + validate exactly as a real dispatch() would (registry-resolved
+          // capability/skill metadata, skill-requirement validation) — a pull-mode
+          // host must see the identical request a push-mode AgentRuntimeAdapter
+          // would, and must be told about a missing required skill before being
+          // asked to do undefined work. Throws SkillValidationError exactly as
+          // dispatch() does; the caller (src/host/project-run-step.ts) handles it
+          // the same way executeProjectRun already does for push-mode.
+          const enrichedRequest = await this.dispatcher.prepareRequest(decision.request, decision.runtime);
+
+          const stepId = generateStepId();
+          const pendingAction: PersistedPendingAction = {
+            step_id: stepId,
+            role: decision.role,
+            runtime: decision.runtime,
+            request: enrichedRequest,
+            requested_at: new Date().toISOString(),
+          };
+          await this.checkpoint(context, "AWAITING_AGENT_ACTION", undefined, undefined, undefined, pendingAction);
+          return {
+            kind: "DISPATCH_PENDING",
+            stepId,
+            request: enrichedRequest,
+            runtime: decision.runtime,
+            decision,
+          };
+        }
+
+        case "TRANSITION": {
+          this.syncState(context, decision.to);
+          if (decision.remediation_iteration !== undefined) {
+            this.syncRemediationIteration(context, decision.remediation_iteration);
+          }
+          context.result = undefined;
+          context.gateStatus = undefined;
+          await this.checkpoint(context, "IN_PROGRESS");
+          continue;
+        }
+
+        default: {
+          const unexpected = decision as { action?: string };
+          throw new Error(`Unexpected coordinator decision action: ${unexpected.action}`);
+        }
+      }
+    }
+
+    throw new Error(
+      `prepareNextAction exceeded maximum step limit of ${maxSteps} steps without requiring agent action or reaching a terminal state.`,
+    );
   }
 
   /**

@@ -25,6 +25,7 @@ import type {
   ProjectRunResumeRequest,
 } from "./types.js";
 import type { ProjectRunEventSink } from "./events.js";
+import { statusProjectRun } from "./status.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -110,7 +111,7 @@ async function buildHostResponse(
   switch (result.status) {
     case "COMPLETED": {
       await emit({ type: "RUN_COMPLETED", executionId, timestamp: now(), state, stepsCount });
-      return { status: "COMPLETED", executionId, state, stepsCount, history, findings };
+      return { status: "COMPLETED", terminal: true, executionId, state, stepsCount, history, findings };
     }
 
     case "HUMAN_INTERVENTION_REQUIRED": {
@@ -141,6 +142,7 @@ async function buildHostResponse(
 
       return {
         status: "HUMAN_INTERVENTION_REQUIRED",
+        terminal: false,
         executionId,
         state,
         stepsCount,
@@ -153,6 +155,7 @@ async function buildHostResponse(
     case "BLOCKED_MISSING_SKILLS": {
       return {
         status: "BLOCKED_MISSING_SKILLS",
+        terminal: false,
         executionId,
         state,
         stepsCount,
@@ -174,6 +177,7 @@ async function buildHostResponse(
       });
       return {
         status: "FAILED",
+        terminal: true,
         executionId,
         state,
         stepsCount,
@@ -259,4 +263,5 @@ export async function resumeProjectRun(request: ProjectRunResumeRequest): Promis
 export const projectRunHost: ProjectRunHost = {
   start: startProjectRun,
   resume: resumeProjectRun,
+  status: statusProjectRun,
 };
