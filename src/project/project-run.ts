@@ -102,6 +102,32 @@ export interface ProjectResumeOptions {
 }
 
 /**
+ * Resolves the runtime a fresh or resuming execution should use, honoring one
+ * precedence, in one place, for every entry point:
+ *
+ *   explicit per-call override (`requestRuntime`)
+ *     ?? a runtime already present on the context/persisted record (`contextRuntime`)
+ *     ?? the project's configured `runtime.default_runtime`
+ *     ?? the engine's historical last-resort fallback ("ANTIGRAVITY")
+ *
+ * Called once, before the Coordinator's decision loop ever runs (`executeProjectRun`,
+ * `nextProjectRunStep`'s fresh-start path, `reconstructResumeContext`) and the result
+ * assigned onto `context.runtime` — so `CoordinatorDecisionEngine.decide()` and
+ * `Coordinator.checkpoint()` always see an already-resolved runtime. Their own
+ * `context.runtime ?? "ANTIGRAVITY"` fallbacks remain as a defensive last resort for a
+ * caller that builds a `CoordinatorExecutionContext` directly without going through
+ * one of these entry points (`Coordinator` is itself part of the public API surface);
+ * they are not expected to fire for any supported host-facing entry point.
+ */
+export function resolveRuntime(
+  requestRuntime: AgentRuntime | undefined,
+  contextRuntime: AgentRuntime | undefined,
+  config: ProjectWorkflowConfig,
+): AgentRuntime {
+  return requestRuntime ?? contextRuntime ?? config.runtime.default_runtime ?? "ANTIGRAVITY";
+}
+
+/**
  * Resolves the project's `.project-run/config.json` (or an explicitly provided
  * config object), returning a simple ok/error result rather than throwing.
  *
@@ -280,12 +306,12 @@ export async function executeProjectRun(
     registry: options.registry,
   });
 
-  // 3. Resolve Runtime
-  const runtime: AgentRuntime =
-    options.runtime ??
-    context.runtime ??
-    config.runtime.default_runtime ??
-    "ANTIGRAVITY";
+  // 3. Resolve Runtime — once, here, before the Coordinator decision loop ever runs,
+  // so every `decisionEngine.decide(context)` call below (both the pre-flight check
+  // and every step inside `coordinator.run()`) sees the SAME, fully-resolved runtime
+  // rather than each independently re-deriving (and potentially diverging on) one.
+  const runtime: AgentRuntime = resolveRuntime(options.runtime, context.runtime, config);
+  context.runtime = runtime;
 
   // 5. Pre-flight Guard Check
   // Determine if the next action requires an agent dispatch. If so, validate required skills BEFORE starting.
@@ -513,8 +539,7 @@ export async function reconstructResumeContext(
       ? (persisted.suspended_from ?? "INTAKE")
       : persisted.state;
 
-  const runtime: AgentRuntime =
-    options.runtime ?? persisted.runtime ?? config.runtime.default_runtime ?? "ANTIGRAVITY";
+  const runtime: AgentRuntime = resolveRuntime(options.runtime, persisted.runtime, config);
 
   // For states where human intervention was required because an evaluation gate failed
   // (e.g. RE_REVIEW or CONVERGE reached max remediation limit, or CLARIFY/ANALYZE hit a

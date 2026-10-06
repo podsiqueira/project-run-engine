@@ -29,6 +29,7 @@ import { SkillValidationError } from "../skills/skill-validation-error.js";
 import type { ProjectWorkflowConfig } from "../project/project-config.js";
 import {
   resolveConfig,
+  resolveRuntime,
   buildEngineServices,
   reconstructStartContext,
   reconstructResumeContext,
@@ -223,7 +224,15 @@ export async function nextProjectRunStep(
   }
   const config = resolvedConfig.config;
 
-  const context: CoordinatorExecutionContext = { state: "INTAKE", runtime: request.runtime };
+  // Resolve runtime once, here, before `runPrepare()` ever calls into the Coordinator's
+  // decision loop — same precedence and same shared helper `executeProjectRun` uses, so
+  // the pull-based fresh-start path honors `config.runtime.default_runtime` exactly like
+  // push-mode does, rather than leaving `context.runtime` unset for the decision engine
+  // to independently (and incorrectly) default elsewhere.
+  const context: CoordinatorExecutionContext = {
+    state: "INTAKE",
+    runtime: resolveRuntime(request.runtime, undefined, config),
+  };
   const started = reconstructStartContext({
     projectRoot,
     context,
