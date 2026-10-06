@@ -1,6 +1,6 @@
 {
   "name": "@incito-labs/project-run-engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Provider-agnostic agent orchestration engine for portable workflow execution",
   "publishConfig": {
@@ -17,7 +17,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "project-run": "./dist/cli/project-run-cli.js"
+    "project-run": "dist/cli/project-run-cli.js"
   },
   "exports": {
     ".": {
