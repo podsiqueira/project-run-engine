@@ -218,7 +218,10 @@ export function discoverFeature(
     return {
       success: false,
       error: "FEATURE_NOT_DISCOVERED",
-      reason: `Explicitly specified feature "${raw}" was not found at "${candidatePath}" or "${inSpecs}".`,
+      reason:
+        `Explicitly specified feature "${raw}" was not found at "${candidatePath}" or "${inSpecs}". ` +
+        `The engine discovers features; it never creates feature directories. For a brand-new feature, ` +
+        `the host/consumer must create the feature workspace (by default "specs/${raw}") before starting, then retry.`,
     };
   }
 
