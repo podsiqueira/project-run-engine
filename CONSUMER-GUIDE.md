@@ -365,6 +365,18 @@ omit it from every call thereafter. Pass `"runtime"` explicitly only when a sing
 needs to override the project's configured default (see `ARCHITECTURE.md` §4.14 for the
 full precedence and where it's resolved).
 
+**Starting a brand-new feature.** The engine locates features; it does not create them.
+If `next-step`/`start` returns `FAILED` with `FEATURE_NOT_DISCOVERED` for a feature you
+just named, create the feature workspace first (by default `specs/<feature>/`) and
+retry. Feature name, execution id, and git branch are separate things and need not
+match (`ARCHITECTURE.md` §4.16).
+
+**Reporting.** Every response carries `stepLog` (the durable, ordered record of agent
+steps and human suspensions, including every finding each step reported) and
+`stepsCount` (the number of agent steps so far). `findings` is only the latest result's
+findings, so a clean final result reports `findings: []` — read `stepLog` for the full
+record (`ARCHITECTURE.md` §4.4).
+
 See `templates/host-integrations/claude-code/project-engine-run/SKILL.md` for a
 complete reference skill built on the pull-based step API — it drives the full
 workflow, including the Human-in-the-Loop round trip, entirely within the same Claude

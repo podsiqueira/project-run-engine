@@ -60,15 +60,14 @@ optimistic concurrency, locking, or a database-backed store.
 
 ## Known limitation — `status().history` is always empty
 
-The persisted checkpoint does not retain a step-by-step event stream; only a live
-`Coordinator.run()` result carries `history`. `statusProjectRun()` therefore returns
-`history: []` and a `stepsCount` approximated from the persisted `iteration` counter
-(`src/host/status.ts`; `ARCHITECTURE.md` §4.4). **Impact**: a host that needs the exact
-step sequence must observe it live via `onEvent` during the call that produced it; a
-restarted host can recover state, pending action, and findings, but not past steps.
-Still true as of `0.1.1`. Status persistence is intentionally not redesigned here.
-The broader audit-record consequence observed in a real run is tracked as **ENG-002**
-below.
+The persisted checkpoint does not retain the Coordinator's live `StepRecord[]` (which
+embeds full decision objects); only a live `Coordinator.run()` result carries `history`.
+`statusProjectRun()` therefore still returns `history: []` (`src/host/status.ts`;
+`ARCHITECTURE.md` §4.4). **Still true as of this change — deliberately not redesigned.**
+What changed under ENG-002 (below): the durable record of *what happened* is no longer
+missing — it lives in the append-only `step_log` / response `stepLog`, and `stepsCount`
+is derived from it. A host that wants decision-level detail (every `TRANSITION`) must
+still observe it live via `onEvent`.
 
 ## Trust boundary — result truthfulness
 
@@ -85,57 +84,114 @@ Source: a full pull-mode run (`@incito-labs/project-run-engine` 0.1.1, consumed 
 Incito repo, Claude Code cloud session; feature `007-lifecycle-smoke-test`, execution
 `exec-1791412982780-58use`) that reached `COMPLETED` / `READY_FOR_PR` through a real
 human-intervention gate. The run's temporary branch, feature files and checkpoint were
-deleted afterward, so this section is the retained evidence. All three items are
-**OPEN**; none is designed or implemented. Severities are provisional — this
-repository has no formal severity taxonomy.
+deleted afterward, so this section is the retained evidence. Each entry below keeps its
+original registered observation and now also records its disposition. Severities are
+provisional — this repository has no formal severity taxonomy.
 
-### ENG-001 — Feature-directory bootstrap (MEDIUM, OPEN)
+### ENG-001 — Feature-directory bootstrap — CLOSED (host-owned; engine contract documented)
 
-`discoverFeature()` (`src/project/context-discovery.ts`) requires an explicit feature to
-already exist as a directory (`<root>/<feature>` or `<root>/specs/<feature>`), otherwise
-returns `FEATURE_NOT_DISCOVERED`. For a brand-new feature the `speckit-specify` skill is
-what normally creates that directory, but the engine refuses to start — and so never
-dispatches `SPECIFY` — until it exists. In the smoke test the host seeded the directory
-by hand and retried with an explicit `feature`. Branch matching only recognizes a
-folder named after the branch (after stripping `feat/`, `fix/`, … prefixes), so a branch
-like `tmp/...` does not auto-discover.
+- **Status**: CLOSED. **Severity**: MEDIUM (provisional, unchanged).
+- **Registered observation**: `discoverFeature()` (`src/project/context-discovery.ts`)
+  requires an explicit feature to already exist as a directory (`<root>/<feature>` or
+  `<root>/specs/<feature>`), otherwise returns `FEATURE_NOT_DISCOVERED`. For a brand-new
+  feature the specify step normally creates that directory, but the engine refuses to
+  start — and so never dispatches `SPECIFY` — until it exists. In the smoke test the host
+  seeded the directory by hand and retried with an explicit `feature`. Branch matching
+  only recognizes a folder named after the branch (after stripping `feat/`, `fix/`, …
+  prefixes), so a branch like `tmp/...` does not auto-discover.
+- **Confirmed root cause**: not a defect — an unstated contract. The engine only ever
+  writes under `.project-run/` at run time; the bundled `speckit-specify` skill owns
+  allocating the feature directory name (numbering by scanning `specs/`), `mkdir -p`,
+  and `.specify/feature.json`. The circularity arose because nothing said who seeds the
+  workspace when the feature is named up front.
+- **Ownership / decision**: the **host/consumer** creates a new feature's workspace; the
+  engine discovers it. The engine does not create feature directories (it would become a
+  second, unsynchronised owner of preset-specific layout and numbering).
+- **Implemented**: no behavior change except the failure reason, which now states the
+  contract and the default location to create (`context-discovery.ts`). Contract
+  documented in `ARCHITECTURE.md` §4.16, `CONSUMER-GUIDE.md` §9.2 and the reference
+  skill (`templates/host-integrations/claude-code/project-engine-run/SKILL.md`).
+  Regression coverage: `tests/feature-bootstrap-boundary.test.ts` (nothing is created
+  on failure; no execution record is written; after the host seeds the directory the
+  same call dispatches `SPECIFY`; non-feature-shaped branches do not auto-discover).
+- **Remaining follow-up (not decided, not scheduled)**: an *opt-in*, preset-aware
+  bootstrap helper is a possible enhancement only if a second host shows the same
+  friction; it would need to defer to the preset's own naming/numbering rather than
+  invent one. Consumers: your host must seed `specs/<feature>/` (see the contract above).
 
-**Open question**: should the engine create the feature workspace, or is the
-host/skill intentionally responsible for seeding it? Either way the bootstrap contract
-is currently undocumented. **Not decided.**
+### ENG-002 — Final execution state loses findings and history — CLOSED (history persistence of decisions DEFERRED)
 
-### ENG-002 — Final execution state loses findings and history (HIGH, OPEN)
+- **Status**: CLOSED for the audit-record gap; decision-level `history` remains DEFERRED
+  (see the limitation above). **Severity**: HIGH (provisional, unchanged) — highest of
+  the three.
+- **Registered observation**: a nine-step run with four findings, a human-intervention
+  gate, three human answers, remediation and an `ANALYZE` re-run returned a final
+  `COMPLETED` response with `findings: []`, `history: []`, `stepsCount: 1`. Only
+  `human_answers` survived in the checkpoint.
+- **Confirmed root causes (three independent)**:
+  - **A. No durable step record** — nothing persisted which steps ran or which human
+    suspensions occurred (`PersistedExecutionState.history` was declared but never
+    written).
+  - **B. Findings replaced** — `Coordinator.applyExternalResult()` replaces
+    `context.findings` with each result's findings. This replacement is *required* for
+    gating (the decision engine and resume logic read it; a clean re-run must clear a
+    blocking gate), so it was **not** changed — the bug was that it was also the only
+    record.
+  - **C. `stepsCount` ≠ steps** — pull-mode `status()` reported the persisted workflow
+    `iteration`, which is never incremented (always 1); push-mode reported a per-call
+    loop counter (including pure transitions, restarting at 0 on every resume).
+- **Ownership**: engine.
+- **Implemented** (`ARCHITECTURE.md` §4.4 is the contract):
+  - **A**: new append-only `step_log` on the checkpoint (`ExecutionStepRecord`: one
+    `AGENT_STEP` per applied result with role/state/status/reported findings/evidence
+    count/`step_id`; one `HUMAN_INTERVENTION` per suspension), carried on the context
+    like `human_answers` and exposed as `stepLog` on every host/step response and
+    `status()`.
+  - **B**: gate semantics untouched; the earlier findings are preserved in
+    `stepLog[].findings` (snapshot per step, never merged or de-duplicated; the engine
+    does not infer "resolved" — read later entries).
+  - **C**: host-level `stepsCount` = number of `AGENT_STEP` entries across the whole
+    execution (excludes transitions and suspensions; includes pre-resume steps). The
+    Coordinator-level `stepsCount` stays the per-call loop counter (it bounds `maxSteps`)
+    and is now documented as such.
+  - Tests: `tests/execution-record.test.ts` (8) — the exact observed sequence (ANALYZE
+    findings → human gate → clean ANALYZE re-run → COMPLETED) in pull and push mode,
+    multiple dispatched steps, resume, human intervention, completed execution, `status()`
+    from a second host, and a pre-`step_log` checkpoint. 7 of the 8 fail against the
+    pre-change code.
+- **Deferred (explicit)**: persisting decision-level `history` (`StepRecord[]`) or an
+  event stream; retaining per-step evidence payloads (only `evidence_count`; the latest
+  result keeps full evidence on `last_result`); engine-inferred "resolved" status for
+  findings; back-filling `step_log` for checkpoints written before this change (they
+  report `stepsCount: 0`).
+- **Side effect to note**: `ProjectRunHostResponse` gains a required `stepLog` field
+  (additive on the wire; a consumer that *constructs* this type must add it) and
+  `stepsCount` changes meaning as above — this is a contract change for the next release.
 
-A nine-step run with four findings, a human-intervention gate, three human answers,
-remediation and an `ANALYZE` re-run returned a final `COMPLETED` response with
-`findings: []`, `history: []`, `stepsCount: 1`. Only `human_answers` survived in the
-checkpoint. Verified causes in the current code (observations, not a design):
+### ENG-003 — Feature vs. execution vs. branch identity in prerequisite tooling — OPEN (EXTERNAL / CONSUMER OWNED; no engine action)
 
-- `history` is not persisted (see the `status().history` limitation above).
-- `Coordinator.applyExternalResult()` *replaces* `context.findings` with each submitted
-  result's findings rather than accumulating, so the persisted findings describe only
-  the latest result — a clean final result yields `[]`.
-- `stepsCount` is taken from the persisted workflow `iteration` counter
-  (`src/host/status.ts`), not a count of dispatched steps.
-
-**Desired outcome**: the final record lets a reader reconstruct which roles ran, which
-findings were raised and remediated, what required human intervention and what the
-human decided, which steps were re-run, and the evidence behind the final state. How is
-**not decided**; this also bears on the "no event-sourcing" scope limit of earlier
-phases.
-
-### ENG-003 — Feature vs. execution vs. branch identity in prerequisite tooling (LOW–MEDIUM, OPEN)
-
-Spec-Kit prerequisite scripts (`.specify/scripts/bash/check-prerequisites.sh`,
-`setup-plan.sh`, in the consuming repo — not shipped by this package) printed
-`BRANCH: 007-lifecycle-smoke-test`, sourced from `.specify/feature.json`, while the
-actual Git branch was `tmp/project-run-lifecycle-smoke`. Three identities are being
-conflated in reporting: the feature (`007-lifecycle-smoke-test`), the execution
-(`exec-…`), and the Git branch. The engine itself keeps them separate (`execution_id`,
-`feature`, `branch` are distinct context fields). **To do**: clarify terminology and the
-source of truth for each; do not force feature and branch names to match without an
-explicit architectural reason. Likely resolved in the consumer/Spec-Kit tooling rather
-than engine source.
+- **Status**: OPEN — consumer-owned. **Severity**: LOW–MEDIUM (provisional, unchanged).
+- **Registered observation**: Spec-Kit prerequisite scripts
+  (`.specify/scripts/bash/check-prerequisites.sh`, `setup-plan.sh`) printed
+  `BRANCH: 007-lifecycle-smoke-test`, sourced from `.specify/feature.json`, while the
+  actual Git branch was `tmp/project-run-lifecycle-smoke`. Feature, execution
+  (`exec-…`) and Git branch were conflated in reporting.
+- **Verification (in this repo)**: the engine does not contain, call, parse or emit
+  `BRANCH:` / `feature.json` / the prerequisite scripts (grep of `src/`). It records
+  `feature`, `execution_id` and `branch` as separate fields from the real `.git/HEAD`;
+  `tests/feature-bootstrap-boundary.test.ts` pins that, including a feature name that
+  differs from the branch. The only in-repo trace is the bundled `speckit-plan` template
+  text that tells the plan agent to read a `BRANCH` key from `setup-plan.sh` output; the
+  bundled `speckit-specify` template already states the branch name "does **not**
+  dictate the spec directory name". The mislabelling originates in the consumer's
+  `.specify/scripts/` (the template is upstream-derived and was not changed here).
+- **Ownership**: Spec-Kit scripts in the consuming repository (Incito).
+- **Engine action**: none, deliberately — no speculative change. Terminology and the
+  per-identity source of truth are written down in `ARCHITECTURE.md` §4.16.
+- **Remaining consumer follow-up**: in the consuming repo, make the prerequisite scripts
+  report the Git branch from git (not from `.specify/feature.json`) — or relabel the
+  feature value as `FEATURE` — and do not force feature and branch names to match.
+  Stays OPEN here until the consumer confirms; close it when they do.
 
 ## Phase 5
 
