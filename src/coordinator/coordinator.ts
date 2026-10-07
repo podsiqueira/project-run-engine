@@ -5,6 +5,7 @@ import type {
   AgentResult,
   AgentRuntime,
   CoordinatorState,
+  ExecutionStepRecord,
   StructuredFinding,
 } from "../domain/types.js";
 import type {
@@ -204,6 +205,7 @@ export class Coordinator {
         context: context.context,
         last_result: (lastResult ?? context.result) as AgentResult | undefined,
         findings,
+        step_log: context.stepLog,
         human_intervention: humanIntervention,
         // Carried forward from the context (see CoordinatorExecutionContext.humanAnswers)
         // since the state store overwrites the whole record on every save rather than
@@ -242,6 +244,7 @@ export class Coordinator {
       }
 
       case "REQUIRE_HUMAN_INTERVENTION": {
+        this.recordHumanIntervention(context, decision);
         this.syncState(context, "HUMAN_INTERVENTION_REQUIRED");
         await this.checkpoint(
           context,
@@ -311,12 +314,50 @@ export class Coordinator {
    * Reused by `step()` itself (see above) so the push-based and pull-based paths
    * apply a result identically — one implementation, not two.
    */
-  async applyExternalResult(context: CoordinatorExecutionContext, result: AgentResult): Promise<void> {
+  async applyExternalResult(
+    context: CoordinatorExecutionContext,
+    result: AgentResult,
+    stepId?: string,
+  ): Promise<void> {
+    // The step log is appended BEFORE `context.findings` is replaced below, and is
+    // never itself replaced: `context.findings` is the decision engine's gate input
+    // (a clean re-run MUST clear it), so it cannot double as the execution's record of
+    // what was ever reported. See `ExecutionStepRecord`.
+    this.appendStepRecord(context, {
+      kind: "AGENT_STEP",
+      state: context.execution?.state ?? context.state ?? (result.state as CoordinatorState),
+      role: result.agent,
+      status: result.status,
+      step_id: stepId,
+      findings: Array.isArray(result.findings) ? [...result.findings] : [],
+      evidence_count: Array.isArray(result.evidence) ? result.evidence.length : 0,
+    });
     context.result = result;
     if (Array.isArray(result.findings)) {
       context.findings = result.findings as FindingInput[];
     }
     await this.checkpoint(context, "IN_PROGRESS", result);
+  }
+
+  private recordHumanIntervention(
+    context: CoordinatorExecutionContext,
+    decision: RequireHumanInterventionDecision,
+  ): void {
+    this.appendStepRecord(context, {
+      kind: "HUMAN_INTERVENTION",
+      state: decision.from ?? context.execution?.state ?? context.state ?? "INTAKE",
+      reason: decision.reason,
+    });
+  }
+
+  private appendStepRecord(
+    context: CoordinatorExecutionContext,
+    record: Omit<ExecutionStepRecord, "seq" | "recorded_at">,
+  ): void {
+    const log = context.stepLog ?? [];
+    const entry: ExecutionStepRecord = { ...record, seq: log.length + 1, recorded_at: new Date().toISOString() };
+    if (entry.step_id === undefined) delete entry.step_id;
+    context.stepLog = [...log, entry];
   }
 
   /**
@@ -348,6 +389,7 @@ export class Coordinator {
         }
 
         case "REQUIRE_HUMAN_INTERVENTION": {
+          this.recordHumanIntervention(context, decision);
           this.syncState(context, "HUMAN_INTERVENTION_REQUIRED");
           await this.checkpoint(
             context,

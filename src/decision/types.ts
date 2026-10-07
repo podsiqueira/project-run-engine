@@ -8,6 +8,7 @@ import type {
   AgentResult,
   AgentSkillRequirement,
   CoordinatorState,
+  ExecutionStepRecord,
   HostExecutionOptions,
   RoleSkillMetadata,
 } from "../domain/types.js";
@@ -133,6 +134,13 @@ export interface CoordinatorExecutionContext {
    * on the context at checkpoint time would otherwise be dropped from the file.
    */
   humanAnswers?: HumanAnswerRecord[];
+  /**
+   * The running, append-only step log (see `ExecutionStepRecord`). Carried on the
+   * context for the same reason as `humanAnswers`: the state store overwrites the
+   * whole record on every save, so whatever isn't on the context at checkpoint time
+   * would be dropped. Never read by the decision engine — gates use `findings`/`result`.
+   */
+  stepLog?: ExecutionStepRecord[];
   executionOptions?: HostExecutionOptions;
 }
 

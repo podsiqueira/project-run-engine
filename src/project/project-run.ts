@@ -7,6 +7,7 @@ import type {
   AgentSkill,
   AgentSkillRequirement,
   CoordinatorState,
+  ExecutionStepRecord,
   HostExecutionOptions,
 } from "../domain/types.js";
 import type {
@@ -68,12 +69,19 @@ export interface ProjectRunExecutionResult {
   status: ProjectRunStatus;
   state: CoordinatorState;
   agentExecuted: boolean;
+  /**
+   * Coordinator loop iterations in THIS call (including pure transitions; bounded by
+   * `maxSteps`). It is NOT the number of agent steps in the execution — that is
+   * `countAgentSteps(stepLog)`, which is what `ProjectRunHostResponse.stepsCount` reports.
+   */
   stepsCount: number;
   history: StepRecord[];
   role?: AgentRole;
   missingSkills?: string[];
   failureReason?: string;
   coordinatorResult?: CoordinatorRunResult;
+  /** The execution's durable step log as of this call's end (including prior resumes). */
+  stepLog?: ExecutionStepRecord[];
 }
 
 export interface ProjectResumeOptions {
@@ -386,6 +394,7 @@ export async function executeProjectRun(
       stepsCount: coordinatorResult.stepsCount,
       history: coordinatorResult.history,
       coordinatorResult,
+      stepLog: context.stepLog,
     };
   } catch (err) {
     if (err instanceof SkillValidationError) {
@@ -399,6 +408,7 @@ export async function executeProjectRun(
         role: err.result.role,
         missingSkills: err.result.missingRequiredSkills,
         failureReason: err.result.failureReason,
+        stepLog: context.stepLog,
       };
     }
 
@@ -410,6 +420,7 @@ export async function executeProjectRun(
       stepsCount: 0,
       history: [],
       failureReason: (err as Error).message,
+      stepLog: context.stepLog,
     };
   }
 }
@@ -597,6 +608,7 @@ export async function reconstructResumeContext(
     human_approved: true,
     human_resolved: true,
     humanAnswers: mergedAnswers.length > 0 ? mergedAnswers : undefined,
+    stepLog: persisted.step_log,
     // blockingAmbiguity/blockingFindings are intentionally left unset here: they are
     // derived from `findings` by the decision engine (hasBlockingFindings), not stored
     // independently. Resetting them to `undefined` previously gave the false impression

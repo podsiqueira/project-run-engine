@@ -8,7 +8,7 @@
 // engine's existing internal shapes, so the CLI and any future host integration can
 // share a single, machine-readable, non-CLI-output-parsing entry point.
 
-import type { AgentDispatchRequest, AgentResult, StructuredFinding } from "../domain/types.js";
+import { countAgentSteps, type AgentDispatchRequest, type AgentResult, type StructuredFinding } from "../domain/types.js";
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
 import type { HostExecutionOptions } from "../runtime/host-execution-contract.js";
 import type { StepRecord } from "../coordinator/coordinator.js";
@@ -105,13 +105,17 @@ async function buildHostResponse(
   result: ProjectRunExecutionResult,
   emit: ProjectRunEventSink,
 ): Promise<ProjectRunHostResponse> {
-  const { state, stepsCount, history } = result;
+  const { state, history } = result;
   const findings = extractFindings(result);
+  // The durable, execution-wide step log — not the per-call loop counter on `result`
+  // (which also counts pure transitions and restarts at 0 on every resume).
+  const stepLog = result.stepLog ?? result.coordinatorResult?.context.stepLog ?? [];
+  const stepsCount = countAgentSteps(stepLog);
 
   switch (result.status) {
     case "COMPLETED": {
       await emit({ type: "RUN_COMPLETED", executionId, timestamp: now(), state, stepsCount });
-      return { status: "COMPLETED", terminal: true, executionId, state, stepsCount, history, findings };
+      return { status: "COMPLETED", terminal: true, executionId, state, stepsCount, history, findings, stepLog };
     }
 
     case "HUMAN_INTERVENTION_REQUIRED": {
@@ -148,6 +152,7 @@ async function buildHostResponse(
         stepsCount,
         history,
         findings,
+        stepLog,
         humanIntervention,
       };
     }
@@ -161,6 +166,7 @@ async function buildHostResponse(
         stepsCount,
         history,
         findings,
+        stepLog,
         role: result.role,
         missingSkills: result.missingSkills,
         failureReason: result.failureReason,
@@ -183,6 +189,7 @@ async function buildHostResponse(
         stepsCount,
         history,
         findings,
+        stepLog,
         failureReason: result.failureReason,
       };
     }
