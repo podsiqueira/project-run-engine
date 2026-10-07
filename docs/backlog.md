@@ -67,6 +67,8 @@ The persisted checkpoint does not retain a step-by-step event stream; only a liv
 step sequence must observe it live via `onEvent` during the call that produced it; a
 restarted host can recover state, pending action, and findings, but not past steps.
 Still true as of `0.1.1`. Status persistence is intentionally not redesigned here.
+The broader audit-record consequence observed in a real run is tracked as **ENG-002**
+below.
 
 ## Trust boundary — result truthfulness
 
@@ -76,6 +78,64 @@ The engine validates the *shape and status* of a submitted `AgentResult` (`stepI
 performed the work it reports. Truthful execution reporting is the host's
 responsibility. See `ARCHITECTURE.md` §4.15. No independent verifier is planned or
 implied.
+
+## Follow-ups from the Claude cloud lifecycle smoke test
+
+Source: a full pull-mode run (`@incito-labs/project-run-engine` 0.1.1, consumed by the
+Incito repo, Claude Code cloud session; feature `007-lifecycle-smoke-test`, execution
+`exec-1791412982780-58use`) that reached `COMPLETED` / `READY_FOR_PR` through a real
+human-intervention gate. The run's temporary branch, feature files and checkpoint were
+deleted afterward, so this section is the retained evidence. All three items are
+**OPEN**; none is designed or implemented. Severities are provisional — this
+repository has no formal severity taxonomy.
+
+### ENG-001 — Feature-directory bootstrap (MEDIUM, OPEN)
+
+`discoverFeature()` (`src/project/context-discovery.ts`) requires an explicit feature to
+already exist as a directory (`<root>/<feature>` or `<root>/specs/<feature>`), otherwise
+returns `FEATURE_NOT_DISCOVERED`. For a brand-new feature the `speckit-specify` skill is
+what normally creates that directory, but the engine refuses to start — and so never
+dispatches `SPECIFY` — until it exists. In the smoke test the host seeded the directory
+by hand and retried with an explicit `feature`. Branch matching only recognizes a
+folder named after the branch (after stripping `feat/`, `fix/`, … prefixes), so a branch
+like `tmp/...` does not auto-discover.
+
+**Open question**: should the engine create the feature workspace, or is the
+host/skill intentionally responsible for seeding it? Either way the bootstrap contract
+is currently undocumented. **Not decided.**
+
+### ENG-002 — Final execution state loses findings and history (HIGH, OPEN)
+
+A nine-step run with four findings, a human-intervention gate, three human answers,
+remediation and an `ANALYZE` re-run returned a final `COMPLETED` response with
+`findings: []`, `history: []`, `stepsCount: 1`. Only `human_answers` survived in the
+checkpoint. Verified causes in the current code (observations, not a design):
+
+- `history` is not persisted (see the `status().history` limitation above).
+- `Coordinator.applyExternalResult()` *replaces* `context.findings` with each submitted
+  result's findings rather than accumulating, so the persisted findings describe only
+  the latest result — a clean final result yields `[]`.
+- `stepsCount` is taken from the persisted workflow `iteration` counter
+  (`src/host/status.ts`), not a count of dispatched steps.
+
+**Desired outcome**: the final record lets a reader reconstruct which roles ran, which
+findings were raised and remediated, what required human intervention and what the
+human decided, which steps were re-run, and the evidence behind the final state. How is
+**not decided**; this also bears on the "no event-sourcing" scope limit of earlier
+phases.
+
+### ENG-003 — Feature vs. execution vs. branch identity in prerequisite tooling (LOW–MEDIUM, OPEN)
+
+Spec-Kit prerequisite scripts (`.specify/scripts/bash/check-prerequisites.sh`,
+`setup-plan.sh`, in the consuming repo — not shipped by this package) printed
+`BRANCH: 007-lifecycle-smoke-test`, sourced from `.specify/feature.json`, while the
+actual Git branch was `tmp/project-run-lifecycle-smoke`. Three identities are being
+conflated in reporting: the feature (`007-lifecycle-smoke-test`), the execution
+(`exec-…`), and the Git branch. The engine itself keeps them separate (`execution_id`,
+`feature`, `branch` are distinct context fields). **To do**: clarify terminology and the
+source of truth for each; do not force feature and branch names to match without an
+explicit architectural reason. Likely resolved in the consumer/Spec-Kit tooling rather
+than engine source.
 
 ## Phase 5
 
