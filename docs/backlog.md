@@ -2,9 +2,12 @@
 
 This tracks work deliberately **not** implemented yet, to keep `project-run-engine`'s
 core provider-neutral and avoid speculative scope creep. See `ARCHITECTURE.md` §4.13
-for how these fit the overall architecture. None of these are scheduled; they are
-recorded so the engine's provider-neutral boundary stays a deliberate choice, not an
-accidental gap.
+for how these fit the overall architecture, and `docs/phase-reports.md` for phase
+history. None of these are scheduled; they are recorded so the engine's
+provider-neutral boundary stays a deliberate choice, not an accidental gap.
+
+**Host split**: *current* — Claude Code (live-validated in Phase 4) and Antigravity
+(supported target; not yet live-validated). *Backlog* — Cursor, Codex, MCP.
 
 ## Host Integration — Antigravity
 
@@ -36,12 +39,45 @@ MCP must remain an **integration/transport concern** carrying the existing
 `PROJECT_ENGINE_RUN_TOOL_SCHEMA`, never an engine architectural dependency — the engine
 itself must never import an MCP SDK.
 
-## Execution persistence under concurrent submission
+## Execution persistence under concurrent submission — DEFERRED
 
-**Purpose**: Harden `FileExecutionStateStore` against a genuine race identified during
-the Phase 0–4 architecture review: two near-simultaneous `submitProjectRunStep()` calls
-for the same pending action can both pass validation (`STALE_STEP` etc.) before either
-writes, since saves are plain, unlocked file writes with no optimistic-concurrency
-check. Not a problem for the single-host-at-a-time usage pattern validated so far;
-worth hardening once simultaneous multi-host operation becomes an actual supported use
-case, not before.
+**Current behavior**: `FileExecutionStateStore` persists with plain file
+read/modify/write (`src/project/state-store.ts`) — no locking, no atomic replace, no
+optimistic-concurrency check. Two near-simultaneous `submitProjectRunStep()` calls for
+the same pending action can both pass validation (`STALE_STEP` etc.) before either
+writes, and simultaneous writes from independent hosts could race.
+
+**Why deferred**: not a blocker for the supported model — one host / one session
+driving an execution at a time, which is what Phases 3–4 validated. There is no current
+multi-host simultaneous-write requirement.
+
+**Revisit when**: real multi-host concurrent execution (more than one host submitting
+against the same `executionId` at the same time) becomes a supported requirement. Not
+before.
+
+**Open directions** (none selected, none decided): stronger persistence semantics,
+optimistic concurrency, locking, or a database-backed store.
+
+## Known limitation — `status().history` is always empty
+
+The persisted checkpoint does not retain a step-by-step event stream; only a live
+`Coordinator.run()` result carries `history`. `statusProjectRun()` therefore returns
+`history: []` and a `stepsCount` approximated from the persisted `iteration` counter
+(`src/host/status.ts`; `ARCHITECTURE.md` §4.4). **Impact**: a host that needs the exact
+step sequence must observe it live via `onEvent` during the call that produced it; a
+restarted host can recover state, pending action, and findings, but not past steps.
+Still true as of `0.1.1`. Status persistence is intentionally not redesigned here.
+
+## Trust boundary — result truthfulness
+
+The engine validates the *shape and status* of a submitted `AgentResult` (`stepId`,
+`execution_id`, no pending/terminal misuse; transitions derive only from
+`status`/`findings`) but does **not** independently verify that the host/agent actually
+performed the work it reports. Truthful execution reporting is the host's
+responsibility. See `ARCHITECTURE.md` §4.15. No independent verifier is planned or
+implied.
+
+## Phase 5
+
+Not started. See `docs/phase-reports.md` for the phase history, entry criteria, and
+current state.

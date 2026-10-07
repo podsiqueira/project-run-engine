@@ -624,3 +624,20 @@ one of these entry points — it is not expected to fire for any supported host
 integration, and a consuming project's `runtime.default_runtime` is a fully functional
 part of the configuration contract: a host may omit `runtime` on every call once it is
 set, exactly as `CONSUMER-GUIDE.md` §9.2 now documents.
+
+### 4.15 Trust boundary: result truthfulness
+
+```text
+Project Run Engine
+    ↓  orchestrates state transitions; validates result shape/status
+Host / agent
+    ↓  responsible for truthful execution reporting
+```
+
+The engine decides the next state purely from the `status` and `findings` of the
+`AgentResult` a host submits, and rejects malformed, stale, forged-identity, or
+post-terminal submissions (§4.11). It does **not** re-run tests, re-inspect files, or
+otherwise verify that the agent really did what it claims; a host that reports `PASS`
+for work it did not do is trusted. The reference Claude Code skill states this
+obligation to the agent explicitly (`SKILL.md`, "Truthfulness"). Building an
+independent verifier is out of scope; see `docs/backlog.md`.
