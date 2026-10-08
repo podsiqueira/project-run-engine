@@ -222,6 +222,23 @@ provisional — this repository has no formal severity taxonomy.
   feature value as `FEATURE` — and do not force feature and branch names to match.
   Stays OPEN here until the consumer confirms; close it when they do.
 
+## Checkpoint save failures are swallowed — OPEN (pre-existing; documented, not fixed in 0.3.0)
+
+`Coordinator.checkpoint()` catches and ignores every `stateStore.save()` error. It predates Phase 5
+(present since the Coordinator's first checkpointing commit) and Phase 5 did not introduce or
+change it. Atomic writes and the execution lock keep the checkpoint file structurally consistent
+(no torn JSON), but they do not make a failed write visible: after the lock is taken and the first
+checkpoint exists, a failing `save()` (disk full, I/O error) can leave the durable checkpoint at
+the previous step while the call returns the next action or a push-mode result. A later submission
+for that action is then rejected `STALE_STEP`, and a restarted process resumes from the older
+checkpoint. Not data corruption; a failure-observability gap. Mitigated only for the first
+checkpoint of a pull-mode execution (`EXECUTION_LOCK_UNAVAILABLE`). Behaviour is described in
+`ARCHITECTURE.md` §4.17 ("Known limitation").
+
+**Future work (not scheduled):** propagate checkpoint save failures from the Coordinator as a
+structured, non-terminal failure (so the caller sees it before acting on an unpersisted step) for
+both pull and push paths. This changes error-propagation semantics and needs its own review.
+
 ## Phase 5
 
 Implemented in source and review-remediated, unreleased: persistence hardening (decision

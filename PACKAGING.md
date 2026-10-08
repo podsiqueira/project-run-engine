@@ -135,12 +135,14 @@ npm run clean       # remove dist/
 Run all of these from the repository root. Each must pass; none publishes anything.
 
 ```bash
-npm run typecheck   # tsc --noEmit over src/ and tests/ (tsconfig.json)
+npm run typecheck   # tsc --noEmit over src/ only (tsconfig.json includes src/**/* and excludes tests/**/*)
 npm test            # vitest run — the whole suite, including the compiled-package and multi-process tests
 npm run build       # production build (see section 4); the locking/CLI tests also compile into a temporary directory
 git diff --check    # no whitespace errors in the working tree
 npm pack --dry-run  # lists exactly what would be published (dist/, templates/, LICENSE and the *.md files in "files")
 ```
+
+Test files are **not** type-checked by `npm run typecheck`; they are transpiled and executed by `vitest` (via `npm test`), which does not report type errors. There is no separate test typecheck command.
 
 `npm test` requires the build tooling only (`tsc` is a dev dependency); it does not need a prior `npm run build`. Run the tests *before* the final build so the build output is not left half-validated, and run `npm pack --dry-run` *after* `npm run build` so the listing reflects the fresh `dist/`.
 

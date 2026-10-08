@@ -822,7 +822,9 @@ read-modify-write turn.
   failure instead of an action that could never be submitted. *Difference from `0.2.0`:* with
   an unusable runs directory `0.2.0` ran best-effort without persisting, and 0.3 refuses
   with `EXECUTION_LOCK_UNAVAILABLE` — a deliberate fail-closed choice, since proceeding
-  unlocked would silently defeat the guarantee. A holder whose process has died is
+  unlocked would silently defeat the guarantee. (This fail-closed behaviour is at lock
+  acquisition and for the first checkpoint only; later checkpoint `save()` failures are still
+  not surfaced — see "Known limitation" below.) A holder whose process has died is
   detected by probing its pid and reclaimed (reclamation is itself serialised through a
   guard file); a live holder is never displaced, however long it holds. A push-mode turn
   holds the lock for the whole run, so a competing mutation waits (or times out) rather
@@ -847,6 +849,26 @@ without atomic exclusive create (some network mounts) — the engine is limited 
 `node:fs`/`node:path` and cannot identify other hosts; or a hung-but-alive holder (waiters
 time out instead). `Coordinator` itself performs no locking, so a library caller driving it
 directly must hold the lock itself.
+
+**Known limitation — checkpoint `save()` failures are not surfaced (pre-existing).**
+`Coordinator.checkpoint()` catches and ignores any error from `stateStore.save()` (the code comment calls it non-fatal so the main
+loop is not interrupted). This predates Phase 5 and is unchanged by it; `0.3.0` does not fix it.
+- *Guaranteed:* a checkpoint file is never torn (temp file + fsync + atomic rename, so a reader or
+  a crash sees the previous or the new complete JSON); mutating turns are serialised by the
+  execution lock; and the *first* checkpoint of a pull-mode execution is confirmed before an action
+  is issued (`EXECUTION_LOCK_UNAVAILABLE`, above).
+- *Not guaranteed:* that a *later* checkpoint was written. If a write fails after the lock was
+  taken and the first checkpoint exists (for example the disk fills, or an I/O error), the turn
+  can still return its result — e.g. the next `AGENT_ACTION_REQUIRED`, or a push-mode result — while
+  the durable checkpoint stays at the previous step. Nothing in the response reports the failure.
+  The file is consistent, just behind the result; a host that then submits against the unpersisted
+  step is rejected `STALE_STEP`, and a restarted process resumes from the older checkpoint. The
+  lock and atomic writes do not change this; they protect file integrity and mutual exclusion, not
+  save-failure observability.
+- *Status:* explicit backlog item (`docs/backlog.md`, "Checkpoint save failures are swallowed").
+  Until it is addressed, hosts should treat an unexpected `STALE_STEP` after a successful
+  `next-step`/`submit-step` as a possible persistence failure and check the runs directory
+  (free space, permissions) before retrying.
 
 **Persisted-format compatibility.** `history` is an optional field and `version` stays `1`:
 no migration. A checkpoint written before Phase 5 loads with an empty `history`; decisions
