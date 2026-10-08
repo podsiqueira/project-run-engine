@@ -307,6 +307,25 @@ describe("NF-2 pull mode — a failed checkpoint write is never reported as prog
     expect(((await readDurable(store, "hq"))?.human_answers ?? []).length).toBe(answers.length);
   }, 60_000);
 
+  it("if the answer record was written and a LATER write failed, the retry records the answers again (audit trail only) and the run completes", async () => {
+    const store = new FaultyStore(tmpDir);
+    let r = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "hq2", runtime: "MOCK", stateStore: store });
+    for (let g = 0; g < 60 && r.status === "AGENT_ACTION_REQUIRED"; g++) {
+      r = await submitProjectRunStep({ projectRoot: tmpDir, executionId: "hq2", stepId: r.stepId, result: await resultForRequest(store, r.request), stateStore: store });
+    }
+    if (r.status !== "HUMAN_INTERVENTION_REQUIRED") throw new Error("setup: expected a suspension, got " + r.status);
+    const answers = r.humanIntervention.questions.map((q) => ({ questionId: q.id, answer: "yes" }));
+
+    store.failOn(store.saves + 2); // 1st save = the answer record (ok); 2nd = the next checkpoint (fails)
+    const failed = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "hq2", stateStore: store, humanAnswers: answers });
+    expect(failed.status === "FAILED" && failed.failureCode).toBe("CHECKPOINT_WRITE_FAILED");
+    expect(((await readDurable(store, "hq2"))?.human_answers ?? []).length).toBe(answers.length); // recorded once so far
+
+    const retried = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "hq2", stateStore: store, humanAnswers: answers });
+    expect(retried.status).toBe("AGENT_ACTION_REQUIRED");
+    expect(((await readDurable(store, "hq2"))?.human_answers ?? []).length).toBe(answers.length * 2); // documented: recorded again
+  }, 60_000);
+
   it("a store that cannot even READ after the failed write still yields a structured failure (never an exception)", async () => {
     class DyingStore extends FaultyStore {
       dead = false;
