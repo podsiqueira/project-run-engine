@@ -352,3 +352,217 @@ describe("ENG-002 — push-mode (start/resume) reports the same durable record",
     expect(status.stepLog).toEqual(resumed.stepLog);
   });
 });
+
+describe("ENG-002 — step log integrity on rejected, failed and blocked paths", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "exec-integrity-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const passAdapter = () =>
+    new MockRuntimeAdapter((req) => ({
+      execution_id: req.execution_id,
+      agent: req.role,
+      state: req.state,
+      status: "PASS",
+      evidence: [],
+      findings: [],
+    }));
+
+  it("rejected pull submissions (stale stepId, forged execution_id, nothing pending, completed) never touch the persisted log", async () => {
+    const executionId = "exec-integrity-rejected";
+    const store = new FileExecutionStateStore(tmpDir);
+    const first = await nextProjectRunStep({ projectRoot: tmpDir, executionId, runtime: "MOCK" });
+    if (first.status !== "AGENT_ACTION_REQUIRED") throw new Error("expected action");
+    const second = await submitProjectRunStep({ projectRoot: tmpDir, executionId, stepId: first.stepId, result: resultFor(first, "PASS") });
+    if (second.status !== "AGENT_ACTION_REQUIRED") throw new Error("expected next action");
+
+    const before = (await store.load(executionId))?.step_log;
+    expect(before).toHaveLength(1);
+
+    // Stale: replaying the already-applied step.
+    const stale = await submitProjectRunStep({ projectRoot: tmpDir, executionId, stepId: first.stepId, result: resultFor(first, "PASS") });
+    expect(stale.status).toBe("FAILED");
+    // Forged: result claims a different execution.
+    const forged = await submitProjectRunStep({
+      projectRoot: tmpDir,
+      executionId,
+      stepId: second.stepId,
+      result: { ...resultFor(second, "PASS"), execution_id: "someone-else" },
+    });
+    expect(forged.status).toBe("FAILED");
+
+    expect((await store.load(executionId))?.step_log).toEqual(before);
+
+    // Drive to completion, then submit against the completed execution.
+    let response: ProjectRunStepResponse = second;
+    let guard = 0;
+    while (response.status === "AGENT_ACTION_REQUIRED" && guard++ < 50) {
+      response = await submitProjectRunStep({ projectRoot: tmpDir, executionId, stepId: response.stepId, result: resultFor(response, "PASS") });
+    }
+    expect(response.status).toBe("COMPLETED");
+    const completedLog = (await store.load(executionId))?.step_log;
+    expect(completedLog).toHaveLength(8);
+
+    const late = await submitProjectRunStep({ projectRoot: tmpDir, executionId, stepId: second.stepId, result: resultFor(second, "PASS") });
+    expect(late.status).toBe("FAILED");
+    expect((await store.load(executionId))?.step_log).toEqual(completedLog);
+  });
+
+  it("an agent dispatch that throws leaves exactly the steps that completed — no entry for the failed one", async () => {
+    const executionId = "exec-integrity-throws";
+    let calls = 0;
+    const adapter = new MockRuntimeAdapter((req) => {
+      if (++calls === 3) throw new Error("runtime crashed");
+      return { execution_id: req.execution_id, agent: req.role, state: req.state, status: "PASS", evidence: [], findings: [] };
+    });
+
+    const response = await startProjectRun({ projectRoot: tmpDir, executionId, runtime: "MOCK", adapters: [adapter] });
+    expect(response.status).toBe("FAILED");
+    expect(response.stepsCount).toBe(2);
+    expect(response.stepLog.map((r) => r.seq)).toEqual([1, 2]);
+
+    const persisted = await new FileExecutionStateStore(tmpDir).load(executionId);
+    expect(persisted?.lifecycle_status).toBe("FAILED");
+    expect(persisted?.step_log).toEqual(response.stepLog);
+  });
+
+  it("a rejected resume of a completed execution still reports its real step count and log, not zero", async () => {
+    const executionId = "exec-integrity-completed-resume";
+    const done = await startProjectRun({ projectRoot: tmpDir, executionId, runtime: "MOCK", adapters: [passAdapter()] });
+    expect(done.status).toBe("COMPLETED");
+    expect(done.stepsCount).toBe(8);
+
+    const rejected = await resumeProjectRun({ projectRoot: tmpDir, executionId, runtime: "MOCK", adapters: [passAdapter()] });
+    expect(rejected.status).toBe("FAILED");
+    expect(rejected.failureReason).toContain("EXECUTION_NOT_RESUMABLE");
+    expect(rejected.stepsCount).toBe(8);
+    expect(rejected.stepLog).toEqual(done.stepLog);
+  });
+
+  it("a resume blocked by a missing required skill (pre-flight) keeps the steps recorded before the suspension", async () => {
+    const executionId = "exec-integrity-blocked-resume";
+    let analyzeAttempts = 0;
+    const adapter = new MockRuntimeAdapter((req) => {
+      if (req.state === "ANALYZE" && ++analyzeAttempts === 1) {
+        return { execution_id: req.execution_id, agent: req.role, state: req.state, status: "FINDINGS", evidence: [], findings: ANALYZE_FINDINGS };
+      }
+      return { execution_id: req.execution_id, agent: req.role, state: req.state, status: "PASS", evidence: [], findings: [] };
+    });
+    const started = await startProjectRun({ projectRoot: tmpDir, executionId, runtime: "MOCK", adapters: [adapter] });
+    expect(started.status).toBe("HUMAN_INTERVENTION_REQUIRED");
+    expect(started.stepsCount).toBe(5);
+
+    // The consumer now requires a skill that is not installed.
+    const configPath = path.join(tmpDir, ".project-run", "config.json");
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    config.agents.ARCHITECTURE.required_skills = [{ id: "skill-that-is-not-installed", required: true }];
+    fs.writeFileSync(configPath, JSON.stringify(config), "utf8");
+
+    const resumed = await resumeProjectRun({
+      projectRoot: tmpDir,
+      executionId,
+      runtime: "MOCK",
+      adapters: [adapter],
+      humanAnswers: started.humanIntervention?.questions.map((q) => ({ questionId: q.id, answer: "ok" })),
+    });
+    expect(resumed.status).toBe("BLOCKED_MISSING_SKILLS");
+    expect(resumed.stepsCount).toBe(5);
+    expect(resumed.stepLog).toEqual(started.stepLog);
+  });
+});
+
+describe("ENG-002 — legacy checkpoints (written before step_log existed)", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "exec-legacy-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("a legacy suspended checkpoint loads, reports an empty log, and a push resume completes recording only the new steps (history is never invented)", async () => {
+    const executionId = "exec-legacy-resume";
+    let analyzeAttempts = 0;
+    const adapter = new MockRuntimeAdapter((req) => {
+      if (req.state === "ANALYZE" && ++analyzeAttempts === 1) {
+        return { execution_id: req.execution_id, agent: req.role, state: req.state, status: "FINDINGS", evidence: [], findings: ANALYZE_FINDINGS };
+      }
+      return { execution_id: req.execution_id, agent: req.role, state: req.state, status: "PASS", evidence: [], findings: [] };
+    });
+    const started = await startProjectRun({ projectRoot: tmpDir, executionId, runtime: "MOCK", adapters: [adapter] });
+    expect(started.status).toBe("HUMAN_INTERVENTION_REQUIRED");
+
+    // Rewrite the checkpoint exactly as a pre-step_log engine would have left it.
+    const store = new FileExecutionStateStore(tmpDir);
+    const persisted = await store.load(executionId);
+    if (!persisted) throw new Error("expected persisted state");
+    delete persisted.step_log;
+    await store.save(persisted);
+    expect(JSON.parse(fs.readFileSync(path.join(tmpDir, ".project-run", "runs", `${executionId}.json`), "utf8")).step_log).toBeUndefined();
+
+    const legacyStatus = await statusProjectRun({ executionId, projectRoot: tmpDir });
+    expect(legacyStatus.status).toBe("HUMAN_INTERVENTION_REQUIRED");
+    expect(legacyStatus.stepsCount).toBe(0);
+    expect(legacyStatus.stepLog).toEqual([]);
+    expect(legacyStatus.humanIntervention?.questions.length).toBeGreaterThan(0);
+
+    const resumed = await resumeProjectRun({
+      projectRoot: tmpDir,
+      executionId,
+      runtime: "MOCK",
+      adapters: [adapter],
+      humanAnswers: legacyStatus.humanIntervention?.questions.map((q) => ({ questionId: q.id, answer: "ok" })),
+    });
+    expect(resumed.status).toBe("COMPLETED");
+    // ANALYZE re-run, IMPLEMENT, INDEPENDENT_REVIEW, CONVERGE — the 5 earlier steps are unrecoverable.
+    expect(resumed.stepsCount).toBe(4);
+    expect(resumed.stepLog.map((r) => r.seq)).toEqual([1, 2, 3, 4]);
+    expect(resumed.stepLog.map((r) => r.state)).toEqual(["ANALYZE", "IMPLEMENT", "INDEPENDENT_REVIEW", "CONVERGE"]);
+  });
+});
+
+describe("ENG-002 — pull-mode read path", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "exec-pull-read-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("nextProjectRunStep on a finished execution (a second host) returns COMPLETED with the same durable record the final submit returned", async () => {
+    const { final } = await driveAnalyzeBlockedOnce(tmpDir, "exec-pull-read");
+    expect(final.status).toBe("COMPLETED");
+    if (final.status !== "COMPLETED") return;
+
+    const reread = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "exec-pull-read" });
+    expect(reread.status).toBe("COMPLETED");
+    if (reread.status !== "COMPLETED") return;
+    expect(reread.result.stepLog).toEqual(final.result.stepLog);
+    expect(reread.result.stepsCount).toBe(9);
+  });
+
+  it("non-terminal pull responses are signals only; the durable record for a running or suspended execution is read through status()", async () => {
+    const executionId = "exec-pull-signals";
+    const action = await nextProjectRunStep({ projectRoot: tmpDir, executionId, runtime: "MOCK" });
+    expect(action.status).toBe("AGENT_ACTION_REQUIRED");
+    expect("stepLog" in action).toBe(false);
+    expect((await statusProjectRun({ executionId, projectRoot: tmpDir })).stepLog).toEqual([]);
+  });
+});

@@ -130,7 +130,9 @@ export interface ProjectRunHostResponse {
   /**
    * The durable, append-only record of every agent step and human suspension in this
    * execution, in order, including what each step reported (ENG-002). See
-   * `ExecutionStepRecord`. Empty for checkpoints written before the log existed.
+   * `ExecutionStepRecord`. Empty for checkpoints written before the log existed
+   * (earlier steps are not reconstructed). Pull-mode step responses other than the
+   * terminal `COMPLETED` one do not carry this; read it with `status()`.
    */
   stepLog: ExecutionStepRecord[];
   /** Present if and only if `status === "HUMAN_INTERVENTION_REQUIRED"`. */

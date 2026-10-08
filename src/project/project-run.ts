@@ -359,6 +359,7 @@ export async function executeProjectRun(
         role,
         missingSkills: validation.missingRequiredSkills,
         failureReason: validation.failureReason,
+        stepLog: context.stepLog,
       };
     }
   }

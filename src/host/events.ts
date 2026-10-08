@@ -57,6 +57,7 @@ export type HumanInterventionRequiredEvent = ProjectRunEventBase<"HUMAN_INTERVEN
 
 export type RunCompletedEvent = ProjectRunEventBase<"RUN_COMPLETED"> & {
   state: CoordinatorState;
+  /** Agent steps in the whole execution (same meaning as `ProjectRunHostResponse.stepsCount`). */
   stepsCount: number;
 };
 

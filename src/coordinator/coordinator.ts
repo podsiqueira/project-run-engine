@@ -42,6 +42,13 @@ export interface CoordinatorRunResult {
   state: CoordinatorState;
   context: CoordinatorExecutionContext;
   history: StepRecord[];
+  /**
+   * Coordinator loop iterations in this `run()` call, including pure state transitions
+   * and the terminal decision; bounded by `maxSteps` and reset on every resume. This is
+   * a loop counter, NOT the number of agent steps in the execution — that is
+   * `countAgentSteps(context.stepLog)`, which is what the host-level
+   * `ProjectRunHostResponse.stepsCount` reports.
+   */
   stepsCount: number;
   terminalDecision: CompleteDecision | RequireHumanInterventionDecision;
 }

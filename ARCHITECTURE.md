@@ -285,8 +285,19 @@ architecture that isn't also checkpointed.
 (role, state, result status, the findings *that result reported*, evidence count, and
 the pull `step_id` when applicable) and one `HUMAN_INTERVENTION` entry per suspension,
 in order, continuing across resumes and restarts. Human answers keep their own
-append-only trail (`human_answers`). `status()` and every `start()`/`resume()`/pull
-response expose it as `stepLog`. Three fields are deliberately distinct:
+append-only trail (`human_answers`). An entry is created only when the engine actually
+applies an agent result or suspends for a human — never for a pure transition, a
+rejected submission (`STALE_STEP`, `INVALID_RESULT`, …), or a dispatch that failed
+before producing a result. It is an execution record, not the decision engine's input
+and not an event stream.
+
+`stepLog` and `stepsCount` are present on `status()`, `start()` and `resume()`
+responses. In pull mode, the terminal `COMPLETED` step response embeds the full host
+response (`result.stepLog`, `result.stepsCount`); the non-terminal variants
+(`AGENT_ACTION_REQUIRED`, `HUMAN_INTERVENTION_REQUIRED`, `BLOCKED_MISSING_SKILLS`,
+`FAILED`) are signals and deliberately do not carry them — a pull host reads the record
+of a running or suspended execution through `status()` (`project-run engine status`).
+Three fields are deliberately distinct:
 
 | Field | Meaning |
 |---|---|
@@ -299,9 +310,14 @@ decision objects) is still not persisted — `status()` and pull responses retur
 `history: []`; use `stepLog` for the durable record. Per-step evidence payloads are not
 retained (only `evidence_count`); the latest result's full evidence remains on
 `last_result`. A checkpoint written before `step_log` existed reports `stepsCount: 0` /
-`stepLog: []` until new steps are recorded. (`CoordinatorRunResult.stepsCount` /
-`ProjectRunExecutionResult.stepsCount` remain the Coordinator loop's per-call iteration
-count, bounded by `maxSteps`; the host-level `stepsCount` above is the one to report.)
+`stepLog: []` until new steps are recorded (earlier steps are not reconstructed).
+
+**Two counters share the name `stepsCount`; they are not the same thing.**
+`ProjectRunHostResponse.stepsCount` (and the `RUN_COMPLETED` event) is the agent-step
+count above. `CoordinatorRunResult.stepsCount` / `ProjectRunExecutionResult.stepsCount`
+are the Coordinator loop's iteration count for that one call — they include pure
+transitions, reset on every resume, and are what `maxSteps` bounds. The workflow
+`iteration` field is a third, unrelated value and is no longer reported as a step count.
 
 ### 4.5 Host adapter responsibilities
 

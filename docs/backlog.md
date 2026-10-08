@@ -145,8 +145,9 @@ provisional — this repository has no formal severity taxonomy.
   - **A**: new append-only `step_log` on the checkpoint (`ExecutionStepRecord`: one
     `AGENT_STEP` per applied result with role/state/status/reported findings/evidence
     count/`step_id`; one `HUMAN_INTERVENTION` per suspension), carried on the context
-    like `human_answers` and exposed as `stepLog` on every host/step response and
-    `status()`.
+    like `human_answers` and exposed as `stepLog` on `status()`, `start()`, `resume()` and
+    the terminal `COMPLETED` pull response (non-terminal pull responses are signals and
+    omit it; read `status()`).
   - **B**: gate semantics untouched; the earlier findings are preserved in
     `stepLog[].findings` (snapshot per step, never merged or de-duplicated; the engine
     does not infer "resolved" — read later entries).

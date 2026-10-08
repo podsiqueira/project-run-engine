@@ -371,11 +371,14 @@ just named, create the feature workspace first (by default `specs/<feature>/`) a
 retry. Feature name, execution id, and git branch are separate things and need not
 match (`ARCHITECTURE.md` §4.16).
 
-**Reporting.** Every response carries `stepLog` (the durable, ordered record of agent
-steps and human suspensions, including every finding each step reported) and
-`stepsCount` (the number of agent steps so far). `findings` is only the latest result's
-findings, so a clean final result reports `findings: []` — read `stepLog` for the full
-record (`ARCHITECTURE.md` §4.4).
+**Reporting.** `status()`, `start()`, `resume()` and the terminal `COMPLETED` pull
+response (under `result`) carry `stepLog` (the durable, ordered record of agent steps and
+human suspensions, including every finding each step reported) and `stepsCount` (the
+number of agent steps in the whole execution, including before a resume). The other pull
+responses are signals and omit them — call `project-run engine status` to read the record
+of a running or suspended execution. `findings` is only the latest result's findings, so
+a clean final result reports `findings: []`; read `stepLog` for the full record
+(`ARCHITECTURE.md` §4.4). `history` is still always `[]` from `status()` and pull mode.
 
 See `templates/host-integrations/claude-code/project-engine-run/SKILL.md` for a
 complete reference skill built on the pull-based step API — it drives the full

@@ -8,7 +8,7 @@
 // engine's existing internal shapes, so the CLI and any future host integration can
 // share a single, machine-readable, non-CLI-output-parsing entry point.
 
-import { countAgentSteps, type AgentDispatchRequest, type AgentResult, type StructuredFinding } from "../domain/types.js";
+import { countAgentSteps, type ExecutionStepRecord, type AgentDispatchRequest, type AgentResult, type StructuredFinding } from "../domain/types.js";
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
 import type { HostExecutionOptions } from "../runtime/host-execution-contract.js";
 import type { StepRecord } from "../coordinator/coordinator.js";
@@ -17,6 +17,7 @@ import {
   executeProjectResume,
   type ProjectRunExecutionResult,
 } from "../project/project-run.js";
+import { FileExecutionStateStore } from "../project/state-store.js";
 import { deriveHumanQuestions, type HumanInterventionRequired } from "../decision/human-intervention.js";
 import type {
   ProjectRunHost,
@@ -100,16 +101,40 @@ function extractFindings(result: ProjectRunExecutionResult): StructuredFinding[]
   return (Array.isArray(findings) ? findings : []) as StructuredFinding[];
 }
 
+/**
+ * The durable, execution-wide step log for a response. Normally taken from the run that
+ * just happened; when the call was rejected before any context existed (e.g. resuming a
+ * completed execution, or a missing config), falls back to whatever the checkpoint
+ * already holds — so a rejected call never reports an existing execution as having
+ * zero steps. Unreadable/absent checkpoint -> empty log.
+ */
+async function resolveStepLog(
+  executionId: string,
+  result: ProjectRunExecutionResult,
+  projectRoot: string | undefined,
+): Promise<ExecutionStepRecord[]> {
+  const live = result.stepLog ?? result.coordinatorResult?.context.stepLog;
+  if (live) return live;
+  try {
+    const persisted = await new FileExecutionStateStore(projectRoot ?? process.cwd()).load(executionId);
+    return persisted?.step_log ?? [];
+  } catch {
+    return [];
+  }
+}
+
 async function buildHostResponse(
   executionId: string,
   result: ProjectRunExecutionResult,
   emit: ProjectRunEventSink,
+  projectRoot: string | undefined,
 ): Promise<ProjectRunHostResponse> {
   const { state, history } = result;
   const findings = extractFindings(result);
-  // The durable, execution-wide step log — not the per-call loop counter on `result`
+  // `stepsCount` is the number of agent steps in the whole execution, derived from the
+  // durable step log — NOT `result.stepsCount`, the Coordinator's per-call loop counter
   // (which also counts pure transitions and restarts at 0 on every resume).
-  const stepLog = result.stepLog ?? result.coordinatorResult?.context.stepLog ?? [];
+  const stepLog = await resolveStepLog(executionId, result, projectRoot);
   const stepsCount = countAgentSteps(stepLog);
 
   switch (result.status) {
@@ -233,7 +258,7 @@ export async function startProjectRun(request: ProjectRunHostRequest): Promise<P
     onStep: createStepEventTranslator(executionId, emit),
   });
 
-  return buildHostResponse(executionId, result, emit);
+  return buildHostResponse(executionId, result, emit, request.projectRoot);
 }
 
 /**
@@ -263,7 +288,7 @@ export async function resumeProjectRun(request: ProjectRunResumeRequest): Promis
     onStep: createStepEventTranslator(request.executionId, emit),
   });
 
-  return buildHostResponse(request.executionId, result, emit);
+  return buildHostResponse(request.executionId, result, emit, request.projectRoot);
 }
 
 /** The `ProjectRunHost` implementation — see `./types.js` for the contract. */
