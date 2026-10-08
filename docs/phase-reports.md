@@ -20,6 +20,7 @@ known limitations, and trust boundaries see `docs/backlog.md`.
 | Phase 4 — Real Claude Code host integration | COMPLETE |
 | Phase 4 Closure — runtime-default hardening, docs, release | COMPLETE |
 | Phase 5 — Persistence hardening | **COMPLETE — released as `0.3.0`** (see [Phase 5](#phase-5--persistence-hardening)) |
+| Post-0.3.0 — Persistence correctness and storage contract | **IMPLEMENTED in source — unreleased** (next release `0.4.0`; see [Post-0.3.0](#post-030--persistence-correctness-and-the-storage-contract)) |
 
 Current release: `@incito-labs/project-run-engine@0.3.0` (`package.json`). Phase 5 shipped as
 `0.3.0`, not a patch, because it changes the typed `history` contract. `0.2.0` was the previous
@@ -203,3 +204,40 @@ detail, ownership, and tests are in `docs/backlog.md`:
 - **Status**: COMPLETE — implemented, validated, review remediation applied, independently
   reviewed, and released as `0.3.0`. The pre-existing, undocumented-until-now limitation that
   `Coordinator.checkpoint()` swallows `save()` failures remains open (`docs/backlog.md`).
+
+## Post-0.3.0 — Persistence correctness and the storage contract
+
+- **Objective**: turn the backlog deferred at `0.3.0` into a coherent next release, prioritised by risk:
+  state correctness first, then concurrency across storage backends, then lock lifecycle, history
+  evolution, and only then host integrations.
+- **Baseline**: `main` at `89a5ef7`, `0.3.0` published (npm `latest`, tag `v0.3.0`).
+- **Delivered** (`ARCHITECTURE.md` §4.17.1–§4.17.2):
+  - **NF-2 resolved.** A checkpoint write the engine needs but cannot do is never swallowed: it is a
+    `CheckpointWriteError` / non-terminal `failureCode: "CHECKPOINT_WRITE_FAILED"`, reporting the last
+    durable state, recoverable through `next-step` / `resume`. Proven by failing each single save of a
+    full pull and push lifecycle. Exhaustive failure injection also exposed a `0.3.0` crash-recovery
+    defect (an `IN_PROGRESS` checkpoint at `READY_FOR_PR` could never be completed), now fixed.
+  - **Storage contract.** Revisioned checkpoints; `save(state, { expectedRevision })`
+    compare-and-swap with `CheckpointConflictError` (`CHECKPOINT_CONFLICT`); an exact CAS in the file store
+    (a short per-execution write guard) that is independent of the execution lock, so a lock that did
+    not hold — or a live lock deleted by hand — now yields a rejected write instead of a lost update;
+    `stateStore` accepted by the host `start()`/`resume()`/`status()`; the whole engine verified on a
+    store with no filesystem.
+- **Evaluated and deferred, with evidence**: lock heartbeat (the engine cannot falsely reclaim a live
+  holder, so there is nothing to fix — §4.17.3); event-stream / payload history (a full lifecycle is
+  8–10 KB with compact history, no requirement — §4.17.4); a concrete database store (no backend or
+  requirement); host integrations (sequenced after this release — `docs/backlog.md`); ENG-003 stays
+  consumer-owned.
+- **Evidence**: `tests/checkpoint-save-failures.test.ts` (16), `tests/state-store-contract.test.ts` (29);
+  the full suite is **292** tests in 30 files. Mutation-checked in a scratch copy: 16 mutants of the new
+  behaviour (swallowing a save error again, marking `FAILED` after a write failure, dropping the CAS check,
+  the write guard, revision chaining, or the base revisions, un-fixing the `READY_FOR_PR` recovery, ...) are all killed.
+  The two-process polling/submission stress and the randomized invariants are unchanged: 0 stale steps, 0
+  dispatch/step mismatches.
+- **Compatibility / semver**: purely additive on the public surface (`CheckpointWriteError`,
+  `CheckpointConflictError`, `PersistenceFailureCode`, `ExecutionFailureCode`, `ExecutionSaveOptions`,
+  `ExecutionSaveReceipt`, `PersistedExecutionState.revision`, `failureCode`, `persistenceFailure`,
+  `stateStore` on the host requests); schema `version` stays `1`; `0.3.0` checkpoints and
+  `void`-returning stores keep working. One behaviour change: save errors that were silently ignored now
+  surface — recommended version **`0.4.0`** (minor, pre-1.0). Details for consumers: `CONSUMER-GUIDE.md` §11.
+- **Status**: implemented, validated, documented; **not released** (release preparation is a separate step).
