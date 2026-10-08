@@ -347,6 +347,7 @@ export async function submitProjectRunStep(
     context: persisted.context,
     findings: persisted.findings as FindingInput[] | undefined,
     humanAnswers: persisted.human_answers,
+    stepLog: persisted.step_log,
     execution: {
       execution_id: persisted.execution_id,
       feature: persisted.feature,
@@ -363,7 +364,7 @@ export async function submitProjectRunStep(
   // place the engine ever "believes" what the host reports, and it does so by
   // handing the result to the SAME Coordinator method (applyExternalResult) and the
   // SAME CoordinatorDecisionEngine every push-mode dispatch uses. No new trust path.
-  await coordinator.applyExternalResult(context, request.result as AgentResult);
+  await coordinator.applyExternalResult(context, request.result as AgentResult, request.stepId);
 
   try {
     const prepared = await coordinator.prepareNextAction(context, request.maxSteps);

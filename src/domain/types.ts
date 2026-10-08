@@ -174,6 +174,50 @@ export interface AgentResult {
   execution_metadata?: HostExecutionMetadata;
 }
 
+/**
+ * One entry in an execution's durable, append-only step log (ENG-002).
+ *
+ * The log is the engine's persisted answer to "what actually happened in this run":
+ * every agent result the engine applied (`AGENT_STEP`) and every time it suspended for
+ * a human (`HUMAN_INTERVENTION`), in order, across restarts and resumes. It is
+ * deliberately NOT the decision engine's input — gates still read the latest result's
+ * findings (`CoordinatorExecutionContext.findings`), so a clean re-run still clears a
+ * blocking gate. The log keeps what that replacement would otherwise erase.
+ *
+ * - `findings` is a snapshot of exactly what that result reported, never merged or
+ *   de-duplicated: a finding raised at step 3 and absent from step 8's (clean) result
+ *   is still visible at step 3.
+ * - Per-step evidence payloads are not retained (only `evidence_count`); the most
+ *   recent result's full evidence remains on `PersistedExecutionState.last_result`.
+ */
+export type ExecutionStepKind = "AGENT_STEP" | "HUMAN_INTERVENTION";
+
+export interface ExecutionStepRecord {
+  /** 1-based position in the log; continues across resumes and restarts. */
+  seq: number;
+  kind: ExecutionStepKind;
+  /** The state the step ran in (`AGENT_STEP`) or the state suspended from (`HUMAN_INTERVENTION`). */
+  state: CoordinatorState;
+  /** `AGENT_STEP` only: the role whose result was applied. */
+  role?: AgentRole;
+  /** `AGENT_STEP` only: the `AgentResult.status` the engine acted on. */
+  status?: string;
+  /** `AGENT_STEP` only, pull-mode only: the correlation id of the submitted step. */
+  step_id?: string;
+  /** `AGENT_STEP` only: the findings that result reported (possibly empty). */
+  findings?: (StructuredFinding | unknown)[];
+  /** `AGENT_STEP` only: how many evidence items that result carried. */
+  evidence_count?: number;
+  /** `HUMAN_INTERVENTION` only: why the engine suspended. */
+  reason?: string;
+  recorded_at: string;
+}
+
+/** Number of agent steps (applied agent results) in a step log — the meaning of `stepsCount`. */
+export function countAgentSteps(stepLog: readonly ExecutionStepRecord[] | undefined): number {
+  return (stepLog ?? []).filter((r) => r.kind === "AGENT_STEP").length;
+}
+
 export class ProjectNotGitRepositoryError extends Error {
   readonly code = "PROJECT_NOT_GIT_REPOSITORY";
   constructor(message = "Target directory is not a git repository") {

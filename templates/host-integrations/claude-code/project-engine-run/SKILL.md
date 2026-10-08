@@ -63,6 +63,12 @@ Extract the feature name from `$ARGUMENTS` (e.g. `/project-engine-run
 If no feature is given, ask the user which feature to run, or omit `feature` from the
 payload below to let the engine auto-discover it from the current git branch.
 
+**New feature?** The engine finds features, it does not create them. If the first
+`next-step` returns `FAILED` with `FEATURE_NOT_DISCOVERED` for a feature you were told
+to start, create `specs/<feature>/` (a seed file is fine) and call `next-step` again.
+The feature name, execution id and git branch are three separate things — the branch
+does not have to match the feature (`ARCHITECTURE.md` §4.16).
+
 ## Outline
 
 1. **Determine the repository root.** Use the current working directory, or ask the

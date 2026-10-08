@@ -12,7 +12,7 @@
 // checkpoint record (FileExecutionStateStore) into the same ProjectRunHostResponse
 // shape `start()`/`resume()` already return, so a host can treat all three uniformly.
 
-import type { StructuredFinding } from "../domain/types.js";
+import { countAgentSteps, type StructuredFinding } from "../domain/types.js";
 import { FileExecutionStateStore, type ExecutionStateStore } from "../project/state-store.js";
 import { deriveHumanQuestions, type HumanInterventionRequired } from "../decision/human-intervention.js";
 import type { ProjectRunHostResponse, ProjectRunStatusRequest } from "./types.js";
@@ -24,12 +24,13 @@ export interface ProjectRunStatusOptions extends ProjectRunStatusRequest {
 /**
  * Reads back the current, persisted status of an execution without advancing it.
  *
- * Note on completeness: the persisted checkpoint record does not currently retain the
- * full step-by-step `history` (only the Coordinator's in-memory run result does — see
- * the Phase 2 report's Findings). `status()` therefore always returns `history: []`
- * and a `stepsCount` approximated from the persisted `iteration` counter; a host that
- * needs the exact step sequence of a run must observe it live via `onEvent` during the
- * `start()`/`resume()` call that produced it.
+ * What is and isn't durable (see `ARCHITECTURE.md` §4.4/§4.15 and `docs/backlog.md`
+ * ENG-002): the checkpoint retains an append-only `step_log` — every agent step (with
+ * the findings it reported) and every human suspension — so `stepLog` and `stepsCount`
+ * are exact, including across resumes and restarts. `findings` is the latest result's
+ * findings only. `history` (the live `StepRecord[]` of decisions) is NOT persisted, so
+ * `status()` always returns `history: []`; use `stepLog` for the durable record. A
+ * checkpoint written before the step log existed reports `stepsCount: 0` / `stepLog: []`.
  */
 export async function statusProjectRun(
   options: ProjectRunStatusOptions,
@@ -49,6 +50,7 @@ export async function statusProjectRun(
       stepsCount: 0,
       history: [],
       findings: [],
+      stepLog: [],
       failureReason: (err as Error).message,
     };
   }
@@ -62,6 +64,7 @@ export async function statusProjectRun(
       stepsCount: 0,
       history: [],
       findings: [],
+      stepLog: [],
       failureReason: `EXECUTION_NOT_FOUND: Execution '${options.executionId}' not found in state store`,
     };
   }
@@ -70,9 +73,10 @@ export async function statusProjectRun(
   const base = {
     executionId: persisted.execution_id,
     state: persisted.state,
-    stepsCount: persisted.iteration,
+    stepsCount: countAgentSteps(persisted.step_log),
     history: [],
     findings,
+    stepLog: persisted.step_log ?? [],
   };
 
   switch (persisted.lifecycle_status) {

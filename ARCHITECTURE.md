@@ -280,12 +280,44 @@ Host B never needs anything from Host A beyond the `executionId` and the shared
 recovers from its own crash: there is no in-memory-only state anywhere in this
 architecture that isn't also checkpointed.
 
-**Known limitation**: the persisted checkpoint does not currently retain full
-step-by-step `history` (only a live `Coordinator.run()` call's in-memory result does).
-`status()` therefore returns `history: []` and an approximate `stepsCount`. A host that
-needs the exact step sequence of a run must observe it live via `onEvent` during the
-`start()`/`resume()` call that produced it — see the Phase 2 report's Findings for why
-this wasn't changed in this phase.
+**What is durable, and what is not.** The checkpoint carries an append-only `step_log`
+(`ExecutionStepRecord[]`): one `AGENT_STEP` entry per agent result the engine applied
+(role, state, result status, the findings *that result reported*, evidence count, and
+the pull `step_id` when applicable) and one `HUMAN_INTERVENTION` entry per suspension,
+in order, continuing across resumes and restarts. Human answers keep their own
+append-only trail (`human_answers`). An entry is created only when the engine actually
+applies an agent result or suspends for a human — never for a pure transition, a
+rejected submission (`STALE_STEP`, `INVALID_RESULT`, …), or a dispatch that failed
+before producing a result. It is an execution record, not the decision engine's input
+and not an event stream.
+
+`stepLog` and `stepsCount` are present on `status()`, `start()` and `resume()`
+responses. In pull mode, the terminal `COMPLETED` step response embeds the full host
+response (`result.stepLog`, `result.stepsCount`); the non-terminal variants
+(`AGENT_ACTION_REQUIRED`, `HUMAN_INTERVENTION_REQUIRED`, `BLOCKED_MISSING_SKILLS`,
+`FAILED`) are signals and deliberately do not carry them — a pull host reads the record
+of a running or suspended execution through `status()` (`project-run engine status`).
+Three fields are deliberately distinct:
+
+| Field | Meaning |
+|---|---|
+| `findings` | The findings of the **most recent** agent result — the decision engine's gate input. A later clean result replaces it with `[]`; that replacement is what lets a re-run clear a blocking gate, so it is intentionally unchanged. |
+| `stepLog[].findings` | What each step **reported**, never merged or replaced. A finding raised at step 5 is still there after a clean re-run at step 8. Whether it was resolved is read from later entries, not inferred by the engine. |
+| `stepsCount` | The number of `AGENT_STEP` entries in the whole execution. Pure state transitions and human suspensions are not steps; the count includes steps before a resume. |
+
+**Known limitations**: `history` (the live `StepRecord[]` of decisions, including the
+decision objects) is still not persisted — `status()` and pull responses return
+`history: []`; use `stepLog` for the durable record. Per-step evidence payloads are not
+retained (only `evidence_count`); the latest result's full evidence remains on
+`last_result`. A checkpoint written before `step_log` existed reports `stepsCount: 0` /
+`stepLog: []` until new steps are recorded (earlier steps are not reconstructed).
+
+**Two counters share the name `stepsCount`; they are not the same thing.**
+`ProjectRunHostResponse.stepsCount` (and the `RUN_COMPLETED` event) is the agent-step
+count above. `CoordinatorRunResult.stepsCount` / `ProjectRunExecutionResult.stepsCount`
+are the Coordinator loop's iteration count for that one call — they include pure
+transitions, reset on every resume, and are what `maxSteps` bounds. The workflow
+`iteration` field is a third, unrelated value and is no longer reported as a step count.
 
 ### 4.5 Host adapter responsibilities
 
@@ -624,3 +656,56 @@ one of these entry points — it is not expected to fire for any supported host
 integration, and a consuming project's `runtime.default_runtime` is a fully functional
 part of the configuration contract: a host may omit `runtime` on every call once it is
 set, exactly as `CONSUMER-GUIDE.md` §9.2 now documents.
+
+### 4.15 Trust boundary: result truthfulness
+
+```text
+Project Run Engine
+    ↓  orchestrates state transitions; validates result shape/status
+Host / agent
+    ↓  responsible for truthful execution reporting
+```
+
+The engine decides the next state purely from the `status` and `findings` of the
+`AgentResult` a host submits, and rejects malformed, stale, forged-identity, or
+post-terminal submissions (§4.11). It does **not** re-run tests, re-inspect files, or
+otherwise verify that the agent really did what it claims; a host that reports `PASS`
+for work it did not do is trusted. The reference Claude Code skill states this
+obligation to the agent explicitly (`SKILL.md`, "Truthfulness"). Building an
+independent verifier is out of scope; see `docs/backlog.md`.
+
+### 4.16 Feature bootstrap and identity boundaries
+
+Three distinct identities travel through an execution, and the engine never conflates
+them: the **feature** (which unit of work, e.g. `007-lifecycle-smoke-test`), the
+**execution id** (this run of the workflow, e.g. `exec-1791412982780-58use`), and the
+**git branch** (what the working tree has checked out, e.g.
+`tmp/project-run-lifecycle-smoke`). Each is its own field on the execution context, the
+dispatch request, and the checkpoint. Feature and branch names are not required to match;
+branch→feature matching in `discoverFeature()` is only a convenience for locating an
+*existing* `specs/<name>/` directory when no feature is given explicitly.
+
+**Who creates a new feature's workspace: the host/consumer, not the engine.** The engine
+discovers features; at run time it writes only under `.project-run/` and never creates a
+feature directory. A call naming a feature whose directory does not exist returns
+`FEATURE_NOT_DISCOVERED` (with an actionable reason) before any execution record is
+written. The reasons this is not the engine's job:
+
+- The workspace layout and naming belong to the workflow preset and its tooling. The
+  bundled `speckit-specify` skill itself allocates the directory name (numbering by
+  scanning existing `specs/` entries), runs `mkdir -p`, and records the path in
+  `.specify/feature.json`; an engine-created directory would be a second, unsynchronised
+  owner of that decision.
+- Creating workspace files from inside the engine would break the engine's
+  "provider-neutral orchestration, no workspace mutation" boundary.
+
+Required host behaviour for a brand-new feature: create the feature workspace (by
+default `specs/<feature>/`, any seed file is fine) and then call `next-step`/`start`
+with that `feature`. If the feature name is only known after the specify step allocates
+it, the host must establish it first — the engine cannot dispatch `SPECIFY` for a
+feature it cannot locate. Whether to later offer an *opt-in*, preset-aware bootstrap
+helper is a possible enhancement, not a decision; see `docs/backlog.md` (ENG-001).
+
+Prerequisite scripts that print a `BRANCH:` value (`.specify/scripts/bash/*.sh`) live in
+the consuming project, not in this package; their reporting of a feature name under
+`BRANCH` is outside the engine (`docs/backlog.md`, ENG-003).

@@ -21,6 +21,7 @@ import type {
   AgentRuntime,
   AgentSkillRequirement,
   CoordinatorState,
+  ExecutionStepRecord,
   HostExecutionOptions,
   StructuredFinding,
 } from "../domain/types.js";
@@ -106,9 +107,34 @@ export interface ProjectRunHostResponse {
   terminal: boolean;
   executionId: string;
   state: CoordinatorState;
+  /**
+   * The number of agent steps (applied agent results) in the whole execution so far,
+   * counted from the durable `stepLog` — so it includes steps performed before a
+   * resume or restart, and excludes pure state transitions and human suspensions.
+   * (Before ENG-002 this was a per-call loop counter in push-mode and the constant
+   * workflow `iteration` in `status()`.)
+   */
   stepsCount: number;
+  /**
+   * Live, in-memory only: the Coordinator's step records for the `start()`/`resume()`
+   * call that produced this response. Always `[]` from `status()` and pull-mode
+   * responses. Use `stepLog` for the durable record.
+   */
   history: StepRecord[];
+  /**
+   * The findings reported by the MOST RECENT agent result — the same findings the
+   * decision engine gates on. A later clean result legitimately replaces this with
+   * `[]`; earlier findings remain visible in `stepLog`.
+   */
   findings: StructuredFinding[];
+  /**
+   * The durable, append-only record of every agent step and human suspension in this
+   * execution, in order, including what each step reported (ENG-002). See
+   * `ExecutionStepRecord`. Empty for checkpoints written before the log existed
+   * (earlier steps are not reconstructed). Pull-mode step responses other than the
+   * terminal `COMPLETED` one do not carry this; read it with `status()`.
+   */
+  stepLog: ExecutionStepRecord[];
   /** Present if and only if `status === "HUMAN_INTERVENTION_REQUIRED"`. */
   humanIntervention?: HumanInterventionRequired;
   /** Present if and only if `status === "BLOCKED_MISSING_SKILLS"`. */

@@ -8,6 +8,7 @@ import type {
   AgentRuntime,
   AgentResult,
   CoordinatorState,
+  ExecutionStepRecord,
   StructuredFinding,
 } from "../domain/types.js";
 import {
@@ -62,6 +63,13 @@ export interface PersistedExecutionState {
   last_result?: AgentResult;
   findings?: (StructuredFinding | unknown)[];
   history?: StepRecord[];
+  /**
+   * Durable, append-only record of every agent result applied and every human
+   * suspension, in order (ENG-002). Unlike `findings` (the latest result's findings,
+   * which the decision engine gates on and which a clean re-run replaces), nothing in
+   * here is overwritten. Absent on checkpoints written before this field existed.
+   */
+  step_log?: ExecutionStepRecord[];
   terminal_reason?: string;
   /**
    * The most recent Human-in-the-Loop request the engine raised: why the workflow
