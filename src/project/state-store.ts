@@ -12,6 +12,7 @@ import type {
   StructuredFinding,
 } from "../domain/types.js";
 import {
+  CheckpointConflictError,
   ExecutionLockError,
   ExecutionLockTimeoutError,
   ExecutionLockUnavailableError,
@@ -105,8 +106,35 @@ export interface PersistedExecutionState {
    * a result, which is what makes duplicate/stale submissions rejectable.
    */
   pending_action?: PersistedPendingAction;
+  /**
+   * Store-assigned, strictly increasing write counter for this execution: `1` for the first
+   * checkpoint, `+1` for every successful save. Absent on checkpoints written before it existed
+   * (read as `0`, "no revision yet"). It is the token of optimistic concurrency (see
+   * `ExecutionSaveOptions.expectedRevision`); callers never set it — a store ignores any value in
+   * the state it is given and assigns its own.
+   */
+  revision?: number;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * Options of `ExecutionStateStore.save()`.
+ */
+export interface ExecutionSaveOptions {
+  /**
+   * Optimistic concurrency (compare-and-swap). When present, the save applies ONLY IF the
+   * execution's currently stored revision equals this value (`0` = no checkpoint stored yet, or
+   * one written before revisions existed). Otherwise the store must reject the write with a
+   * `CheckpointConflictError` and change nothing. Stores that cannot honour it ignore the option.
+   */
+  expectedRevision?: number;
+}
+
+/** What a successful `save()` reports back. */
+export interface ExecutionSaveReceipt {
+  /** The revision now stored for the execution. */
+  revision: number;
 }
 
 export interface ExecutionLockOptions {
@@ -116,8 +144,30 @@ export interface ExecutionLockOptions {
   pollMs?: number;
 }
 
+/**
+ * The storage contract the engine is written against. The Coordinator and every entry point know
+ * nothing about files: anything that satisfies this interface can hold executions (the file store
+ * below is the reference implementation; a database store would implement the same methods).
+ *
+ * Required semantics:
+ *  - `save` resolves only once the checkpoint is DURABLE and rejects otherwise; a rejected save
+ *    changed nothing visible (all-or-nothing — a reader sees the previous or the new checkpoint,
+ *    never a mixture). The engine treats a rejection as "this progress did not happen"
+ *    (`CheckpointWriteError`) — a store must never resolve a save it did not persist.
+ *  - `load` returns the last durable checkpoint (`null` when none) or throws; `exists` agrees with it.
+ *  - Optional `withLock`: mutual exclusion for one execution's read-modify-write turn.
+ *  - Optional optimistic concurrency: if `save` is given `expectedRevision` it compares-and-swaps
+ *    against the stored revision, rejects a mismatch with `CheckpointConflictError` without writing,
+ *    and returns the new revision so the next write of the same turn can chain from it. A store that
+ *    supports it must assign `revision` (1, 2, 3, ...) on every save and return it from `load`.
+ *
+ * `withLock` and `expectedRevision` are independent guarantees: the lock keeps cooperating callers
+ * from interleaving; the revision check makes any lost update that still slips through (lock not
+ * held, deleted by an operator, not offered by the store) a rejected write instead of silent overwrite.
+ * See `ARCHITECTURE.md` §4.17 for what each backend can and cannot promise.
+ */
 export interface ExecutionStateStore {
-  save(state: PersistedExecutionState): Promise<void>;
+  save(state: PersistedExecutionState, options?: ExecutionSaveOptions): Promise<void | ExecutionSaveReceipt>;
   load(executionId: string): Promise<PersistedExecutionState | null>;
   exists(executionId: string): Promise<boolean>;
   list?(): Promise<PersistedExecutionState[]>;
@@ -244,6 +294,13 @@ export function validatePersistedState(
     );
   }
 
+  if (state.revision !== undefined && (!Number.isInteger(state.revision) || state.revision < 0)) {
+    throw new InvalidPersistedStateError(
+      executionId,
+      `Persisted state for '${executionId}' has an invalid 'revision' (${String(state.revision)}); expected a non-negative integer.`,
+    );
+  }
+
   return state as PersistedExecutionState;
 }
 
@@ -324,42 +381,100 @@ export class FileExecutionStateStore implements ExecutionStateStore {
     return fs.existsSync(filePath);
   }
 
-  async save(state: PersistedExecutionState): Promise<void> {
+  /**
+   * Writes a checkpoint atomically (temp file + fsync + rename) and assigns it the next revision.
+   *
+   * Every save runs inside a short per-execution WRITE GUARD (`<id>.cas`, the same exclusive-create
+   * file mechanism as the execution lock, held only for the revision check + rename). That makes
+   * "compare the stored revision, then replace the file" atomic among all engine processes on this
+   * machine, independent of whether the execution lock is held — so `expectedRevision` is an exact
+   * compare-and-swap here, not a best-effort check. Same scope as the lock: one machine, a local
+   * filesystem with atomic exclusive create; callers that bypass the guard (an older engine, direct
+   * file edits) are not covered.
+   *
+   * This implementation always resolves with the `ExecutionSaveReceipt`, but the declared return type is
+   * the contract's `void | ExecutionSaveReceipt` so that a subclass written against `0.3.0`
+   * (`override async save(state): Promise<void>`) keeps type-checking. Callers that need the revision
+   * narrow it: `const receipt = await store.save(s); if (receipt) receipt.revision`.
+   */
+  async save(state: PersistedExecutionState, options: ExecutionSaveOptions = {}): Promise<void | ExecutionSaveReceipt> {
     if (!fs.existsSync(this.runsDir)) {
       fs.mkdirSync(this.runsDir, { recursive: true });
     }
 
-    const sanitized: PersistedExecutionState = {
-      ...state,
-      version: CURRENT_STATE_SCHEMA_VERSION,
-      context: scrubSecrets(state.context),
-      updated_at: new Date().toISOString(),
-    };
-
     const filePath = this.getFilePath(state.execution_id);
-    const serialized = JSON.stringify(sanitized, null, 2);
-
-    // Write-then-rename: a concurrent reader (or a crash mid-write) never observes a
-    // truncated or half-written checkpoint — the file is always either the previous
-    // complete record or the new complete record. The temp file is fsync'd before the
-    // rename so a process crash cannot leave a renamed-but-empty file.
-    const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+    const release = await this.acquireWriteGuard(state.execution_id);
     try {
-      const fd = fs.openSync(tmpPath, "w");
-      try {
-        fs.writeSync(fd, serialized, 0, "utf8");
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
+      const stored = this.readStoredRevision(filePath);
+      if (stored === "unreadable" && options.expectedRevision !== undefined) {
+        // Not a concurrent change: the stored checkpoint itself is broken. Refuse to guess
+        // (an unconditional save is the only way to repair it); reported as a failed write.
+        throw new Error(`The stored checkpoint at ${filePath} cannot be read, so the revision to compare against is unknown`);
       }
-      fs.renameSync(tmpPath, filePath);
+      if (options.expectedRevision !== undefined && stored !== "unreadable" && options.expectedRevision !== stored) {
+        throw new CheckpointConflictError(state.execution_id, state.lifecycle_status, options.expectedRevision, stored);
+      }
+      const revision = (stored === "unreadable" ? 0 : stored) + 1;
+
+      const sanitized: PersistedExecutionState = {
+        ...state,
+        version: CURRENT_STATE_SCHEMA_VERSION,
+        context: scrubSecrets(state.context),
+        revision,
+        updated_at: new Date().toISOString(),
+      };
+      const serialized = JSON.stringify(sanitized, null, 2);
+
+      // Write-then-rename: a concurrent reader (or a crash mid-write) never observes a
+      // truncated or half-written checkpoint — the file is always either the previous
+      // complete record or the new complete record. The temp file is fsync'd before the
+      // rename so a process crash cannot leave a renamed-but-empty file.
+      const tmpPath = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+      try {
+        const fd = fs.openSync(tmpPath, "w");
+        try {
+          fs.writeSync(fd, serialized, 0, "utf8");
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        fs.renameSync(tmpPath, filePath);
+      } catch (err) {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          // temp file may not exist
+        }
+        throw err;
+      }
+      return { revision };
+    } finally {
+      release();
+    }
+  }
+
+  /** The revision of the stored checkpoint: `0` when none (or written before revisions existed), `"unreadable"` when the file cannot be parsed. */
+  private readStoredRevision(filePath: string): number | "unreadable" {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(filePath, "utf8");
     } catch (err) {
-      try {
-        fs.unlinkSync(tmpPath);
-      } catch {
-        // temp file may not exist
-      }
-      throw err;
+      return (err as NodeJS.ErrnoException).code === "ENOENT" ? 0 : "unreadable";
+    }
+    try {
+      const parsed = JSON.parse(raw) as { revision?: unknown };
+      return typeof parsed.revision === "number" && Number.isInteger(parsed.revision) && parsed.revision >= 0 ? parsed.revision : 0;
+    } catch {
+      return "unreadable";
+    }
+  }
+
+  private async acquireWriteGuard(executionId: string): Promise<() => void> {
+    try {
+      return await this.acquireLockOrThrow(executionId, { timeoutMs: 10_000, pollMs: 5 }, this.getLockPath(executionId).replace(/\.lock$/, ".cas"));
+    } catch (err) {
+      // Not an execution-lock failure: say what actually failed (the checkpoint write guard).
+      throw new Error(`Could not obtain the checkpoint write guard for execution '${executionId}' (${(err as Error).message})`);
     }
   }
 
@@ -409,12 +524,12 @@ export class FileExecutionStateStore implements ExecutionStateStore {
     }
   }
 
-  private async acquireLockOrThrow(executionId: string, options: ExecutionLockOptions): Promise<() => void> {
+  private async acquireLockOrThrow(executionId: string, options: ExecutionLockOptions, lockPathOverride?: string): Promise<() => void> {
     const timeoutMs = options.timeoutMs ?? this.lockDefaults.timeoutMs ?? 30_000;
     const pollMs = options.pollMs ?? this.lockDefaults.pollMs ?? 25;
     fs.mkdirSync(this.runsDir, { recursive: true });
 
-    const lockPath = this.getLockPath(executionId);
+    const lockPath = lockPathOverride ?? this.getLockPath(executionId);
     const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     const info: LockInfo = { pid: process.pid, token, acquired_at: new Date().toISOString() };
     const deadline = Date.now() + timeoutMs;

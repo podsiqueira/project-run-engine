@@ -11,7 +11,7 @@ Add `@incito-labs/project-run-engine` to your repository's `package.json`:
 ```json
 {
   "dependencies": {
-    "@incito-labs/project-run-engine": "^0.3.0"
+    "@incito-labs/project-run-engine": "^0.4.0"
   }
 }
 ```
@@ -295,6 +295,29 @@ A lock error raised *inside* an operation (for example by an adapter that tries 
 same execution from within a push-mode run) is **not** one of these: the turn fails as an ordinary
 terminal `FAILED`, its `failureReason` does not begin with a lock code, and the execution is not resumable.
 
+**Checkpoint write failures and conflicts** *(since `0.4.0` — `ARCHITECTURE.md` §4.17.1–§4.17.2)*. The engine never reports progress that is not durable. If a checkpoint it
+needs cannot be written, or the execution was changed by someone else while the call was in
+progress, the call returns a non-terminal `FAILED` with `terminal: false` and a machine-readable
+`failureCode` (the same field now also carries the two lock codes):
+
+| `failureCode` | Meaning | What to do |
+|---|---|---|
+| `CHECKPOINT_WRITE_FAILED` | The store rejected a `save()` (disk full, I/O error, permissions). The execution is at its last durable checkpoint; `state`/`stepLog`/`history` in the response are that checkpoint's — **unless the store cannot be read either**, in which case `state` is only a placeholder (`"INTAKE"` in pull responses, the abandoned turn's in-memory state in push results) and not a confirmed durable state. | Fix the storage problem, then call `next-step` again with the same `executionId` (pull) or `resume` (push; `start` again only if nothing was ever written). Submitting the same result again is safe — it is applied at most once. |
+| `CHECKPOINT_CONFLICT` | The execution was modified by another operation after this call read it (optimistic concurrency); nothing of this call was written and the other operation's checkpoint stands. Normally prevented by the lock, so it means the lock did not hold. | Do **not** retry blindly: call `next-step` (or `status`) to get the current state. |
+
+**Writing your own store.** `ExecutionStateStore` (exported) is all the engine knows about storage —
+`save` / `load` / `exists`, plus optional `list` and `withLock`. A `save` must resolve only once the
+checkpoint is durable and reject otherwise. To get compare-and-swap, assign a per-execution `revision`
+(1, 2, 3, ...), return it from `load()`, accept `save(state, { expectedRevision })`, throw
+`CheckpointConflictError` (nothing written) when it does not match the stored revision (`0` = none yet),
+and return `{ revision }` from `save`. A store written against the `0.3.0` contract (`save(state): Promise<void>`)
+keeps working without it, and so does a **subclass of `FileExecutionStateStore` that overrides `save()` returning
+`Promise<void>`**: `FileExecutionStateStore.save` is declared `Promise<void | ExecutionSaveReceipt>` (it always
+resolves the receipt), so narrow before reading it: `const receipt = await store.save(s); if (receipt) receipt.revision`. `startProjectRun` / `resumeProjectRun` / `statusProjectRun` and the pull
+functions all take a `stateStore`. The bundled file store is local-filesystem, single-machine only — it
+is **not** safe across machines or network filesystems; for that you need a store whose conditional write
+is atomic across machines.
+
 **Clearing a stale lock by hand.** The lock file is `.project-run/runs/<executionId>.lock`
 (named in the `EXECUTION_LOCKED` message). A lock left by a crashed process is reclaimed
 automatically. The engine will *not* remove a lock whose recorded pid is still alive — it cannot
@@ -511,6 +534,34 @@ hosts. Do not run mixed versions against one execution.
 same call) and `EXECUTION_LOCK_UNAVAILABLE:` (fix the environment; do not retry blindly) as
 non-terminal; both arrive as `FAILED` with `terminal: false`. Details and manual recovery are in
 section 6.
+
+---
+
+## 11. Upgrading from 0.3.x to 0.4.x
+
+`0.4.0` is a minor, pre-1.0 release after `0.3.0`: the public surface only grows,
+the persisted `version` stays `1`, and `0.3.x` checkpoints and `void`-returning stores keep working. **One
+behaviour changes:** a failed checkpoint write used to be silently ignored and is now reported.
+
+| | `0.3.x` | `0.4.x` |
+|---|---|---|
+| A checkpoint `save()` fails | ignored; the call could still return an action / result / completion that was not saved (later `STALE_STEP`) | non-terminal `FAILED`, `failureCode: "CHECKPOINT_WRITE_FAILED"`, last durable state; recover with `next-step` / `resume` |
+| Human answers that cannot be recorded | the run went on | the call fails the same way and nothing is acted on |
+| Failure codes | `failureReason` prefix only | also `failureCode` (`EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`, `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`) on `FAILED` responses; push results: `lockFailure` / `persistenceFailure` |
+| Lost updates when the lock did not hold | possible | `PersistedExecutionState.revision` + compare-and-swap writes for every turn that continues an execution (pull `next-step`/`submit`, push `resume`) and for pull creation; the loser gets `CHECKPOINT_CONFLICT`. **Not covered: the initial push `start`** — its first write is unconditional, so `start` with an `executionId` that already exists *restarts* that execution (same as `0.3.x`); use a fresh id per new run and `resume` / `next-step` to continue one |
+| `start()` / `resume()` / `status()` storage | file store only | accept a `stateStore` |
+| A checkpoint left `IN_PROGRESS` at `READY_FOR_PR` (crash) | `resume` / `next-step` refused it as completed | recovers and completes |
+| Push agent work around a failed checkpoint write | (the failure was invisible) | **at-least-once**: after `resume`, an adapter can be invoked again for work whose result was produced but never saved — don't assume exactly-once external side effects |
+| `FAILED` response when the advisory `FAILED` marker could not be written | n/a (swallowed) | still `FAILED`/`terminal: true`, but the persisted lifecycle stays `IN_PROGRESS` (`status()` = `RUNNING`, `resume` works); trust `status()` for the durable lifecycle |
+
+**What to do:** handle `failureCode` (or the `failureReason` prefix) `CHECKPOINT_WRITE_FAILED` and
+`CHECKPOINT_CONFLICT` as non-terminal like the lock failures (section 6). If you implement
+`ExecutionStateStore` or subclass `FileExecutionStateStore`: `save` may now return `{ revision }` and
+receives an optional second argument; `FileExecutionStateStore.save` is declared `Promise<void | ExecutionSaveReceipt>`, so
+a TypeScript subclass written against `0.3.x` that overrides `save()` returning `Promise<void>` still compiles (it
+just doesn't pass options on unless it forwards them). Keep `.project-run/runs/` in `.gitignore` — the file store
+now also creates a short-lived `<executionId>.cas` write guard. Mixed `0.3.x` / `0.4.x` use of one
+execution is not supported (a `0.3.x` engine does not maintain `revision` or take the write guard).
 
 ---
 

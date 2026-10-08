@@ -113,7 +113,7 @@ This constraint is continuously enforced by automated package-boundary tests.
 
 ## 3. Runtime Persistence Directory
 
-During execution, `project-run-engine` checkpoints state to `.project-run/runs/<execution_id>.json`. This directory is managed by the consumer project and should be added to `.gitignore`. Checkpoints are sanitized of credentials and sensitive tokens prior to disk persistence.
+During execution, `project-run-engine` checkpoints state to `.project-run/runs/<execution_id>.json`. This directory is managed by the consumer project and should be added to `.gitignore`. Checkpoints are sanitized of credentials and sensitive tokens prior to disk persistence. Besides `<id>.json`, the directory transiently holds `<id>.lock` (execution lock), `<id>.cas` (write guard, since `0.4.0`) and `*.tmp` files; they are removed after use, so ignore the whole directory in version control.
 
 ---
 
@@ -150,6 +150,6 @@ Test files are **not** type-checked by `npm run typecheck`; they are transpiled 
 
 ## 6. Publishing
 
-`@incito-labs/project-run-engine` is published to the public npm registry (`"publishConfig": { "access": "public" }`). Versions `0.1.0`, `0.1.1`, `0.2.0` and `0.3.0` have been published so far (`0.3.0` verified from a fresh registry install; the `v0.3.0` tag marks release commit `2e1ccb7`).
+`@incito-labs/project-run-engine` is published to the public npm registry (`"publishConfig": { "access": "public" }`). Versions `0.1.0`, `0.1.1`, `0.2.0`, `0.3.0` and `0.4.0` have been published so far (`0.4.0` verified from a fresh registry install; the `v0.4.0` tag marks release commit `7eee83b`).
 
 A release is prepared and published by a maintainer from an authenticated session, after the verification in section 5 (typecheck, tests, build, `git diff --check` and `npm pack --dry-run`). The version bump (`package.json` and `package-lock.json`) is committed on its own before publishing, and a published version is never modified. The sandboxed environments used for implementation work so far have held no npm credentials, so they prepared releases and a maintainer published them.

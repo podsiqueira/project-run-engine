@@ -1,5 +1,6 @@
 // packages/project-run-engine/src/coordinator/coordinator.ts
 
+import { CheckpointWriteError } from "../domain/types.js";
 import type {
   AgentDispatchRequest,
   AgentResult,
@@ -80,6 +81,13 @@ export interface CoordinatorExecutionMetadata {
   branch: string;
   runtime: AgentRuntime;
   preset?: string;
+  /**
+   * The revision of the checkpoint this Coordinator's turn is based on (`PersistedExecutionState.revision`,
+   * `0` when none exists yet). When set, every checkpoint is written as a compare-and-swap from it —
+   * and then from the revision each successful save returns — so a turn can never overwrite a change
+   * somebody else made after this turn read the execution. Leave unset to write unconditionally.
+   */
+  baseRevision?: number;
 }
 
 export interface CoordinatorOptions {
@@ -121,6 +129,8 @@ export class Coordinator {
   private readonly stateStore?: ExecutionStateStore;
   private readonly executionMetadata?: CoordinatorExecutionMetadata;
   private readonly onStep?: (record: StepRecord) => void | Promise<void>;
+  /** The revision the next checkpoint must be based on (undefined = unconditional write). */
+  private expectedRevision?: number;
 
   constructor(options: CoordinatorOptions) {
     if (!options.dispatcher) {
@@ -131,6 +141,7 @@ export class Coordinator {
     this.maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS;
     this.stateStore = options.stateStore;
     this.executionMetadata = options.executionMetadata;
+    this.expectedRevision = options.executionMetadata?.baseRevision;
     this.onStep = options.onStep;
   }
 
@@ -141,6 +152,7 @@ export class Coordinator {
     terminalReason?: string,
     suspendedFrom?: CoordinatorState,
     pendingAction?: PersistedPendingAction,
+    options: { bestEffort?: boolean } = {},
   ): Promise<void> {
     if (!this.stateStore) return;
 
@@ -198,7 +210,7 @@ export class Coordinator {
         : undefined;
 
     try {
-      await this.stateStore.save({
+      const receipt = await this.stateStore.save({
         version: 1,
         execution_id: executionId,
         project,
@@ -231,9 +243,21 @@ export class Coordinator {
         terminal_reason: terminalReason,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      });
-    } catch {
-      // Non-fatal if checkpoint save fails, don't crash main loop
+      }, this.expectedRevision !== undefined ? { expectedRevision: this.expectedRevision } : undefined);
+      // Chain the next write from the revision this one produced; a store that does not report
+      // revisions cannot be compared against, so the chain (and the check) simply ends there.
+      this.expectedRevision = receipt && typeof receipt.revision === "number" ? receipt.revision : undefined;
+    } catch (err) {
+      // A checkpoint is the engine's only durable record of progress, so a failed write is
+      // NEVER swallowed: continuing would let a response describe progress (a next action,
+      // a result, a completion) that the checkpoint does not contain. The turn is abandoned
+      // and the caller sees a CheckpointWriteError; the execution stays at its last durable
+      // checkpoint. Only advisory writes (the terminal FAILED marker written while already
+      // handling another error) opt out via `bestEffort`.
+      if (options.bestEffort) return;
+      // A refused compare-and-swap is already the precise error (CheckpointConflictError).
+      if (err instanceof CheckpointWriteError) throw err;
+      throw new CheckpointWriteError(executionId, status, err);
     }
   }
 
@@ -556,7 +580,13 @@ export class Coordinator {
         `Coordinator execution exceeded maximum step limit of ${this.maxSteps} steps. Terminal state was not reached.`,
       );
     } catch (err) {
-      await this.checkpoint(context, "FAILED", undefined, operationFailureReason(err));
+      // A failed checkpoint write must leave the execution at its last durable checkpoint
+      // (recoverable, like a crash), not be recorded as terminally FAILED. For any other
+      // error the FAILED marker is advisory: if it cannot be written either, the original
+      // error is still what the caller gets and the last durable checkpoint stays resumable.
+      if (!(err instanceof CheckpointWriteError)) {
+        await this.checkpoint(context, "FAILED", undefined, operationFailureReason(err), undefined, undefined, { bestEffort: true });
+      }
       throw err;
     }
   }

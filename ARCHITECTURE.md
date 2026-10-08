@@ -822,9 +822,8 @@ read-modify-write turn.
   failure instead of an action that could never be submitted. *Difference from `0.2.0`:* with
   an unusable runs directory `0.2.0` ran best-effort without persisting, and 0.3 refuses
   with `EXECUTION_LOCK_UNAVAILABLE` — a deliberate fail-closed choice, since proceeding
-  unlocked would silently defeat the guarantee. (This fail-closed behaviour is at lock
-  acquisition and for the first checkpoint only; later checkpoint `save()` failures are still
-  not surfaced — see "Known limitation" below.) A holder whose process has died is
+  unlocked would silently defeat the guarantee. (Later checkpoint `save()` failures are
+  reported too, as `CHECKPOINT_WRITE_FAILED` — see "Checkpoint write failures" below.) A holder whose process has died is
   detected by probing its pid and reclaimed (reclamation is itself serialised through a
   guard file); a live holder is never displaced, however long it holds. A push-mode turn
   holds the lock for the whole run, so a competing mutation waits (or times out) rather
@@ -850,32 +849,155 @@ without atomic exclusive create (some network mounts) — the engine is limited 
 time out instead). `Coordinator` itself performs no locking, so a library caller driving it
 directly must hold the lock itself.
 
-**Known limitation — checkpoint `save()` failures are not surfaced (pre-existing).**
-`Coordinator.checkpoint()` catches and ignores any error from `stateStore.save()` (the code comment calls it non-fatal so the main
-loop is not interrupted). This predates Phase 5 and is unchanged by it; `0.3.0` does not fix it.
-- *Guaranteed:* a checkpoint file is never torn (temp file + fsync + atomic rename, so a reader or
-  a crash sees the previous or the new complete JSON); mutating turns are serialised by the
-  execution lock; and the *first* checkpoint of a pull-mode execution is confirmed before an action
-  is issued (`EXECUTION_LOCK_UNAVAILABLE`, above).
-- *Not guaranteed:* that a *later* checkpoint was written. If a write fails after the lock was
-  taken and the first checkpoint exists (for example the disk fills, or an I/O error), the turn
-  can still return its result — e.g. the next `AGENT_ACTION_REQUIRED`, or a push-mode result — while
-  the durable checkpoint stays at the previous step. Nothing in the response reports the failure.
-  The file is consistent, just behind the result; a host that then submits against the unpersisted
-  step is rejected `STALE_STEP`, and a restarted process resumes from the older checkpoint. The
-  lock and atomic writes do not change this; they protect file integrity and mutual exclusion, not
-  save-failure observability.
-- *Status:* explicit backlog item (`docs/backlog.md`, "Checkpoint save failures are swallowed").
-  Until it is addressed, hosts should treat an unexpected `STALE_STEP` after a successful
-  `next-step`/`submit-step` as a possible persistence failure and check the runs directory
-  (free space, permissions) before retrying.
+#### 4.17.1 Checkpoint write failures (`0.4.0`)
+
+Through `0.3.0`, `Coordinator.checkpoint()` caught and ignored every `save()` error, so a turn
+could return an action, a result or a completion that the durable checkpoint did not contain
+(NF-2; pre-existing, not a Phase 5 regression). That is fixed. **The engine never reports progress
+that is not durable.**
+
+- *Contract.* A checkpoint the engine needs but cannot write abandons the turn as a
+  `CheckpointWriteError` (`code: "CHECKPOINT_WRITE_FAILED"`, exported from `/domain`). Every entry
+  point reports it as a **non-terminal** failure with an explicit, machine-readable
+  `failureCode` (pull: `ProjectRunStepResponse`; host: `ProjectRunHostResponse`; push:
+  `ProjectRunExecutionResult.persistenceFailure`). No message parsing is needed, and the same
+  `failureCode` field now also carries `EXECUTION_LOCKED` / `EXECUTION_LOCK_UNAVAILABLE`.
+- *What a failure response says.* Preferred and normal case: `state`, `stepLog` and `history` are the
+  **last durable** ones, re-read from the store after the failed write, never the abandoned turn's
+  in-memory progress. **Caveat — the store may be unreadable too** (a dying device fails reads as well
+  as writes). Then the engine has nothing durable to report: host/push results carry an empty
+  `stepLog`/`history`, and `state` is only a *placeholder* — `"INTAKE"` in pull responses, the abandoned
+  turn's in-memory state in push results — which is **not** a confirmed durable state and must not be
+  read as one (the real checkpoint may be further along; e.g. a pull response said `INTAKE` while the
+  durable state was `CLARIFY`). The response is still structured, non-terminal and carries the code; call
+  `status()` / `next-step` once storage works to learn the real state. A failure never marks the
+  execution `FAILED`: the execution is left at its last durable checkpoint, which is always a state the
+  engine can continue from — exactly as after a crash at that point.
+- *Recovery.* Pull: fix the storage problem, then call `next-step` with the same `executionId`; it
+  returns the authoritative state (the same pending action if the submitted result was not recorded,
+  or the recovered next action if it was). Push: `resume` (or `start` again if nothing was ever
+  written). Submitting the same result again is safe: a result is applied at most once (a second
+  attempt after it was recorded is `NO_PENDING_ACTION`/`STALE_STEP`, never a double-apply).
+  Human answers that cannot be recorded are not acted on; if the answer record was written and a
+  later write failed, retrying records the answers a second time (audit trail only; nothing in the
+  engine reads the answers, and the agent is re-dispatched either way).
+- *Agent execution is at-least-once around a lost write.* In **push** mode the engine calls your
+  adapter, and only then saves the result. If that save fails, the result is not durable, so after
+  recovery (`resume`) the same role is dispatched again: the adapter can be invoked twice for work whose
+  first result was produced but never recorded (observed: 9 invocations for 8 durable steps; the record
+  itself stays exact — one step per dispatch, no duplicates). Integrations must therefore not assume
+  exactly-once external side effects (commits, messages, deployments) unless the operation itself is
+  idempotent. In **pull** mode the host performs the work once and may simply submit the same result
+  again; the engine applies it at most once.
+- *First checkpoint.* When nothing durable exists yet (a first `next-step` whose first write
+  fails), the 0.3.0 response is kept: non-terminal `EXECUTION_LOCK_UNAVAILABLE`, no action issued.
+- *Advisory write.* The only write still best-effort is the terminal `FAILED` marker written
+  while the engine is already handling another error (an ordinary failure such as an adapter that
+  throws). If it cannot be written the original error is still what the caller gets, and the last
+  durable checkpoint stays resumable. This is safe but visible: that one response says `FAILED` /
+  `terminal: true` (it reports the run's outcome) while the **persisted** lifecycle is still
+  `IN_PROGRESS` — `status()` shows `RUNNING` and `resume` can continue it. The engine never claims a
+  `FAILED` it did not write; **the persisted status (`status()`) is authoritative for the durable
+  lifecycle**, the response's `terminal` is not. When the marker *is* written, the execution is
+  `FAILED` and not resumable (`EXECUTION_NOT_RESUMABLE`). Pre-existing since `0.3.0`; unchanged.
+- *Found while proving it.* An `IN_PROGRESS` checkpoint whose `state` is `READY_FOR_PR` (the window
+  between the CONVERGE → READY_FOR_PR transition and the `COMPLETED` checkpoint — a crash, or a
+  failed `COMPLETED` write, lands exactly there) was rejected as "completed" by `resume` and
+  `next-step`, so such an execution could never finish. Only a checkpoint that *records*
+  `COMPLETED` is final now. (A 0.3.0 defect in crash recovery, not documented before.)
+- *Evidence.* `tests/checkpoint-save-failures.test.ts` fails **each single save** of a full pull
+  lifecycle and of a full push lifecycle (including the human-answer record and the completion
+  write), asserts on every response that the matching checkpoint exists, recovers through the
+  documented path, and checks the final record (contiguous history, every dispatch matched by exactly one
+  agent step, no step applied twice). 11 of its first 13 tests fail on `0.3.0`.
+
+#### 4.17.2 The storage contract, revisions and optimistic concurrency (`0.4.0`)
+
+The Coordinator and every entry point are written against `ExecutionStateStore` and know nothing
+about files; the host `start()`/`resume()`/`status()` accept a `stateStore` like the pull and
+push functions already did. `tests/state-store-contract.test.ts` runs the whole contract, and a
+complete pull, push and host lifecycle, against a store with **no filesystem** (an in-memory
+test store shaped like a database store) and checks that no runs directory is created.
+
+The contract (`ExecutionStateStore` in `src/project/state-store.ts`):
+
+| Method | Requirement |
+|---|---|
+| `save(state, { expectedRevision? })` | Resolves only once the checkpoint is durable; rejects otherwise; all-or-nothing. Returns `{ revision }`. With `expectedRevision`, compare-and-swap against the stored revision: mismatch → reject with `CheckpointConflictError`, write nothing. |
+| `load` / `exists` | Last durable checkpoint (or `null`/`false`); `load` returns `revision`. |
+| `withLock?` | Optional mutual exclusion for one execution's turn. |
+
+`PersistedExecutionState.revision` is a store-assigned counter (`1` for the first checkpoint, `+1`
+per save; absent on 0.3.0 checkpoints, read as `0`). Every turn that **continues or creates an execution
+in pull mode, and every push `resume`**, is based on the revision it read (`0` for a pull execution that
+does not exist yet) and chains each write from the receipt of the previous one, so such a turn
+**cannot overwrite a change made after it read the execution**. A refused write is a
+`CheckpointConflictError` (`CHECKPOINT_CONFLICT`, a `CheckpointWriteError` subtype): reported as a
+non-terminal failure, the other writer's checkpoint stands, the execution is not marked failed; the
+right reaction is `next-step`/`status`, not a blind retry. Stores that ignore the option, or still
+return `void` (the 0.3.0 contract), keep working with no compare-and-swap.
+
+**What is *not* revision-protected: the initial push `start`.** `executeProjectRun` /
+`startProjectRun` write their *first* checkpoint unconditionally — no `expectedRevision` (not even `0`).
+Consequences, all unchanged since `0.3.0`: starting with an `executionId` that **already exists
+restarts that execution** — its checkpoint is replaced with the new run's, whatever its lifecycle (a
+completed one, a suspended one, or a pull-mode execution with an outstanding action, whose `stepId`
+then goes stale); the call is *not* rejected and no `CHECKPOINT_CONFLICT` is raised. Two push starts
+racing on a brand-new id are likewise not told apart at the first write; the *second* and later writes of
+each run do chain from their receipts, so the loser of such a race fails with `CHECKPOINT_CONFLICT` as
+soon as it writes again. Pull mode differs: an explicit `executionId` that exists is **continued**, never
+reset, and a pull creator is based on revision `0`. In practice: give each new push run a fresh
+`executionId` (or omit it), and use `resume` / `next-step` to continue one. Guarding the initial push
+start with `expectedRevision: 0` would make a reused id a `CHECKPOINT_CONFLICT`; that is a behaviour
+change and is not made here (`tests/state-store-contract.test.ts` pins the current behaviour).
+
+What each backend promises:
+
+| | Execution lock (`withLock`) | Revision compare-and-swap |
+|---|---|---|
+| `FileExecutionStateStore` | Cooperating engine processes on **one machine, local filesystem** | **Exact** among engine processes on that machine, even with no lock held: every save runs in a short per-execution write guard (`<id>.cas`, same exclusive-create/dead-holder mechanism as the lock). Proven with 8 racing processes: exactly one winner. |
+| A future database store | Its own advisory/row lock, if offered | Its conditional write (`UPDATE … WHERE revision = :expected`); that is what makes it safe across machines |
+
+What this does **not** make true: the file store is **not distributed-safe**. Different machines
+sharing a network/distributed filesystem are outside both mechanisms (exclusive create and rename
+are not reliably atomic there, and the engine cannot identify other hosts). A `0.3.0` engine uses the same
+execution-lock file name and protocol but not the write guard, and does not maintain `revision` —
+mixing versions on one execution stays unsupported (as since `0.3.0`). The write guard is a new file in the runs
+directory (`<id>.cas`, removed after each save); keep `.project-run/runs/` in `.gitignore`.
+
+Practical effect: the manual recovery advice ("delete a stuck lock file") is now safe even if applied
+to a live holder — the interleaved writer that loses gets `CHECKPOINT_CONFLICT` instead of silently
+overwriting the other (`tests/state-store-contract.test.ts`, "an operator deleting a LIVE holder's lock").
+
+#### 4.17.3 Lock lifecycle: heartbeat evaluated, deferred
+
+The question was whether the lock needs a heartbeat. The failure a heartbeat would fix is a
+*false stale-lock reclamation during a legitimately long turn*. The engine cannot produce one: a
+lock is reclaimed only when its holder's pid is dead (or its file is unreadable for over 5 s),
+reclamation is serialised and re-verified, and a live holder is never displaced however long it
+holds (`phase5-locking.test.ts`: live holder never displaced, bounded timeouts, SIGKILLed holder,
+many processes racing a stale lock). A long turn makes *waiters* time out with a non-terminal
+`EXECUTION_LOCKED` — a heartbeat does not change that. The opposite failure — a dead holder whose pid
+was reused stays "live" — would need a time-based takeover that contradicts the "live holders are
+never auto-deleted" invariant; with revisions it is also no longer dangerous to resolve by hand.
+No heartbeat was added; revisit if a measured false-reclamation or a need for time-based leases
+(for example a database store) appears.
+
+#### 4.17.4 History and event stream: evaluated, deferred
+
+`history` (decisions) and `stepLog` (what happened) stay compact and in the checkpoint. Measured on
+full mock lifecycles (clean and with a remediation loop): 8.3–10.4 KB per checkpoint, of which
+`history` ≈ 3.7–4.6 KB (18–22 records) and `stepLog` ≈ 1.6–2.2 KB; the engine's default cap is 100
+steps per run. No payload history, audit trail, replay or external sink has a concrete requirement yet, so
+none was built. If one appears it belongs in a separate store (an append-only sink fed by
+`recordDecision`/`appendStepRecord`), not in the checkpoint, with its own retention and size limits;
+`history` stays decision-level and `stepLog` operational.
 
 **Persisted-format compatibility.** `history` is an optional field and `version` stays `1`:
 no migration. A checkpoint written before Phase 5 loads with an empty `history`; decisions
 that were never recorded are never reconstructed, and recording simply resumes from the
 next decision (step numbering restarts at 1 for such an execution).
 
-**Out of scope, and not decided:** optimistic-concurrency/versioned writes, a
-database-backed store, cross-machine coordination, a heartbeat for long-lived holders,
-persisting per-decision payloads or an event stream, and any change to `stepLog` or
-`stepsCount`. See `docs/backlog.md`.
+**Out of scope, and not decided:** a concrete database-backed store, cross-machine coordination,
+a lock heartbeat (§4.17.3), persisting per-decision payloads or an event stream (§4.17.4), host
+integrations, and any change to `stepLog` or `stepsCount`. See `docs/backlog.md`.

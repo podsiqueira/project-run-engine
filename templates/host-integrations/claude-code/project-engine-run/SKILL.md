@@ -136,6 +136,16 @@ does not have to match the feature (`ARCHITECTURE.md` §4.16).
      - `failureReason` starting `EXECUTION_LOCK_UNAVAILABLE:` — the runs directory
        cannot be used (missing, not writable, disk full). Retrying will not help: report
        the reason to the user and stop until the environment is fixed.
+     - `failureCode` `"CHECKPOINT_WRITE_FAILED"` (reason starts `CHECKPOINT_WRITE_FAILED:`) —
+       the engine could not save its progress, so it did not report any: the execution is at
+       its last saved state. Tell the user the reason (usually a full disk or permissions on
+       `.project-run/runs`) and stop until it is fixed; then call `next-step` with the same
+       `executionId` — it returns the current state, which is either the same step you just
+       answered (submit it again) or the next one. Never assume the previous submission took effect.
+     - `failureCode` `"CHECKPOINT_CONFLICT"` (reason starts `CHECKPOINT_CONFLICT:`) — another
+       process changed this execution while your call was in progress, and nothing of your
+       call was saved. Do not resubmit blindly: call `next-step` with the same `executionId` and
+       continue from what it returns.
    - **`"COMPLETED"`**: report success. `response.result.state` is `"READY_FOR_PR"`.
 
 4. **Present human intervention questions.** `response.humanIntervention.questions` is

@@ -4,7 +4,7 @@ A provider-agnostic, runtime-neutral agent orchestration engine for portable wor
 
 `project-run-engine` automates multi-agent software engineering lifecycles (Specification, Architecture, Implementation, Independent Review, Remediation, and Convergence) without coupling to any specific LLM provider, SDK, or host runtime.
 
-**Status**: Phases 0–4, Phase 4 Closure, the ENG-001/002/003 remediation and Phase 5 (persistence hardening: durable decision `history`, atomic checkpoints, per-execution locking) are complete (current release `0.3.0`). See [`docs/phase-reports.md`](docs/phase-reports.md) for phase history and [`docs/backlog.md`](docs/backlog.md) for deferred work and known limitations. **Upgrading from 0.2.x?** `ProjectRunHostResponse.history` changes type in 0.3 — see [`CONSUMER-GUIDE.md` §10](CONSUMER-GUIDE.md#10-upgrading-from-02x-to-03x).
+**Status**: Phases 0–4, Phase 4 Closure, the ENG-001/002/003 remediation and Phase 5 (persistence hardening: durable decision `history`, atomic checkpoints, per-execution locking) are complete (current release `0.4.0`). `0.4.0` reports failed checkpoint writes instead of swallowing them (`CHECKPOINT_WRITE_FAILED`), gives the storage contract revisioned compare-and-swap writes (`CHECKPOINT_CONFLICT`), and fixes a crash-recovery bug at the final `READY_FOR_PR` transition — see [`CONSUMER-GUIDE.md` §11](CONSUMER-GUIDE.md#11-upgrading-from-03x-to-04x). See [`docs/phase-reports.md`](docs/phase-reports.md) for phase history and [`docs/backlog.md`](docs/backlog.md) for deferred work and known limitations. **Upgrading from 0.2.x?** `ProjectRunHostResponse.history` changes type in 0.3 — see [`CONSUMER-GUIDE.md` §10](CONSUMER-GUIDE.md#10-upgrading-from-02x-to-03x).
 
 ---
 
@@ -84,32 +84,34 @@ Zero LLM calls or synthetic fabrications are made.
 
 ## Execution State Persistence (G-2)
 
-The engine introduces an `ExecutionStateStore` abstraction with a default `FileExecutionStateStore`:
+The engine is written against an `ExecutionStateStore` abstraction; the default is `FileExecutionStateStore`
+(single machine, local filesystem). Any store that satisfies the contract can hold executions:
 
 ```typescript
 export interface ExecutionStateStore {
-  save(state: PersistedExecutionState): Promise<void>;
+  save(state: PersistedExecutionState, options?: { expectedRevision?: number }): Promise<void | { revision: number }>;
   load(executionId: string): Promise<PersistedExecutionState | null>;
   exists(executionId: string): Promise<boolean>;
+  list?(): Promise<PersistedExecutionState[]>;
+  withLock?<T>(executionId: string, fn: () => Promise<T>, options?: ExecutionLockOptions): Promise<T>;
 }
 ```
 
+`save` resolves only once the checkpoint is durable. `expectedRevision` (compare-and-swap) and `revision` are
+the optimistic-concurrency part of the contract *(added in `0.4.0` — `ARCHITECTURE.md` §4.17.2)*.
 Persisted runs are saved to `.project-run/runs/<execution_id>.json`.
 
 ### Persisted State Schema
 
-- `schema_version`: Current state schema version (currently `1`).
-- `execution_id`: Unique identifier for the run.
-- `project`: Project identity and workflow preset version.
-- `feature`: Target feature name.
-- `branch`: Active Git branch.
-- `current_state`: Active `CoordinatorState`.
-- `iteration`: Current overall iteration count.
-- `remediation_iteration`: Remediation loop iteration counter.
-- `last_result`: Last recorded `AgentResult`.
-- `findings`: Array of `StructuredFinding` records.
-- `context`: Snapshot of `CoordinatorExecutionContext`.
-- `timestamps`: `started_at` and `updated_at` ISO-8601 strings.
+- `version`: state schema version (currently `1`).
+- `execution_id`, `project`, `feature`, `branch`, `preset`, `runtime`: identity of the run.
+- `state`: the active `CoordinatorState`; `lifecycle_status`: `IN_PROGRESS`, `AWAITING_AGENT_ACTION`,
+  `HUMAN_INTERVENTION_REQUIRED`, `COMPLETED` or `FAILED`; `suspended_from`, `terminal_reason`.
+- `iteration`, `remediation_iteration`: loop counters.
+- `last_result` (the last `AgentResult`), `findings` (the latest result's), `context`.
+- `history` (`DecisionRecord[]`, what the engine decided) and `step_log` (what happened: agent steps and human suspensions).
+- `human_intervention` (the latest suspension), `human_answers` (append-only), `pending_action` (the outstanding pull-mode step).
+- `revision`: store-assigned write counter *(since `0.4.0`)*; `created_at` / `updated_at` ISO-8601 strings.
 
 ### Secret Scrubbing & Privacy
 
@@ -258,13 +260,13 @@ const resumeResult = await executeProjectResume({
 | Module | Exports |
 |---|---|
 | `@incito-labs/project-run-engine` | Main barrel export exposing all public API components |
-| `@incito-labs/project-run-engine/domain` | `CoordinatorState`, `AgentRole`, `AgentRuntime`, `StructuredFinding`, `AgentResult`, `AgentSkillRequirement`, `ExecutionStepRecord`, `countAgentSteps`, domain error classes (including `ExecutionLockError`, `ExecutionLockTimeoutError`, `ExecutionLockUnavailableError`, `isExecutionLockFailure`) |
+| `@incito-labs/project-run-engine/domain` | `CoordinatorState`, `AgentRole`, `AgentRuntime`, `StructuredFinding`, `AgentResult`, `AgentSkillRequirement`, `ExecutionStepRecord`, `countAgentSteps`, domain error classes (including `ExecutionLockError`, `ExecutionLockTimeoutError`, `ExecutionLockUnavailableError`, `isExecutionLockFailure`; since `0.4.0`: `CheckpointWriteError`, `CheckpointConflictError`, `ExecutionFailureCode`, `PersistenceFailureCode`) |
 | `@incito-labs/project-run-engine/coordinator` | `Coordinator`, `CoordinatorOptions`, `CoordinatorRunResult`, `StepRecord` (the live, per-call record — not the durable `history`) |
 | *(no `/decision` subpath)* | The decision layer — `CoordinatorDecisionEngine`, `CoordinatorDecision`, `CoordinatorExecutionContext`, `isFindingActionable`, and the durable-history types `DecisionRecord`, `RecordedDecision`, `DispatchDecisionSummary` — is exported from the **root** barrel only |
 | `@incito-labs/project-run-engine/runtime` | `HostDispatchAdapter`, `HostAgentDispatcher`, `MockRuntimeAdapter`, `executeWithHostGuards` |
 | `@incito-labs/project-run-engine/skills` | `SkillResolver`, `SkillValidator`, `SkillValidationError` |
 | `@incito-labs/project-run-engine/presets` | Spec-Kit preset definitions (`ROLE_SKILLS_MAP`, `getSkillsForRole`, etc.) |
-| `@incito-labs/project-run-engine/project` | `executeProjectRun`, `executeProjectResume`, `discoverProjectContext`, `FileExecutionStateStore` (including `withLock` and its lock-default options), `ExecutionStateStore` (optional `withLock`), `ExecutionLockOptions`, `withExecutionLock`, `PersistedExecutionState`, `runProjectDoctor`, `loadProjectConfig` |
+| `@incito-labs/project-run-engine/project` | `executeProjectRun`, `executeProjectResume`, `discoverProjectContext`, `FileExecutionStateStore` (including `withLock` and its lock-default options), `ExecutionStateStore` (optional `withLock`; since `0.4.0`: revisioned `save`), `ExecutionLockOptions`, `withExecutionLock`, `PersistedExecutionState`, since `0.4.0`: `ExecutionSaveOptions`, `ExecutionSaveReceipt`, `runProjectDoctor`, `loadProjectConfig` |
 | `@incito-labs/project-run-engine/host` | `startProjectRun`, `resumeProjectRun`, `statusProjectRun`, `nextProjectRunStep`, `submitProjectRunStep`, `projectEngineRun`, and the `ProjectRunHostResponse` / `ProjectRunStepResponse` types |
 
 ---

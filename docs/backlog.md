@@ -9,6 +9,14 @@ provider-neutral boundary stays a deliberate choice, not an accidental gap.
 **Host split**: *current* — Claude Code (live-validated in Phase 4) and Antigravity
 (supported target; not yet live-validated). *Backlog* — Cursor, Codex, MCP.
 
+**Sequencing decision (after `0.3.0`)**: the persistence work (checkpoint write failures, the revisioned
+store contract — `ARCHITECTURE.md` §4.17) changes what a host can rely on and must handle
+(`failureCode`: `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`). The four integrations below are
+therefore **deferred until that release (`0.4.0`) was out** so that no host integration is built on, or hides,
+a persistence limitation. `0.4.0` has shipped, so they are now unblocked; none is started. They stay thin: a skill/adapter or transport over
+`nextProjectRunStep`/`submitProjectRunStep`, with no provider SDK in the core, no provider branch in
+the Coordinator, no second persistence mechanism and no workflow logic of their own. None is started.
+
 ## Host Integration — Antigravity
 
 **Purpose**: Validate that the same provider-neutral pull contract
@@ -60,14 +68,26 @@ validated.
   with real OS processes, including SIGKILL.
 - Duplicate-submission idempotency is preserved and is now race-proof.
 
+**Post-`0.3.0` follow-up (delivered in `0.4.0`)** — see `ARCHITECTURE.md` §4.17.1–§4.17.4:
+- *Optimistic concurrency* — **contract and file-store implementation delivered**: revisioned
+  checkpoints, `save(state, { expectedRevision })` compare-and-swap, `CHECKPOINT_CONFLICT`, an
+  exact CAS in the file store independent of the lock, and a host API that accepts any
+  `ExecutionStateStore`. A database-backed store itself is **not** built (no concrete backend or
+  requirement); the contract and the contract tests are what it would implement.
+- *Lock heartbeat* — **evaluated, deferred**: the engine cannot falsely reclaim a live holder's lock, so
+  there is no failure for a heartbeat to fix; revisit only on a measured false reclamation or a store
+  that needs time-based leases (§4.17.3).
+- *Event-stream / payload history* — **evaluated, deferred**: a full lifecycle checkpoint is 8–10 KB with
+  compact `history`; no requirement for payload history, replay or an external sink (§4.17.4).
+
 **Still deferred (not decided, not scheduled)**:
-- *Cross-machine / network-filesystem coordination.* The engine is limited to
-  `node:fs`/`node:path`, so the lock is scoped to one machine and a local filesystem.
-- *Optimistic concurrency / versioned writes or a database-backed store.* Revisit only if
-  the advisory lock proves insufficient (e.g. hosts on different machines sharing a store).
-- *Lock heartbeat for very long push-mode turns.* A live holder is never displaced; waiters
-  time out (default 30 s, configurable) instead. Mixed-engine-version use of one execution
-  (older engines don't lock and drop `history`) is unsupported.
+- *Cross-machine / network-filesystem coordination.* The file store is scoped to one machine and a
+  local filesystem and is **not distributed-safe**. A distributed deployment needs a store whose
+  conditional write is atomic across machines (the revision contract above); the engine cannot
+  provide that with `node:fs`/`node:path`.
+- *A concrete database-backed store.*
+- *Mixed-engine-version use of one execution* (older engines don't lock the same way, don't keep
+  `revision`, and drop `history`) is unsupported.
 
 ## Decision-level `history` — RESOLVED in Phase 5
 
@@ -138,7 +158,7 @@ provisional — this repository has no formal severity taxonomy.
   friction; it would need to defer to the preset's own naming/numbering rather than
   invent one. Consumers: your host must seed `specs/<feature>/` (see the contract above).
 
-### ENG-002 — Final execution state loses findings and history — CLOSED (history persistence of decisions DEFERRED)
+### ENG-002 — Final execution state loses findings and history — CLOSED (decision-level history was deferred here, then RESOLVED in Phase 5)
 
 - **Status**: CLOSED for the audit-record gap; decision-level `history` was DEFERRED here
   and has since been resolved by Phase 5 (see above). **Severity**: HIGH (provisional, unchanged) — highest of
@@ -222,22 +242,33 @@ provisional — this repository has no formal severity taxonomy.
   feature value as `FEATURE` — and do not force feature and branch names to match.
   Stays OPEN here until the consumer confirms; close it when they do.
 
-## Checkpoint save failures are swallowed — OPEN (pre-existing; documented, not fixed in 0.3.0)
+## Checkpoint save failures are swallowed — RESOLVED in `0.4.0`
 
-`Coordinator.checkpoint()` catches and ignores every `stateStore.save()` error. It predates Phase 5
-(present since the Coordinator's first checkpointing commit) and Phase 5 did not introduce or
-change it. Atomic writes and the execution lock keep the checkpoint file structurally consistent
-(no torn JSON), but they do not make a failed write visible: after the lock is taken and the first
-checkpoint exists, a failing `save()` (disk full, I/O error) can leave the durable checkpoint at
-the previous step while the call returns the next action or a push-mode result. A later submission
-for that action is then rejected `STALE_STEP`, and a restarted process resumes from the older
-checkpoint. Not data corruption; a failure-observability gap. Mitigated only for the first
-checkpoint of a pull-mode execution (`EXECUTION_LOCK_UNAVAILABLE`). Behaviour is described in
-`ARCHITECTURE.md` §4.17 ("Known limitation").
+`Coordinator.checkpoint()` used to catch and ignore every `stateStore.save()` error (pre-existing,
+present since the Coordinator's first checkpointing commit; documented in `0.3.0`). A later write
+failure could therefore leave the durable checkpoint at the previous step while the call returned
+the next action or a push-mode result, and a later submission failed `STALE_STEP`.
 
-**Future work (not scheduled):** propagate checkpoint save failures from the Coordinator as a
-structured, non-terminal failure (so the caller sees it before acting on an unpersisted step) for
-both pull and push paths. This changes error-propagation semantics and needs its own review.
+**Resolved**: a checkpoint the engine needs but cannot write is now a `CheckpointWriteError`
+(`CHECKPOINT_WRITE_FAILED`), reported by every pull/host/push entry point as a non-terminal failure
+with an explicit `failureCode`, describing the last durable checkpoint, never marking the
+execution `FAILED`, and recoverable through `next-step` / `resume`. Proven by failing each single save
+of full pull and push lifecycles (`tests/checkpoint-save-failures.test.ts`). Contract, recovery and
+the one remaining best-effort write (the advisory terminal `FAILED` marker): `ARCHITECTURE.md`
+§4.17.1. Found along the way and fixed: an `IN_PROGRESS` checkpoint at `READY_FOR_PR` (crash or failed
+`COMPLETED` write) was rejected as completed and could never finish.
+
+## Observations (not engine contract; no action scheduled)
+
+- `created_at` in a checkpoint is rewritten on every save (it equals `updated_at`), so it is not the
+  creation time. Nothing in the engine reads it; fixing it means preserving it across saves. Found
+  during the post-`0.3.0` persistence review.
+- The `README.md` persisted-state field list described names that never matched the code
+  (`schema_version`, `current_state`, `timestamps`); corrected to the real fields with the
+  revision work. The code was right; the documentation was wrong.
+- (Resolved before release.) A TypeScript subclass of `FileExecutionStateStore` overriding `save()` with a
+  `Promise<void>` return type briefly failed to type-check once the base returned `{ revision }`; the base is
+  now declared `Promise<void | ExecutionSaveReceipt>` and a consumer-compile test pins that it compiles.
 
 ## Phase 5
 

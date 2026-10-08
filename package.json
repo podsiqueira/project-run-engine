@@ -1,6 +1,6 @@
 {
   "name": "@incito-labs/project-run-engine",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "Provider-agnostic agent orchestration engine for portable workflow execution",
   "publishConfig": {

@@ -18,7 +18,7 @@ import {
   executeProjectResume,
   type ProjectRunExecutionResult,
 } from "../project/project-run.js";
-import { FileExecutionStateStore, type PersistedExecutionState } from "../project/state-store.js";
+import { FileExecutionStateStore, type ExecutionStateStore, type PersistedExecutionState } from "../project/state-store.js";
 import { deriveHumanQuestions, type HumanInterventionRequired } from "../decision/human-intervention.js";
 import type {
   ProjectRunHost,
@@ -113,13 +113,14 @@ async function resolveDurableRecord(
   executionId: string,
   result: ProjectRunExecutionResult,
   projectRoot: string | undefined,
+  stateStore: ExecutionStateStore | undefined,
 ): Promise<{ stepLog: ExecutionStepRecord[]; history: DecisionRecord[] }> {
   const liveLog = result.stepLog ?? result.coordinatorResult?.context.stepLog;
   const liveHistory = result.decisionHistory ?? result.coordinatorResult?.context.history;
   if (liveLog && liveHistory) return { stepLog: liveLog, history: liveHistory };
   let persisted: PersistedExecutionState | null = null;
   try {
-    persisted = await new FileExecutionStateStore(projectRoot ?? process.cwd()).load(executionId);
+    persisted = await (stateStore ?? new FileExecutionStateStore(projectRoot ?? process.cwd())).load(executionId);
   } catch {
     // unreadable checkpoint: report what we have
   }
@@ -131,13 +132,14 @@ async function buildHostResponse(
   result: ProjectRunExecutionResult,
   emit: ProjectRunEventSink,
   projectRoot: string | undefined,
+  stateStore?: ExecutionStateStore,
 ): Promise<ProjectRunHostResponse> {
   const { state } = result;
   const findings = extractFindings(result);
   // `stepsCount` is the number of agent steps in the whole execution, derived from the
   // durable step log — NOT `result.stepsCount`, the Coordinator's per-call loop counter
   // (which also counts pure transitions and restarts at 0 on every resume).
-  const { stepLog, history } = await resolveDurableRecord(executionId, result, projectRoot);
+  const { stepLog, history } = await resolveDurableRecord(executionId, result, projectRoot, stateStore);
   const stepsCount = countAgentSteps(stepLog);
 
   switch (result.status) {
@@ -209,12 +211,14 @@ async function buildHostResponse(
         timestamp: now(),
         reason: result.failureReason ?? "Unknown failure",
       });
+      const failureCode = result.lockFailure ?? result.persistenceFailure;
       return {
         status: "FAILED",
         // Only an engine-generated lock failure (set explicitly by the engine when it could not
-        // obtain the lock) rejects THIS call alone with the execution untouched. Any other
+        // obtain the lock) or a checkpoint-write failure (the run was abandoned at the last
+        // durable checkpoint, which is recoverable) leaves the execution retryable. Any other
         // failure — including a lock error raised inside the run — has failed the execution.
-        terminal: result.lockFailure === undefined,
+        terminal: failureCode === undefined,
         executionId,
         state,
         stepsCount,
@@ -222,6 +226,7 @@ async function buildHostResponse(
         findings,
         stepLog,
         failureReason: result.failureReason,
+        ...(failureCode !== undefined ? { failureCode } : {}),
       };
     }
   }
@@ -258,13 +263,14 @@ export async function startProjectRun(request: ProjectRunHostRequest): Promise<P
     executionId,
     explicitFeature: request.feature,
     explicitBranch: request.branch,
+    stateStore: request.stateStore,
     adapters: withDispatchEvents(request.adapters, executionId, emit),
     executionOptions: request.executionOptions,
     maxSteps: request.maxSteps,
     onStep: createStepEventTranslator(executionId, emit),
   });
 
-  return buildHostResponse(executionId, result, emit, request.projectRoot);
+  return buildHostResponse(executionId, result, emit, request.projectRoot, request.stateStore);
 }
 
 /**
@@ -291,10 +297,11 @@ export async function resumeProjectRun(request: ProjectRunResumeRequest): Promis
     executionOptions: request.executionOptions,
     maxSteps: request.maxSteps,
     humanAnswers: request.humanAnswers,
+    stateStore: request.stateStore,
     onStep: createStepEventTranslator(request.executionId, emit),
   });
 
-  return buildHostResponse(request.executionId, result, emit, request.projectRoot);
+  return buildHostResponse(request.executionId, result, emit, request.projectRoot, request.stateStore);
 }
 
 /** The `ProjectRunHost` implementation — see `./types.js` for the contract. */

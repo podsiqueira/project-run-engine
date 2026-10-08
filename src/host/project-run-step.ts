@@ -20,7 +20,13 @@
 // back the result; this module's only job is translating between that and the
 // Coordinator/DecisionEngine's existing, unmodified machinery.
 
-import { ExecutionLockUnavailableError, type AgentResult, type CoordinatorState } from "../domain/types.js";
+import {
+  CheckpointWriteError,
+  ExecutionLockUnavailableError,
+  type AgentResult,
+  type CoordinatorState,
+  type ExecutionFailureCode,
+} from "../domain/types.js";
 import type { CoordinatorExecutionContext, FindingInput } from "../decision/types.js";
 import { Coordinator, type PreparedAction } from "../coordinator/coordinator.js";
 import { CoordinatorDecisionEngine } from "../decision/decision-engine.js";
@@ -53,8 +59,30 @@ function failed(
   state: CoordinatorState,
   failureReason: string,
   terminal = true,
+  failureCode?: ExecutionFailureCode,
 ): ProjectRunStepResponse {
-  return { status: "FAILED", terminal, executionId, state, failureReason };
+  return { status: "FAILED", terminal, executionId, state, failureReason, ...(failureCode !== undefined ? { failureCode } : {}) };
+}
+
+/**
+ * The response for a call that was abandoned because a checkpoint could not be written. The
+ * execution is at its last durable checkpoint, so `state` is re-read from the store (best
+ * effort) rather than taken from the abandoned in-memory turn — the response must never claim
+ * progress the checkpoint does not contain. Non-terminal: `nextProjectRunStep()` with the same
+ * `executionId` returns the authoritative state once the storage problem is fixed.
+ */
+async function checkpointWriteFailed(
+  err: CheckpointWriteError,
+  stateStore: ExecutionStateStore,
+  fallbackState: CoordinatorState,
+): Promise<ProjectRunStepResponse> {
+  let state = fallbackState;
+  try {
+    state = (await stateStore.load(err.executionId))?.state ?? fallbackState;
+  } catch {
+    // the store that failed to write may also fail to read
+  }
+  return failed(err.executionId, state, err.message, false, err.code);
 }
 
 /** Translates an already-terminal/paused `ProjectRunHostResponse` into step-response shape. */
@@ -129,6 +157,20 @@ export async function nextProjectRunStep(
 ): Promise<ProjectRunStepResponse> {
   const projectRoot = request.projectRoot ?? process.cwd();
   const stateStore = request.stateStore ?? new FileExecutionStateStore(projectRoot);
+  try {
+    return await nextProjectRunStepGuarded(request, projectRoot, stateStore);
+  } catch (err) {
+    // A checkpoint the call needed could not be written: nothing is reported as progress.
+    if (err instanceof CheckpointWriteError) return checkpointWriteFailed(err, stateStore, "INTAKE");
+    throw err;
+  }
+}
+
+async function nextProjectRunStepGuarded(
+  request: NextProjectRunStepRequest,
+  projectRoot: string,
+  stateStore: ExecutionStateStore,
+): Promise<ProjectRunStepResponse> {
   const executionId = request.executionId;
 
   // No id: a fresh, unguessable one is minted below — nothing else can contend for it.
@@ -150,7 +192,7 @@ export async function nextProjectRunStep(
   // Pass 2 — LOCKED. Re-evaluates from the checkpoint as it is once the lock is held; whatever
   // another host did in the meantime is respected (the answer may now be a plain read).
   const turn = await runLockedTurn(stateStore, executionId, () => nextProjectRunStepImpl(request, projectRoot, stateStore, "write"));
-  if (!turn.acquired) return failed(executionId, first.state, turn.error.message, false);
+  if (!turn.acquired) return failed(executionId, first.state, turn.error.message, false, turn.error.code);
   return settle(turn.value);
 }
 
@@ -255,7 +297,7 @@ async function nextProjectRunStepImpl(
           if (!reconstructed.ok) {
             return failed(persisted.execution_id, reconstructed.state, reconstructed.failureReason);
           }
-          return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps);
+          return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps, reconstructed.baseRevision);
         }
 
         case "COMPLETED":
@@ -284,7 +326,7 @@ async function nextProjectRunStepImpl(
           if (!reconstructed.ok) {
             return failed(persisted.execution_id, reconstructed.state, reconstructed.failureReason);
           }
-          return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps);
+          return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps, reconstructed.baseRevision);
         }
       }
     }
@@ -320,16 +362,28 @@ async function nextProjectRunStepImpl(
     return failed(request.executionId ?? "unknown", "INTAKE", started.failureReason);
   }
 
-  return confirmFirstCheckpoint(await runPrepare(context, config, projectRoot, stateStore, request.maxSteps), stateStore);
+  try {
+    return await confirmFirstCheckpoint(await runPrepare(context, config, projectRoot, stateStore, request.maxSteps, 0), stateStore);
+  } catch (err) {
+    // Nothing durable exists yet: the very first checkpoint could not be written. Report it as
+    // the documented "runs directory unusable" failure (same as the unwritable-dir case that
+    // confirmFirstCheckpoint detects when a store drops the write silently). A failure AFTER
+    // the first checkpoint exists is a CHECKPOINT_WRITE_FAILED and propagates to the entry point.
+    if (err instanceof CheckpointWriteError && !(await stateStore.exists(err.executionId).catch(() => false))) {
+      return firstCheckpointUnwritable(err.executionId);
+    }
+    throw err;
+  }
 }
 
 /**
- * A fresh start hands the host an action that it will perform and later submit. Checkpoint
- * writes are best-effort inside the Coordinator, so if the store is unusable the action would
- * be issued although nothing was persisted — the host would do the work and only then learn,
- * at submit, that there is no execution to submit to. Confirm the first checkpoint exists
- * before issuing the action; otherwise report it now, in the same (non-terminal) way as any
- * other failure to use the runs directory.
+ * A fresh start hands the host an action that it will perform and later submit. A failed
+ * checkpoint write is reported by the Coordinator (CheckpointWriteError), so the action is not
+ * issued for an unusable store; this guards the remaining case, a store that RESOLVES a save
+ * without persisting anything. The host would do the work and only then learn, at submit, that
+ * there is no execution to submit to. Confirm the first checkpoint exists before issuing the
+ * action; otherwise report it now, in the same (non-terminal) way as any other failure to use
+ * the runs directory.
  */
 async function confirmFirstCheckpoint(
   response: ProjectRunStepResponse,
@@ -343,16 +397,16 @@ async function confirmFirstCheckpoint(
     persisted = false;
   }
   if (persisted) return response;
-  return failed(
-    response.executionId,
-    "INTAKE",
-    new ExecutionLockUnavailableError(
-      response.executionId,
-      `EXECUTION_LOCK_UNAVAILABLE: The first checkpoint for execution '${response.executionId}' could not be written, so no action was issued ` +
-        `(nothing could ever be submitted against it). Check that '.project-run/runs' exists as a writable directory and that the disk is not full, then retry.`,
-    ).message,
-    false,
+  return firstCheckpointUnwritable(response.executionId);
+}
+
+function firstCheckpointUnwritable(executionId: string): ProjectRunStepResponse {
+  const err = new ExecutionLockUnavailableError(
+    executionId,
+    `EXECUTION_LOCK_UNAVAILABLE: The first checkpoint for execution '${executionId}' could not be written, so no action was issued ` +
+      `(nothing could ever be submitted against it). Check that '.project-run/runs' exists as a writable directory and that the disk is not full, then retry.`,
   );
+  return failed(executionId, "INTAKE", err.message, false, err.code);
 }
 
 /**
@@ -367,6 +421,21 @@ export async function submitProjectRunStep(
 ): Promise<ProjectRunStepResponse> {
   const projectRoot = request.projectRoot ?? process.cwd();
   const stateStore = request.stateStore ?? new FileExecutionStateStore(projectRoot);
+  try {
+    return await submitProjectRunStepGuarded(request, projectRoot, stateStore);
+  } catch (err) {
+    // A checkpoint the call needed could not be written: the response must not claim that the
+    // result was applied beyond what the last durable checkpoint contains.
+    if (err instanceof CheckpointWriteError) return checkpointWriteFailed(err, stateStore, "INTAKE");
+    throw err;
+  }
+}
+
+async function submitProjectRunStepGuarded(
+  request: SubmitProjectRunStepRequest,
+  projectRoot: string,
+  stateStore: ExecutionStateStore,
+): Promise<ProjectRunStepResponse> {
   // A submission is validate-then-apply on the pending action: two near-simultaneous
   // submits for the same step would both pass validation against the same checkpoint
   // and double-apply. Holding the lock across the whole turn makes the loser see the
@@ -380,7 +449,7 @@ export async function submitProjectRunStep(
   } catch {
     // best-effort state for the error response only
   }
-  return failed(request.executionId, state, turn.error.message, false);
+  return failed(request.executionId, state, turn.error.message, false, turn.error.code);
 }
 
 async function submitProjectRunStepUnlocked(
@@ -487,7 +556,7 @@ async function submitProjectRunStepUnlocked(
     },
   };
 
-  const coordinator = buildStepCoordinator(persisted.execution_id, projectRoot, config, persisted, stateStore, request.maxSteps);
+  const coordinator = buildStepCoordinator(persisted.execution_id, projectRoot, config, persisted, stateStore, request.maxSteps, persisted.revision ?? 0);
 
   // Apply the host's result exactly as a real dispatch would have — this is the one
   // place the engine ever "believes" what the host reports, and it does so by
@@ -510,6 +579,7 @@ async function submitProjectRunStepUnlocked(
         failureReason: err.result.failureReason,
       };
     }
+    if (err instanceof CheckpointWriteError) throw err;
     return failed(persisted.execution_id, context.state ?? persisted.state, (err as Error).message);
   }
 }
@@ -521,6 +591,7 @@ function buildStepCoordinator(
   persisted: { project: string; feature: string; branch: string; runtime: string; preset: string } | undefined,
   stateStore: ExecutionStateStore,
   maxSteps: number | undefined,
+  baseRevision: number,
 ): Coordinator {
   const { validator, registry } = buildEngineServices(projectRoot, config, {});
   // No real AgentRuntimeAdapter is ever registered: prepareNextAction()/
@@ -540,6 +611,7 @@ function buildStepCoordinator(
       branch: persisted?.branch ?? "",
       runtime: (persisted?.runtime as never) ?? config.runtime.default_runtime,
       preset: persisted?.preset ?? config.project.workflow_version ?? "spec-kit-v1",
+      baseRevision,
     },
   });
 }
@@ -550,9 +622,10 @@ async function runPrepare(
   projectRoot: string,
   stateStore: ExecutionStateStore,
   maxSteps: number | undefined,
+  baseRevision: number,
 ): Promise<ProjectRunStepResponse> {
   const executionId = context.execution_id ?? context.execution?.execution_id ?? "unknown";
-  const coordinator = buildStepCoordinator(executionId, projectRoot, config, undefined, stateStore, maxSteps);
+  const coordinator = buildStepCoordinator(executionId, projectRoot, config, undefined, stateStore, maxSteps, baseRevision);
 
   try {
     const prepared = await coordinator.prepareNextAction(context, maxSteps);
@@ -569,6 +642,7 @@ async function runPrepare(
         failureReason: err.result.failureReason,
       };
     }
+    if (err instanceof CheckpointWriteError) throw err;
     return failed(executionId, context.state ?? "INTAKE", (err as Error).message);
   }
 }
