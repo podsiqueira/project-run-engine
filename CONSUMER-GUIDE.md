@@ -11,7 +11,7 @@ Add `@incito-labs/project-run-engine` to your repository's `package.json`:
 ```json
 {
   "dependencies": {
-    "@incito-labs/project-run-engine": "^0.1.0"
+    "@incito-labs/project-run-engine": "^0.2.0"
   }
 }
 ```
@@ -378,7 +378,15 @@ number of agent steps in the whole execution, including before a resume). The ot
 responses are signals and omit them — call `project-run engine status` to read the record
 of a running or suspended execution. `findings` is only the latest result's findings, so
 a clean final result reports `findings: []`; read `stepLog` for the full record
-(`ARCHITECTURE.md` §4.4). `history` is still always `[]` from `status()` and pull mode.
+(`ARCHITECTURE.md` §4.4). `history` is the engine's durable, compact record of what it
+*decided* (transitions, dispatches, suspensions) — not an alias of `stepLog`
+(`ARCHITECTURE.md` §4.17).
+
+**Concurrent hosts.** Mutating calls on the same `executionId` are serialised by a
+per-execution advisory lock (one machine, local filesystem). If another turn holds it past
+the wait budget you get a non-terminal `FAILED` whose `failureReason` starts with
+`EXECUTION_LOCKED`: the execution is intact, just retry. Reads (`status`, returning an
+already-pending action) never wait.
 
 See `templates/host-integrations/claude-code/project-engine-run/SKILL.md` for a
 complete reference skill built on the pull-based step API — it drives the full

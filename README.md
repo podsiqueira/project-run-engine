@@ -4,7 +4,7 @@ A provider-agnostic, runtime-neutral agent orchestration engine for portable wor
 
 `project-run-engine` automates multi-agent software engineering lifecycles (Specification, Architecture, Implementation, Independent Review, Remediation, and Convergence) without coupling to any specific LLM provider, SDK, or host runtime.
 
-**Status**: Phases 0–4 and Phase 4 Closure are complete (current release `0.1.1`); Phase 5 has not started. See [`docs/phase-reports.md`](docs/phase-reports.md) for phase history and [`docs/backlog.md`](docs/backlog.md) for deferred work and known limitations.
+**Status**: Phases 0–4, Phase 4 Closure and the ENG-001/002/003 remediation are complete (current release `0.2.0`). Phase 5 (persistence hardening: durable decision `history`, atomic checkpoints, per-execution locking) is implemented in source and unreleased. See [`docs/phase-reports.md`](docs/phase-reports.md) for phase history and [`docs/backlog.md`](docs/backlog.md) for deferred work and known limitations.
 
 ---
 
