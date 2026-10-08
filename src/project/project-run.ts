@@ -10,7 +10,8 @@ import type {
   ExecutionStepRecord,
   HostExecutionOptions,
 } from "../domain/types.js";
-import type { ExecutionLockError, ExecutionLockFailureCode } from "../domain/types.js";
+import { CheckpointWriteError, countAgentSteps } from "../domain/types.js";
+import type { ExecutionLockError, ExecutionLockFailureCode, PersistenceFailureCode } from "../domain/types.js";
 import { operationFailureReason, runLockedTurn } from "./locked-turn.js";
 import type {
   CoordinatorExecutionContext,
@@ -94,6 +95,14 @@ export interface ProjectRunExecutionResult {
    * itself is an ordinary failure and leaves this unset.
    */
   lockFailure?: ExecutionLockFailureCode;
+  /**
+   * Set ONLY when a checkpoint the engine needed could not be written (`CHECKPOINT_WRITE_FAILED`).
+   * The run was abandoned at that point: `state`, `stepLog` and `decisionHistory` describe the
+   * LAST DURABLE checkpoint (never in-memory progress that was not saved), and the execution is
+   * recoverable from it with `resume`/`start` using the same execution id. Like `lockFailure`,
+   * this explicit field — not the text of `failureReason` — is what says so.
+   */
+  persistenceFailure?: PersistenceFailureCode;
 }
 
 export interface ProjectResumeOptions {
@@ -287,6 +296,37 @@ export async function executeProjectRun(
   return turn.acquired ? turn.value : lockedResult(context, turn.error);
 }
 
+/**
+ * The result for a run that was abandoned because a checkpoint could not be written. It
+ * reports the LAST DURABLE record (re-read from the store), never the in-memory progress of
+ * the abandoned turn, so a response can never describe steps or decisions the checkpoint does
+ * not contain. Unreadable/absent checkpoint -> empty records (nothing durable exists yet).
+ */
+async function persistenceFailureResult(
+  err: CheckpointWriteError,
+  stateStore: ExecutionStateStore,
+  fallbackState: CoordinatorState,
+  agentExecuted: boolean,
+): Promise<ProjectRunExecutionResult> {
+  let durable: PersistedExecutionState | null = null;
+  try {
+    durable = await stateStore.load(err.executionId);
+  } catch {
+    // the store that just failed to write may also fail to read: report empty records
+  }
+  return {
+    status: "FAILED",
+    state: durable?.state ?? fallbackState,
+    agentExecuted,
+    stepsCount: 0,
+    history: [],
+    failureReason: err.message,
+    persistenceFailure: err.code,
+    stepLog: durable?.step_log ?? [],
+    decisionHistory: durable?.history ?? [],
+  };
+}
+
 function lockedResult(context: CoordinatorExecutionContext, err: ExecutionLockError): ProjectRunExecutionResult {
   return {
     status: "FAILED",
@@ -427,6 +467,7 @@ async function executeProjectRunUnlocked(
   });
 
   // 7. Execute Coordinator Loop
+  const agentStepsBefore = countAgentSteps(context.stepLog ?? []);
   try {
     const coordinatorResult = await coordinator.run(context);
     return {
@@ -457,6 +498,9 @@ async function executeProjectRunUnlocked(
     }
 
     const currentState = context.execution?.state ?? context.state ?? "INTAKE";
+    if (err instanceof CheckpointWriteError) {
+      return persistenceFailureResult(err, stateStore, currentState, countAgentSteps(context.stepLog ?? []) > agentStepsBefore);
+    }
     return {
       status: "FAILED",
       state: currentState,
@@ -565,8 +609,12 @@ export async function reconstructResumeContext(
     };
   }
 
-  // 2. Validate resumability
-  if (persisted.state === "READY_FOR_PR" || persisted.lifecycle_status === "COMPLETED") {
+  // 2. Validate resumability.
+  // Only a checkpoint that RECORDS completion is final. An IN_PROGRESS checkpoint whose state is
+  // READY_FOR_PR is the window between the CONVERGE -> READY_FOR_PR transition and the COMPLETED
+  // checkpoint (a crash, or a COMPLETED write that failed, lands exactly there): the decision
+  // engine completes it on the next decision, so it must stay recoverable, not be mistaken for done.
+  if (persisted.lifecycle_status === "COMPLETED") {
     return {
       ok: false,
       state: "READY_FOR_PR",
@@ -632,10 +680,11 @@ export async function reconstructResumeContext(
   if (newAnswers.length > 0) {
     try {
       await stateStore.save({ ...persisted, human_answers: mergedAnswers });
-    } catch {
-      // Non-fatal: the resume attempt below still proceeds. A failure to persist the
-      // answer record is reported as part of the FAILED result if the resume itself
-      // then also fails, but must never block a resume that would otherwise succeed.
+    } catch (err) {
+      // Not swallowed: an answer the engine cannot record durably must not be acted on
+      // (the agent would be re-dispatched on the strength of an answer that the audit
+      // trail does not contain). Nothing was modified; retrying the same call is safe.
+      throw new CheckpointWriteError(executionId, persisted.lifecycle_status, err);
     }
   }
 
@@ -692,16 +741,22 @@ async function resumeUnlocked(
   stateStore: ExecutionStateStore,
 ): Promise<ProjectRunExecutionResult> {
 
-  const reconstructed = await reconstructResumeContext({
-    executionId: options.executionId,
-    projectRoot,
-    stateStore,
-    config: options.config,
-    configPath: options.configPath,
-    runtime: options.runtime,
-    humanAnswers: options.humanAnswers,
-    executionOptions: options.executionOptions,
-  });
+  let reconstructed: ResumeContextResult;
+  try {
+    reconstructed = await reconstructResumeContext({
+      executionId: options.executionId,
+      projectRoot,
+      stateStore,
+      config: options.config,
+      configPath: options.configPath,
+      runtime: options.runtime,
+      humanAnswers: options.humanAnswers,
+      executionOptions: options.executionOptions,
+    });
+  } catch (err) {
+    if (err instanceof CheckpointWriteError) return persistenceFailureResult(err, stateStore, "HUMAN_INTERVENTION_REQUIRED", false);
+    throw err;
+  }
 
   if (!reconstructed.ok) {
     return {

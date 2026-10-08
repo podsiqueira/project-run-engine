@@ -21,6 +21,7 @@ import type {
   AgentRuntime,
   AgentSkillRequirement,
   CoordinatorState,
+  ExecutionFailureCode,
   ExecutionStepRecord,
   HostExecutionOptions,
   StructuredFinding,
@@ -149,6 +150,14 @@ export interface ProjectRunHostResponse {
   missingSkills?: AgentSkillRequirement["id"][];
   /** Present if and only if `status === "FAILED"` (or "BLOCKED_MISSING_SKILLS"). */
   failureReason?: string;
+  /**
+   * Present on a `FAILED` response for the failures a host can handle without reading
+   * `failureReason`: `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE` and
+   * `CHECKPOINT_WRITE_FAILED`. All three are non-terminal (`terminal: false`): the call did not
+   * take effect beyond the last durable checkpoint. For `CHECKPOINT_WRITE_FAILED`, `state`,
+   * `stepLog` and `history` describe that last durable checkpoint, never unsaved progress.
+   */
+  failureCode?: ExecutionFailureCode;
 }
 
 /**

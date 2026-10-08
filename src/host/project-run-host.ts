@@ -209,12 +209,14 @@ async function buildHostResponse(
         timestamp: now(),
         reason: result.failureReason ?? "Unknown failure",
       });
+      const failureCode = result.lockFailure ?? result.persistenceFailure;
       return {
         status: "FAILED",
         // Only an engine-generated lock failure (set explicitly by the engine when it could not
-        // obtain the lock) rejects THIS call alone with the execution untouched. Any other
+        // obtain the lock) or a checkpoint-write failure (the run was abandoned at the last
+        // durable checkpoint, which is recoverable) leaves the execution retryable. Any other
         // failure — including a lock error raised inside the run — has failed the execution.
-        terminal: result.lockFailure === undefined,
+        terminal: failureCode === undefined,
         executionId,
         state,
         stepsCount,
@@ -222,6 +224,7 @@ async function buildHostResponse(
         findings,
         stepLog,
         failureReason: result.failureReason,
+        ...(failureCode !== undefined ? { failureCode } : {}),
       };
     }
   }

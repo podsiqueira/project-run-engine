@@ -305,6 +305,43 @@ export function isExecutionLockFailure(reason: string | undefined): boolean {
   return /^EXECUTION_LOCK(ED|_UNAVAILABLE):/.test(reason ?? "");
 }
 
+export type PersistenceFailureCode = "CHECKPOINT_WRITE_FAILED";
+
+/** Every machine-readable failure code a response can carry in `failureCode`. */
+export type ExecutionFailureCode = ExecutionLockFailureCode | PersistenceFailureCode;
+
+/**
+ * A checkpoint the engine needed to write could not be written (`ExecutionStateStore.save`
+ * rejected). The engine never reports progress that is not durable, so the operation that
+ * needed the write is abandoned and this error surfaces; entry points turn it into a
+ * structured, non-terminal failure (`failureCode: "CHECKPOINT_WRITE_FAILED"`).
+ *
+ * The execution is left at its LAST DURABLE checkpoint (a save is all-or-nothing). Which
+ * checkpoint that is depends on how far the abandoned turn got, but it is always a state
+ * the engine can recover from — exactly like a crash at that point: `next-step` (pull) or
+ * `resume`/`start` (push) with the same execution id continue from it. Raised only for a
+ * write the engine required; never for a lock failure (see `ExecutionLockError`).
+ */
+export class CheckpointWriteError extends Error {
+  readonly code: PersistenceFailureCode = "CHECKPOINT_WRITE_FAILED";
+  constructor(
+    readonly executionId: string,
+    /** The lifecycle status the failed checkpoint would have recorded. */
+    readonly lifecycleStatus: string,
+    readonly cause?: unknown,
+  ) {
+    const detail = cause instanceof Error ? cause.message : cause === undefined ? "unknown error" : String(cause);
+    super(
+      `CHECKPOINT_WRITE_FAILED: The ${lifecycleStatus} checkpoint for execution '${executionId}' could not be written (${detail}). ` +
+        `The engine does not report progress that is not durable, so this call did not take effect beyond the last durable checkpoint, ` +
+        `and the execution is intact. Fix the storage problem (free disk space, permissions on '.project-run/runs'), then call next-step ` +
+        `(pull mode) or resume/start (push mode) again with the same executionId — it continues from the last durable checkpoint.`,
+    );
+    this.name = "CheckpointWriteError";
+    Object.setPrototypeOf(this, CheckpointWriteError.prototype);
+  }
+}
+
 export class InvalidPersistedStateError extends Error {
   readonly code = "INVALID_PERSISTED_STATE";
   constructor(readonly executionId: string, message?: string) {
