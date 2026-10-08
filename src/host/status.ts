@@ -24,13 +24,14 @@ export interface ProjectRunStatusOptions extends ProjectRunStatusRequest {
 /**
  * Reads back the current, persisted status of an execution without advancing it.
  *
- * What is and isn't durable (see `ARCHITECTURE.md` §4.4/§4.15 and `docs/backlog.md`
- * ENG-002): the checkpoint retains an append-only `step_log` — every agent step (with
- * the findings it reported) and every human suspension — so `stepLog` and `stepsCount`
- * are exact, including across resumes and restarts. `findings` is the latest result's
- * findings only. `history` (the live `StepRecord[]` of decisions) is NOT persisted, so
- * `status()` always returns `history: []`; use `stepLog` for the durable record. A
- * checkpoint written before the step log existed reports `stepsCount: 0` / `stepLog: []`.
+ * What is durable (see `ARCHITECTURE.md` §4.4/§4.17 and `docs/backlog.md`): the checkpoint
+ * retains two append-only records — `step_log` (what happened: every agent step with the
+ * findings it reported, and every human suspension) and `history` (what the engine
+ * decided: every transition, dispatch, completion and suspension). `stepLog`, `history`
+ * and `stepsCount` are exact, including across resumes and restarts. `findings` is the
+ * latest result's findings only. A checkpoint written before Phase 5 has no `history`
+ * (reported as `[]`); one written before `step_log` existed reports `stepsCount: 0` /
+ * `stepLog: []` — earlier entries are never reconstructed.
  */
 export async function statusProjectRun(
   options: ProjectRunStatusOptions,
@@ -74,7 +75,7 @@ export async function statusProjectRun(
     executionId: persisted.execution_id,
     state: persisted.state,
     stepsCount: countAgentSteps(persisted.step_log),
-    history: [],
+    history: persisted.history ?? [],
     findings,
     stepLog: persisted.step_log ?? [],
   };

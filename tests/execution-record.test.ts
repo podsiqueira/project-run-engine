@@ -196,8 +196,10 @@ describe("ENG-002 — pull-mode execution record (the exact observed failure)", 
     expect(status.status).toBe("COMPLETED");
     expect(status.stepLog).toEqual(final.result.stepLog);
     expect(status.stepsCount).toBe(final.result.stepsCount);
-    // `history` is documented as live-only; the durable record is `stepLog`.
-    expect(status.history).toEqual([]);
+    // Phase 5: `history` is now the durable decision record (it was `[]` through 0.2.0 —
+    // the ENG-002 deferral). It is distinct from `stepLog`, and the same from any host.
+    expect(status.history.length).toBeGreaterThan(status.stepLog.length);
+    expect(status.history).toEqual(final.result.history);
   });
 });
 

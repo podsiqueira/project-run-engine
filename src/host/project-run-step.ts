@@ -20,7 +20,7 @@
 // back the result; this module's only job is translating between that and the
 // Coordinator/DecisionEngine's existing, unmodified machinery.
 
-import type { AgentResult, CoordinatorState } from "../domain/types.js";
+import { ExecutionLockTimeoutError, type AgentResult, type CoordinatorState } from "../domain/types.js";
 import type { CoordinatorExecutionContext, FindingInput } from "../decision/types.js";
 import { Coordinator, type PreparedAction } from "../coordinator/coordinator.js";
 import { CoordinatorDecisionEngine } from "../decision/decision-engine.js";
@@ -36,6 +36,7 @@ import {
 } from "../project/project-run.js";
 import {
   FileExecutionStateStore,
+  withExecutionLock,
   type ExecutionStateStore,
   type PersistedExecutionState,
 } from "../project/state-store.js";
@@ -128,6 +129,41 @@ export async function nextProjectRunStep(
 ): Promise<ProjectRunStepResponse> {
   const projectRoot = request.projectRoot ?? process.cwd();
   const stateStore = request.stateStore ?? new FileExecutionStateStore(projectRoot);
+  const executionId = request.executionId;
+
+  // No id: a fresh, unguessable one is minted below — nothing to contend for.
+  if (!executionId) return nextProjectRunStepUnlocked(request, projectRoot, stateStore);
+
+  // Cheap unlocked peek decides whether this call can MUTATE the execution. Pure reads
+  // (return the pending action, report a suspension, report a terminal state) never
+  // block behind a writer; the impl re-reads under the lock when it does mutate.
+  let peeked: PersistedExecutionState | null = null;
+  try {
+    peeked = await stateStore.load(executionId);
+  } catch {
+    return nextProjectRunStepUnlocked(request, projectRoot, stateStore); // reports the load error itself
+  }
+  const mutates =
+    !peeked ||
+    peeked.lifecycle_status === "IN_PROGRESS" ||
+    (peeked.lifecycle_status === "HUMAN_INTERVENTION_REQUIRED" && (request.humanAnswers?.length ?? 0) > 0);
+  if (!mutates) return nextProjectRunStepUnlocked(request, projectRoot, stateStore);
+
+  try {
+    return await withExecutionLock(stateStore, executionId, () => nextProjectRunStepUnlocked(request, projectRoot, stateStore));
+  } catch (err) {
+    if (err instanceof ExecutionLockTimeoutError) {
+      return failed(executionId, peeked?.state ?? "INTAKE", err.message, false);
+    }
+    throw err;
+  }
+}
+
+async function nextProjectRunStepUnlocked(
+  request: NextProjectRunStepRequest,
+  projectRoot: string,
+  stateStore: ExecutionStateStore,
+): Promise<ProjectRunStepResponse> {
 
   if (request.executionId) {
     let persisted: PersistedExecutionState | null;
@@ -260,6 +296,32 @@ export async function submitProjectRunStep(
 ): Promise<ProjectRunStepResponse> {
   const projectRoot = request.projectRoot ?? process.cwd();
   const stateStore = request.stateStore ?? new FileExecutionStateStore(projectRoot);
+  // A submission is validate-then-apply on the pending action: two near-simultaneous
+  // submits for the same step would both pass validation against the same checkpoint
+  // and double-apply. Holding the lock across the whole turn makes the loser see the
+  // winner's checkpoint and be rejected as STALE_STEP, exactly as a sequential
+  // duplicate already is.
+  try {
+    return await withExecutionLock(stateStore, request.executionId, () => submitProjectRunStepUnlocked(request, projectRoot, stateStore));
+  } catch (err) {
+    if (err instanceof ExecutionLockTimeoutError) {
+      let state: CoordinatorState = "INTAKE";
+      try {
+        state = (await stateStore.load(request.executionId))?.state ?? state;
+      } catch {
+        // best-effort state for the error response only
+      }
+      return failed(request.executionId, state, err.message, false);
+    }
+    throw err;
+  }
+}
+
+async function submitProjectRunStepUnlocked(
+  request: SubmitProjectRunStepRequest,
+  projectRoot: string,
+  stateStore: ExecutionStateStore,
+): Promise<ProjectRunStepResponse> {
 
   let persisted: PersistedExecutionState | null;
   try {
@@ -348,6 +410,7 @@ export async function submitProjectRunStep(
     findings: persisted.findings as FindingInput[] | undefined,
     humanAnswers: persisted.human_answers,
     stepLog: persisted.step_log,
+    history: persisted.history,
     execution: {
       execution_id: persisted.execution_id,
       feature: persisted.feature,

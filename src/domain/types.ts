@@ -254,6 +254,19 @@ export class ExecutionNotResumableError extends Error {
   }
 }
 
+/**
+ * Another operation holds the advisory lock for this execution and did not release it
+ * within the wait budget. The execution itself is fine — retry the call.
+ */
+export class ExecutionLockTimeoutError extends Error {
+  readonly code = "EXECUTION_LOCKED";
+  constructor(readonly executionId: string, message?: string) {
+    super(message ?? `EXECUTION_LOCKED: Execution '${executionId}' is being modified by another operation`);
+    this.name = "ExecutionLockTimeoutError";
+    Object.setPrototypeOf(this, ExecutionLockTimeoutError.prototype);
+  }
+}
+
 export class InvalidPersistedStateError extends Error {
   readonly code = "INVALID_PERSISTED_STATE";
   constructor(readonly executionId: string, message?: string) {
