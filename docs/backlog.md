@@ -241,9 +241,8 @@ both pull and push paths. This changes error-propagation semantics and needs its
 
 ## Phase 5
 
-Implemented in source and review-remediated, unreleased: persistence hardening (decision
-`history`, atomic checkpoints, per-execution advisory lock). See `docs/phase-reports.md` for
-the baseline, evidence, and the release impact (the next release must be a minor bump,
-`0.3.0`).
+Complete and released as `0.3.0`: persistence hardening (decision `history`, atomic
+checkpoints, per-execution advisory lock). See `docs/phase-reports.md` for the baseline,
+evidence, and the release impact (a minor bump, `0.3.0`).
 Host integrations (Antigravity, Cursor, Codex, MCP) are **not** part of Phase 5; they remain
 the backlog items above.

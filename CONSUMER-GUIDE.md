@@ -11,7 +11,7 @@ Add `@incito-labs/project-run-engine` to your repository's `package.json`:
 ```json
 {
   "dependencies": {
-    "@incito-labs/project-run-engine": "^0.2.0"
+    "@incito-labs/project-run-engine": "^0.3.0"
   }
 }
 ```

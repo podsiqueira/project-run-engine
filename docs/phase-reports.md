@@ -19,12 +19,11 @@ known limitations, and trust boundaries see `docs/backlog.md`.
 | Phase 3 — Pull-based execution model | COMPLETE |
 | Phase 4 — Real Claude Code host integration | COMPLETE |
 | Phase 4 Closure — runtime-default hardening, docs, release | COMPLETE |
-| Phase 5 — Persistence hardening | **IMPLEMENTED in source — unreleased** (see [Phase 5](#phase-5--persistence-hardening)) |
+| Phase 5 — Persistence hardening | **COMPLETE — released as `0.3.0`** (see [Phase 5](#phase-5--persistence-hardening)) |
 
-Current release: `@incito-labs/project-run-engine@0.2.0` (`package.json`; published to npm,
-`latest` dist-tag, verified from a fresh registry install). The Phase 5 work below is
-unreleased; because it changes the typed `history` contract it must ship as `0.3.0`, not a
-patch.
+Current release: `@incito-labs/project-run-engine@0.3.0` (`package.json`). Phase 5 shipped as
+`0.3.0`, not a patch, because it changes the typed `history` contract. `0.2.0` was the previous
+release.
 
 ## Phase 0 — Coordinator safety gates
 
@@ -201,5 +200,6 @@ detail, ownership, and tests are in `docs/backlog.md`:
   removing the lock re-entry, letting the read pass mutate, letting a failed read fall
   through to the locked path, restoring prefix classification, and dropping the
   first-checkpoint check each make a test fail.
-- **Status**: IMPLEMENTED in source, validated, review remediation applied; **unreleased**
-  (release is a separate step: the next version must be `0.3.0`).
+- **Status**: COMPLETE — implemented, validated, review remediation applied, independently
+  reviewed, and released as `0.3.0`. The pre-existing, undocumented-until-now limitation that
+  `Coordinator.checkpoint()` swallows `save()` failures remains open (`docs/backlog.md`).
