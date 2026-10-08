@@ -10,7 +10,7 @@ import type {
   ExecutionStepRecord,
   HostExecutionOptions,
 } from "../domain/types.js";
-import { ExecutionLockTimeoutError } from "../domain/types.js";
+import { ExecutionLockError } from "../domain/types.js";
 import type {
   CoordinatorExecutionContext,
   DecisionRecord,
@@ -279,12 +279,12 @@ export async function executeProjectRun(
   try {
     return await withExecutionLock(stateStore, executionId, () => executeProjectRunUnlocked({ ...options, stateStore }));
   } catch (err) {
-    if (err instanceof ExecutionLockTimeoutError) return lockedResult(context, err);
+    if (err instanceof ExecutionLockError) return lockedResult(context, err);
     throw err;
   }
 }
 
-function lockedResult(context: CoordinatorExecutionContext, err: ExecutionLockTimeoutError): ProjectRunExecutionResult {
+function lockedResult(context: CoordinatorExecutionContext, err: ExecutionLockError): ProjectRunExecutionResult {
   return {
     status: "FAILED",
     state: context.execution?.state ?? context.state ?? "INTAKE",
@@ -681,7 +681,7 @@ export async function executeProjectResume(
   try {
     return await withExecutionLock(stateStore, options.executionId, () => resumeUnlocked(options, projectRoot, stateStore));
   } catch (err) {
-    if (err instanceof ExecutionLockTimeoutError) {
+    if (err instanceof ExecutionLockError) {
       return lockedResult({ state: "HUMAN_INTERVENTION_REQUIRED" }, err);
     }
     throw err;

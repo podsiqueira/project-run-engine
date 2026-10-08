@@ -276,6 +276,75 @@ describe("Phase 5 — push mode reports and recovers the same durable history", 
   });
 });
 
+describe("Phase 5 — push and pull record the same decisions", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "p5-parity-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("push mode records the pure transitions too (not only dispatches), including the remediation loop", async () => {
+    let reviews = 0;
+    const adapter = new MockRuntimeAdapter((req) => {
+      const block = req.role === "INDEPENDENT_REVIEW" && ++reviews === 1;
+      return {
+        execution_id: req.execution_id,
+        agent: req.role,
+        state: req.state,
+        status: block ? "FINDINGS" : "PASS",
+        evidence: [],
+        findings: block ? [{ id: "R-1", severity: "HIGH", status: "OPEN" }] : [],
+      };
+    });
+    const response = await startProjectRun({ projectRoot: tmpDir, executionId: "exec-p5-push-transitions", runtime: "MOCK", adapters: [adapter] });
+    expect(response.status).toBe("COMPLETED");
+
+    const labels = response.history.map(label);
+    expect(labels[0]).toBe("INTAKE>SPECIFY");
+    expect(labels).toEqual(expect.arrayContaining(["SPECIFY>CLARIFY", "ANALYZE>IMPLEMENT", "INDEPENDENT_REVIEW>REMEDIATION", "REMEDIATION>RE_REVIEW", "RE_REVIEW>CONVERGE", "CONVERGE>READY_FOR_PR"]));
+    expect(response.history.filter((r) => r.decision.action === "TRANSITION").length).toBeGreaterThan(response.stepLog.length - 1);
+    expect(labels.at(-1)).toBe("COMPLETE");
+  });
+
+  it("the same scripted run produces an identical decision sequence in push mode and in pull mode", async () => {
+    // Pull
+    const pull = await driveWithRemediation(tmpDir, "exec-p5-parity-pull");
+    if (pull.status !== "COMPLETED") throw new Error("pull run did not complete");
+
+    // Push, same script: INDEPENDENT_REVIEW blocks on its first run, everything else passes.
+    let reviews = 0;
+    const adapter = new MockRuntimeAdapter((req) => {
+      const block = req.role === "INDEPENDENT_REVIEW" && ++reviews === 1;
+      return {
+        execution_id: req.execution_id,
+        agent: req.role,
+        state: req.state,
+        status: block ? "FINDINGS" : "PASS",
+        evidence: [],
+        findings: block ? [{ id: "R-1", severity: "HIGH", status: "OPEN" }] : [],
+      };
+    });
+    const push = await startProjectRun({ projectRoot: tmpDir, executionId: "exec-p5-parity-push", runtime: "MOCK", adapters: [adapter] });
+    expect(push.status).toBe("COMPLETED");
+
+    expect(push.history.map(label)).toEqual(pull.result.history.map(label));
+    expect(push.history.map((r) => r.step)).toEqual(pull.result.history.map((r) => r.step));
+    expect(push.stepsCount).toBe(pull.result.stepsCount);
+    expect(push.stepLog.map((r) => `${r.kind}:${r.role}:${r.state}:${r.status}`)).toEqual(
+      pull.result.stepLog.map((r) => `${r.kind}:${r.role}:${r.state}:${r.status}`),
+    );
+    // The only difference between the modes is the pull-only correlation id.
+    expect(push.history.some((r) => r.decision.action === "DISPATCH_AGENT" && r.decision.step_id !== undefined)).toBe(false);
+    expect(pull.result.history.some((r) => r.decision.action === "DISPATCH_AGENT" && r.decision.step_id !== undefined)).toBe(true);
+  });
+});
+
 describe("Phase 5 — a dispatch that never completed stays visible", () => {
   let tmpDir: string;
 

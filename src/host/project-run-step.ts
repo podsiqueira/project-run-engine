@@ -20,7 +20,7 @@
 // back the result; this module's only job is translating between that and the
 // Coordinator/DecisionEngine's existing, unmodified machinery.
 
-import { ExecutionLockTimeoutError, type AgentResult, type CoordinatorState } from "../domain/types.js";
+import { ExecutionLockError, type AgentResult, type CoordinatorState } from "../domain/types.js";
 import type { CoordinatorExecutionContext, FindingInput } from "../decision/types.js";
 import { Coordinator, type PreparedAction } from "../coordinator/coordinator.js";
 import { CoordinatorDecisionEngine } from "../decision/decision-engine.js";
@@ -152,7 +152,7 @@ export async function nextProjectRunStep(
   try {
     return await withExecutionLock(stateStore, executionId, () => nextProjectRunStepUnlocked(request, projectRoot, stateStore));
   } catch (err) {
-    if (err instanceof ExecutionLockTimeoutError) {
+    if (err instanceof ExecutionLockError) {
       return failed(executionId, peeked?.state ?? "INTAKE", err.message, false);
     }
     throw err;
@@ -304,7 +304,7 @@ export async function submitProjectRunStep(
   try {
     return await withExecutionLock(stateStore, request.executionId, () => submitProjectRunStepUnlocked(request, projectRoot, stateStore));
   } catch (err) {
-    if (err instanceof ExecutionLockTimeoutError) {
+    if (err instanceof ExecutionLockError) {
       let state: CoordinatorState = "INTAKE";
       try {
         state = (await stateStore.load(request.executionId))?.state ?? state;

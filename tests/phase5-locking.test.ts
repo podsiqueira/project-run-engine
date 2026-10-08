@@ -12,14 +12,14 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, execFileSync, type ChildProcess } from "node:child_process";
 import { nextProjectRunStep, submitProjectRunStep } from "../src/host/project-run-step.js";
 import { executeProjectResume, executeProjectRun } from "../src/project/project-run.js";
 import { statusProjectRun } from "../src/host/status.js";
 import { FileExecutionStateStore, withExecutionLock, type PersistedExecutionState } from "../src/project/state-store.js";
 import { runProjectInit } from "../src/project/bootstrap.js";
 import { MockRuntimeAdapter } from "../src/runtime/mock-runtime-adapter.js";
-import { ExecutionLockTimeoutError, type AgentResult } from "../src/domain/types.js";
+import { ExecutionLockError, ExecutionLockTimeoutError, ExecutionLockUnavailableError, type AgentResult } from "../src/domain/types.js";
 import type { ProjectRunStepResponse } from "../src/host/step-types.js";
 
 type ActionRequired = Extract<ProjectRunStepResponse, { status: "AGENT_ACTION_REQUIRED" }>;
@@ -43,6 +43,7 @@ if (mode === "increment") {
   // Read-modify-write on a shared counter file, with a gap between read and write that
   // makes lost updates likely unless the turn is mutually exclusive.
   const store = new FileExecutionStateStore(arg.root);
+  while (arg.startAt && Date.now() < arg.startAt) await sleep(1);
   const turn = async () => {
     const n = Number(fs.readFileSync(arg.file, "utf8"));
     await sleep(2);
@@ -77,6 +78,11 @@ if (mode === "increment") {
   }
   console.log("DIED_AFTER " + JSON.stringify({ stepId: r.stepId }));
   process.kill(process.pid, "SIGKILL");
+} else if (mode === "next-at") {
+  const { nextProjectRunStep } = await import(arg.dist + "/host/project-run-step.js");
+  while (Date.now() < arg.startAt) await sleep(1);
+  const r = await nextProjectRunStep({ projectRoot: arg.root, executionId: arg.executionId, humanAnswers: arg.humanAnswers });
+  console.log("RESULT " + JSON.stringify({ status: r.status, stepId: r.stepId, failureReason: r.failureReason }));
 } else if (mode === "submit-at") {
   const { submitProjectRunStep } = await import(arg.dist + "/host/project-run-step.js");
   while (Date.now() < arg.startAt) await sleep(1);
@@ -229,9 +235,13 @@ describe("Phase 5 — FileExecutionStateStore.withLock (real lock, real processe
       for (const o of outs) expect(o.code, o.stderr).toBe(0);
       return Number(fs.readFileSync(counter, "utf8"));
     };
-    const unlocked = await run(false);
+    // The control proves this workload CAN lose updates. Losing one is overwhelmingly likely but
+    // not certain (the processes could happen to serialise), so give it a few attempts before
+    // concluding the test cannot detect races at all.
+    let unlocked = 45;
+    for (let attempt = 0; attempt < 5 && unlocked >= 45; attempt++) unlocked = await run(false);
+    expect(unlocked, "the unlocked control never lost an update in 5 attempts: this test cannot detect races").toBeLessThan(45);
     const locked = await run(true);
-    expect(unlocked).toBeLessThan(45); // the race is real: updates were lost
     expect(locked).toBe(45); // 3 processes x 15 increments, none lost
     expect(lockFiles(tmpDir)).toEqual([]);
   }, 60_000);
@@ -624,4 +634,382 @@ describe("Phase 5 — crash and recovery across real process death", () => {
     expect(response.result.stepsCount).toBe(8);
     expect(lockFiles(tmpDir)).toEqual([]);
   }, 60_000);
+});
+
+// =======================================================================================
+// Review remediation F1: lock-acquisition failures are structured, never raw exceptions.
+// =======================================================================================
+describe("Phase 5 remediation F1 — lock acquisition failures are structured and fail closed", () => {
+  let tmpDir: string;
+  let runsPath: string;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "p5-unavail-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+    runsPath = path.join(tmpDir, ".project-run", "runs");
+    fs.rmSync(runsPath, { recursive: true, force: true });
+    fs.writeFileSync(runsPath, "this is a file, so no run can ever be written here");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Replaces the blocking file with a real directory, as an operator fixing the environment would. */
+  function repairRunsDir(): void {
+    fs.rmSync(runsPath, { force: true });
+    fs.mkdirSync(runsPath, { recursive: true });
+  }
+
+  it("the store raises ExecutionLockUnavailableError (not a raw fs error) and never runs the operation", async () => {
+    const store = new FileExecutionStateStore(tmpDir);
+    let ran = false;
+    const err = await store.withLock("exec-u", async () => { ran = true; }).catch((e) => e);
+    expect(ran).toBe(false);
+    expect(err).toBeInstanceOf(ExecutionLockUnavailableError);
+    expect(err).toBeInstanceOf(ExecutionLockError);
+    expect(err).not.toBeInstanceOf(ExecutionLockTimeoutError);
+    expect(err.code).toBe("EXECUTION_LOCK_UNAVAILABLE");
+    expect(err.message).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+    expect(err.message).toContain(runsPath);
+    expect(err.cause).toBeInstanceOf(Error);
+  });
+
+  it("an error thrown by the locked operation itself is NOT mapped to a lock failure", async () => {
+    repairRunsDir();
+    const store = new FileExecutionStateStore(tmpDir);
+    await expect(store.withLock("exec-u", async () => { throw new TypeError("application bug"); })).rejects.toBeInstanceOf(TypeError);
+    // ...nor is a filesystem-shaped error raised by the operation after the lock was taken.
+    await expect(
+      store.withLock("exec-u", async () => { fs.readFileSync(path.join(tmpDir, "does-not-exist")); }),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("pull mode: nextProjectRunStep (with an id) and submitProjectRunStep return a non-terminal structured FAILED instead of throwing", async () => {
+    const next = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "exec-u", runtime: "MOCK" });
+    expect(next.status).toBe("FAILED");
+    if (next.status !== "FAILED") return;
+    expect(next.terminal).toBe(false);
+    expect(next.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+    expect(next.executionId).toBe("exec-u");
+
+    const submit = await submitProjectRunStep({
+      projectRoot: tmpDir,
+      executionId: "exec-u",
+      stepId: "step-whatever",
+      result: { execution_id: "exec-u", agent: "SPECIFICATION", state: "SPECIFY", status: "PASS", evidence: [], findings: [] },
+    });
+    expect(submit.status).toBe("FAILED");
+    expect(submit.status === "FAILED" && submit.terminal).toBe(false);
+    expect(submit.status === "FAILED" && submit.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+  });
+
+  it("push mode: executeProjectRun, executeProjectResume and the host start()/resume() all return FAILED EXECUTION_LOCK_UNAVAILABLE, and the host marks it non-terminal", async () => {
+    const adapter = new MockRuntimeAdapter((req) => ({ execution_id: req.execution_id, agent: req.role, state: req.state, status: "PASS", evidence: [], findings: [] }));
+
+    const run = await executeProjectRun({ projectRoot: tmpDir, executionId: "exec-u", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter] });
+    expect(run.status).toBe("FAILED");
+    expect(run.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+    expect(run.agentExecuted).toBe(false);
+
+    const resumed = await executeProjectResume({ projectRoot: tmpDir, executionId: "exec-u", runtime: "MOCK", adapters: [adapter] });
+    expect(resumed.status).toBe("FAILED");
+    expect(resumed.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+
+    const { startProjectRun, resumeProjectRun } = await import("../src/host/project-run-host.js");
+    for (const response of [
+      await startProjectRun({ projectRoot: tmpDir, executionId: "exec-u", runtime: "MOCK", adapters: [adapter] }),
+      await resumeProjectRun({ projectRoot: tmpDir, executionId: "exec-u", runtime: "MOCK", adapters: [adapter] }),
+    ]) {
+      expect(response.status).toBe("FAILED");
+      expect(response.terminal).toBe(false); // the execution is untouched and retryable once the environment is fixed
+      expect(response.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+      expect(response.stepLog).toEqual([]);
+      expect(response.history).toEqual([]);
+    }
+  });
+
+  it("fails closed: nothing is written while the lock is unavailable, and the same call works once the directory is repaired", async () => {
+    let dispatched = 0;
+    const adapter = new MockRuntimeAdapter((req) => { dispatched++; return { execution_id: req.execution_id, agent: req.role, state: req.state, status: "PASS", evidence: [], findings: [] }; });
+    const blocked = await executeProjectRun({ projectRoot: tmpDir, executionId: "exec-u", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter] });
+    expect(blocked.status).toBe("FAILED");
+    expect(dispatched).toBe(0); // fail closed: no agent work happened without the lock
+    expect(fs.statSync(runsPath).isFile()).toBe(true); // untouched
+
+    repairRunsDir();
+    const ok = await executeProjectRun({ projectRoot: tmpDir, executionId: "exec-u", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter] });
+    expect(ok.status).toBe("COMPLETED");
+    expect(dispatched).toBeGreaterThan(0);
+    expect(lockFiles(tmpDir)).toEqual([]);
+  });
+
+  it("an unrelated error from a custom store's own withLock is not swallowed or relabelled", async () => {
+    const real = new FileExecutionStateStore(tmpDir);
+    const exotic = {
+      save: real.save.bind(real),
+      load: real.load.bind(real),
+      exists: real.exists.bind(real),
+      withLock: async () => { throw new RangeError("custom store exploded"); },
+    };
+    await expect(
+      submitProjectRunStep({
+        projectRoot: tmpDir,
+        executionId: "exec-u",
+        stepId: "s",
+        result: { execution_id: "exec-u", agent: "SPECIFICATION", state: "SPECIFY", status: "PASS", evidence: [], findings: [] },
+        stateStore: exotic as never,
+      }),
+    ).rejects.toBeInstanceOf(RangeError);
+  });
+
+  it("the real CLI process still prints exactly one JSON line, exits 0, and writes nothing to stderr (next-step, submit-step, start)", () => {
+    const cli = path.join(distDir(), "cli", "project-run-cli.js");
+    const run = (args: string[]) => spawnSync(process.execPath, [cli, ...args, "--dir", tmpDir], { encoding: "utf8" });
+    const cases: string[][] = [
+      ["engine", "next-step", "--json", JSON.stringify({ executionId: "exec-cli", runtime: "MOCK" })],
+      ["engine", "submit-step", "--json", JSON.stringify({ executionId: "exec-cli", stepId: "s", result: { execution_id: "exec-cli", agent: "SPECIFICATION", state: "SPECIFY", status: "PASS", evidence: [], findings: [] } })],
+      ["engine", "start", "--json", JSON.stringify({ executionId: "exec-cli", runtime: "MOCK" }), "--mock-scenario", "clean"],
+    ];
+    for (const args of cases) {
+      const out = run(args);
+      expect(out.status, `${args[1]} stderr: ${out.stderr}`).toBe(0);
+      expect(out.stderr).toBe("");
+      const lines = out.stdout.trim().split("\n");
+      expect(lines, `${args[1]} stdout`).toHaveLength(1);
+      const body = JSON.parse(lines[0]);
+      expect(body.status).toBe("FAILED");
+      expect(body.terminal).toBe(false);
+      expect(body.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+    }
+  });
+});
+
+// =======================================================================================
+// Review remediation F2/F3: bounded acquisition and a truthful, actionable timeout message.
+// =======================================================================================
+describe("Phase 5 remediation F2/F3 — acquisition is bounded and the timeout message is actionable", () => {
+  let tmpDir: string;
+  let store: FileExecutionStateStore;
+  let lock: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "p5-bounded-"));
+    store = new FileExecutionStateStore(tmpDir);
+    fs.mkdirSync(store.runsDir, { recursive: true });
+    lock = path.join(store.runsDir, "exec-b.lock");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function deadPid(): Promise<number> {
+    const dead = spawn(process.execPath, ["-e", "0"]);
+    const pid = dead.pid!;
+    await collect(dead);
+    return pid;
+  }
+
+  it("a stale lock whose reap guard was orphaned by a dead reaper honours the timeout instead of spinning", async () => {
+    fs.writeFileSync(lock, JSON.stringify({ pid: await deadPid(), token: "t", acquired_at: new Date().toISOString() }));
+    fs.writeFileSync(`${lock}.reap`, ""); // a reaper died holding the guard (fresh mtime: not yet abandoned)
+
+    let maxGap = 0;
+    let last = Date.now();
+    const ticker = setInterval(() => { const n = Date.now(); maxGap = Math.max(maxGap, n - last); last = n; }, 20);
+    const started = Date.now();
+    const err = await store.withLock("exec-b", async () => "never", { timeoutMs: 300, pollMs: 10 }).catch((e) => e);
+    const elapsed = Date.now() - started;
+    await new Promise((r) => setTimeout(r, 60));
+    clearInterval(ticker);
+
+    expect(err).toBeInstanceOf(ExecutionLockTimeoutError);
+    expect(elapsed).toBeLessThan(2000); // was ~10 s: the loop ignored its deadline
+    expect(maxGap).toBeLessThan(500); // and it did not block the event loop meanwhile
+  });
+
+  it("once that orphaned guard is old enough to be abandoned, the stale lock is reclaimed", async () => {
+    fs.writeFileSync(lock, JSON.stringify({ pid: await deadPid(), token: "t", acquired_at: new Date().toISOString() }));
+    fs.writeFileSync(`${lock}.reap`, "");
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(`${lock}.reap`, old, old);
+    await expect(store.withLock("exec-b", async () => "reclaimed", { timeoutMs: 3000, pollMs: 10 })).resolves.toBe("reclaimed");
+    expect(lockFiles(tmpDir)).toEqual([]);
+  });
+
+  it("an unremovable/unreadable lock (a directory in its place) times out within budget instead of hanging", async () => {
+    fs.mkdirSync(lock);
+    const started = Date.now();
+    const err = await store.withLock("exec-b", async () => "never", { timeoutMs: 250, pollMs: 10 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ExecutionLockTimeoutError);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it("the timeout message names the lock file and the manual recovery, does not promise retry will work, and the lock is left alone", async () => {
+    const bystander = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"]); // an unrelated, live process
+    try {
+      fs.writeFileSync(lock, JSON.stringify({ pid: bystander.pid, token: "from-a-crash-last-week", acquired_at: "2026-09-01T00:00:00.000Z" }));
+      const err = await store.withLock("exec-b", async () => 1, { timeoutMs: 150, pollMs: 10 }).catch((e) => e);
+
+      expect(err).toBeInstanceOf(ExecutionLockTimeoutError);
+      expect(err.message).toContain(lock);
+      expect(err.message).toContain(`pid ${bystander.pid}`);
+      expect(err.message).toMatch(/delete the lock file manually/);
+      expect(err.message).toMatch(/no engine process is actually running/);
+      expect(err.message).toMatch(/never removes a lock whose pid is still alive/);
+      expect(err.message).not.toContain("retry the call"); // the old, misleading advice
+      expect(fs.existsSync(lock)).toBe(true); // an ambiguous pid is never auto-deleted
+    } finally {
+      bystander.kill();
+      await collect(bystander);
+    }
+  });
+
+  it("reap re-verification: a stale holder read earlier must not cause a NEWER live holder's lock to be deleted", async () => {
+    const live = { pid: process.pid, token: "newer-live-holder", acquired_at: new Date().toISOString() };
+    fs.writeFileSync(lock, JSON.stringify(live));
+    const reap = (store as unknown as { reapStaleLock(p: string, s: unknown): boolean }).reapStaleLock.bind(store);
+
+    // The caller read an older, dead holder ("older-dead-holder"), then another waiter replaced it
+    // with a live lock before this caller got the reap guard.
+    expect(reap(lock, { pid: 999999, token: "older-dead-holder", acquired_at: "2026-01-01T00:00:00.000Z" })).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lock, "utf8")).token).toBe("newer-live-holder");
+
+    // Same for the "unreadable" flavour: the lock is now readable, so it is not the one that was judged stale.
+    expect(reap(lock, "unreadable")).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lock, "utf8")).token).toBe("newer-live-holder");
+    expect(fs.existsSync(`${lock}.reap`)).toBe(false); // the guard is always released
+  });
+
+  it("reaping reports no progress while another reaper holds the guard, and leaves everything untouched", () => {
+    fs.writeFileSync(lock, JSON.stringify({ pid: 999999, token: "dead", acquired_at: "2026-01-01T00:00:00.000Z" }));
+    fs.writeFileSync(`${lock}.reap`, "");
+    const reap = (store as unknown as { reapStaleLock(p: string, s: unknown): boolean }).reapStaleLock.bind(store);
+    expect(reap(lock, { pid: 999999, token: "dead", acquired_at: "x" })).toBe(false);
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(fs.existsSync(`${lock}.reap`)).toBe(true);
+  });
+
+  it("many processes starting at once on a stale lock reclaim it without ever admitting two holders", async () => {
+    fs.writeFileSync(lock, JSON.stringify({ pid: await deadPid(), token: "dead", acquired_at: new Date().toISOString() }));
+    const counter = path.join(tmpDir, "counter.txt");
+    fs.writeFileSync(counter, "0");
+    const startAt = Date.now() + 1500;
+    const kids = [0, 1, 2, 3].map(() => runWorker("increment", { root: tmpDir, executionId: "exec-b", file: counter, n: 8, useLock: true, startAt }));
+    for (const o of await Promise.all(kids.map(collect))) expect(o.code, o.stderr).toBe(0);
+    expect(Number(fs.readFileSync(counter, "utf8"))).toBe(32);
+    expect(lockFiles(tmpDir)).toEqual([]);
+  }, 60_000);
+});
+
+// =======================================================================================
+// Review remediation F4: every mutating entry point is protected, not just "locking exists".
+// =======================================================================================
+describe("Phase 5 remediation F4 — each mutating entry point is individually lock-protected", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "p5-entry-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const impatient = () => new FileExecutionStateStore(tmpDir, undefined, { timeoutMs: 150, pollMs: 10 });
+  const hold = async (executionId: string) => {
+    let release!: () => void;
+    const held = new FileExecutionStateStore(tmpDir).withLock(executionId, () => new Promise<void>((r) => (release = r)));
+    await new Promise((r) => setTimeout(r, 20));
+    return async () => { release(); await held; };
+  };
+
+  it("with the lock held: nextProjectRunStep's mutating paths (new id, answers on a suspension) are refused, pure reads still work", async () => {
+    const executionId = "exec-held-next";
+    const store = impatient();
+
+    // (a) a brand-new execution under an explicit id is a mutation
+    const releaseNew = await hold(executionId);
+    const blockedNew = await nextProjectRunStep({ projectRoot: tmpDir, executionId, runtime: "MOCK", stateStore: store });
+    expect(blockedNew.status === "FAILED" && blockedNew.failureReason).toMatch(/^EXECUTION_LOCKED:/);
+    expect(blockedNew.status === "FAILED" && blockedNew.terminal).toBe(false);
+    expect(await new FileExecutionStateStore(tmpDir).exists(executionId)).toBe(false); // nothing was created
+    await releaseNew();
+
+    // (b) answers against a suspension are a mutation; a plain look at the suspension is not
+    let response = await nextProjectRunStep({ projectRoot: tmpDir, executionId, runtime: "MOCK" });
+    for (let guard = 0; guard < 20 && response.status === "AGENT_ACTION_REQUIRED"; guard++) {
+      response = await submitProjectRunStep({
+        projectRoot: tmpDir,
+        executionId,
+        stepId: response.stepId,
+        result: resultFor(response, response.request.state === "ANALYZE" ? "FINDINGS" : "PASS", response.request.state === "ANALYZE" ? [{ id: "A-1", severity: "HIGH", status: "OPEN" }] : []),
+      });
+    }
+    if (response.status !== "HUMAN_INTERVENTION_REQUIRED") throw new Error(`expected suspension, got ${response.status}`);
+    const answers = response.humanIntervention.questions.map((q) => ({ questionId: q.id, answer: "x" }));
+    const before = fs.readFileSync(path.join(tmpDir, ".project-run", "runs", `${executionId}.json`), "utf8");
+
+    const releaseHitl = await hold(executionId);
+    const read = await nextProjectRunStep({ projectRoot: tmpDir, executionId, stateStore: store }); // no answers: pure read
+    expect(read.status).toBe("HUMAN_INTERVENTION_REQUIRED");
+    const blockedAnswers = await nextProjectRunStep({ projectRoot: tmpDir, executionId, humanAnswers: answers, stateStore: store });
+    expect(blockedAnswers.status === "FAILED" && blockedAnswers.failureReason).toMatch(/^EXECUTION_LOCKED:/);
+    expect(fs.readFileSync(path.join(tmpDir, ".project-run", "runs", `${executionId}.json`), "utf8")).toBe(before);
+    await releaseHitl();
+  });
+
+  it("with the lock held: executeProjectRun (start with an id) is refused and creates no checkpoint; it runs once released", async () => {
+    const executionId = "exec-held-start";
+    const adapter = new MockRuntimeAdapter((req) => ({ execution_id: req.execution_id, agent: req.role, state: req.state, status: "PASS", evidence: [], findings: [] }));
+    const release = await hold(executionId);
+
+    const blocked = await executeProjectRun({ projectRoot: tmpDir, executionId, runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter], stateStore: impatient() });
+    expect(blocked.status).toBe("FAILED");
+    expect(blocked.failureReason).toMatch(/^EXECUTION_LOCKED:/);
+    expect(await new FileExecutionStateStore(tmpDir).exists(executionId)).toBe(false);
+
+    await release();
+    const ok = await executeProjectRun({ projectRoot: tmpDir, executionId, runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter], stateStore: impatient() });
+    expect(ok.status).toBe("COMPLETED");
+  });
+
+  it("two OS processes answering the same human question at the same instant: answers recorded once, one re-dispatch, one stepId (repeated rounds)", async () => {
+    for (let round = 0; round < 4; round++) {
+      const executionId = `exec-race-next-${round}`;
+      let response = await nextProjectRunStep({ projectRoot: tmpDir, executionId, runtime: "MOCK" });
+      for (let guard = 0; guard < 20 && response.status === "AGENT_ACTION_REQUIRED"; guard++) {
+        const block = response.request.state === "ANALYZE";
+        response = await submitProjectRunStep({
+          projectRoot: tmpDir,
+          executionId,
+          stepId: response.stepId,
+          result: resultFor(response, block ? "FINDINGS" : "PASS", block ? [{ id: "A-1", severity: "HIGH", status: "OPEN" }] : []),
+        });
+      }
+      if (response.status !== "HUMAN_INTERVENTION_REQUIRED") throw new Error(`expected suspension, got ${response.status}`);
+      const answers = response.humanIntervention.questions.map((q) => ({ questionId: q.id, answer: "same" }));
+      const before = (await new FileExecutionStateStore(tmpDir).load(executionId))!;
+      const dispatchesBefore = before.history!.filter((r) => r.decision.action === "DISPATCH_AGENT").length;
+
+      const startAt = Date.now() + 1200;
+      const kids = [0, 1].map(() => runWorker("next-at", { root: tmpDir, executionId, humanAnswers: answers, startAt }));
+      const results = (await Promise.all(kids.map(collect))).map((o) => {
+        expect(o.code, o.stderr).toBe(0);
+        return JSON.parse(o.stdout.split("RESULT ")[1]) as { status: string; stepId?: string };
+      });
+
+      expect(results.map((r) => r.status)).toEqual(["AGENT_ACTION_REQUIRED", "AGENT_ACTION_REQUIRED"]);
+      expect(results[0].stepId).toBe(results[1].stepId);
+      const after = (await new FileExecutionStateStore(tmpDir).load(executionId))!;
+      expect(after.human_answers).toHaveLength(answers.length);
+      expect(after.history!.filter((r) => r.decision.action === "DISPATCH_AGENT").length - dispatchesBefore).toBe(1);
+      expect(after.step_log!.filter((r) => r.kind === "HUMAN_INTERVENTION")).toHaveLength(1);
+    }
+    expect(lockFiles(tmpDir)).toEqual([]);
+  }, 90_000);
 });

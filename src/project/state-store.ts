@@ -12,7 +12,9 @@ import type {
   StructuredFinding,
 } from "../domain/types.js";
 import {
+  ExecutionLockError,
   ExecutionLockTimeoutError,
+  ExecutionLockUnavailableError,
   InvalidPersistedStateError,
   StateVersionUnsupportedError,
 } from "../domain/types.js";
@@ -389,6 +391,25 @@ export class FileExecutionStateStore implements ExecutionStateStore {
   }
 
   private async acquireLock(executionId: string, options: ExecutionLockOptions): Promise<() => void> {
+    try {
+      return await this.acquireLockOrThrow(executionId, options);
+    } catch (err) {
+      if (err instanceof ExecutionLockError) throw err;
+      // A filesystem failure while taking the lock (missing/unwritable runs dir, disk full,
+      // too many open files, ...). Only failures from acquisition itself reach here — the
+      // caller's own work runs after acquisition and is never wrapped.
+      const e = err as NodeJS.ErrnoException;
+      throw new ExecutionLockUnavailableError(
+        executionId,
+        `EXECUTION_LOCK_UNAVAILABLE: Could not acquire the lock for execution '${executionId}' in '${this.runsDir}' ` +
+          `(${e.code ?? "error"}: ${e.message}). The execution was not modified, and the engine will not proceed without the lock. ` +
+          `Check that the directory exists and is writable and that the disk is not full, then retry.`,
+        err,
+      );
+    }
+  }
+
+  private async acquireLockOrThrow(executionId: string, options: ExecutionLockOptions): Promise<() => void> {
     const timeoutMs = options.timeoutMs ?? this.lockDefaults.timeoutMs ?? 30_000;
     const pollMs = options.pollMs ?? this.lockDefaults.pollMs ?? 25;
     fs.mkdirSync(this.runsDir, { recursive: true });
@@ -399,33 +420,55 @@ export class FileExecutionStateStore implements ExecutionStateStore {
     const deadline = Date.now() + timeoutMs;
 
     for (;;) {
-      try {
-        const fd = fs.openSync(lockPath, "wx");
-        try {
-          fs.writeSync(fd, JSON.stringify(info), 0, "utf8");
-        } finally {
-          fs.closeSync(fd);
-        }
-        return () => this.releaseLock(lockPath, token);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      }
+      if (this.tryCreateLock(lockPath, info)) return () => this.releaseLock(lockPath, token);
 
       const holder = readLockInfo(lockPath);
-      if (holder === "gone") continue; // released between our attempt and our read
-      if (isLockStale(lockPath, holder)) {
-        this.reapStaleLock(lockPath, holder);
-        continue;
-      }
+      // Progress = the situation changed (lock vanished, or we removed an abandoned one), so
+      // retry at once; otherwise wait a poll interval. EVERY iteration passes through the
+      // deadline check and yields to the event loop, so no path can spin or outlive the budget.
+      let progressed = holder === "gone";
+      if (holder !== "gone" && isLockStale(lockPath, holder)) progressed = this.reapStaleLock(lockPath, holder);
+
       if (Date.now() >= deadline) {
-        const who = holder === "unreadable" ? "an unknown holder" : `pid ${holder.pid} since ${holder.acquired_at}`;
+        const who = holder === "unreadable" || holder === "gone" ? "an unidentified holder" : `pid ${holder.pid} (since ${holder.acquired_at})`;
         throw new ExecutionLockTimeoutError(
           executionId,
-          `EXECUTION_LOCKED: Execution '${executionId}' is locked by ${who}; gave up after ${timeoutMs}ms. The execution is intact — retry the call.`,
+          `EXECUTION_LOCKED: Execution '${executionId}' is locked by ${who}; gave up after ${timeoutMs}ms. Lock file: ${lockPath}. ` +
+            `If that operation is still running, retry once it finishes. If no engine process is actually running for this ` +
+            `execution (for example the pid now belongs to an unrelated process after a crash or restart), the lock is stale: ` +
+            `delete the lock file manually. The engine never removes a lock whose pid is still alive. The execution itself is intact.`,
         );
       }
-      await sleep(pollMs + Math.floor(Math.random() * pollMs));
+      await sleep(progressed ? 0 : pollMs + Math.floor(Math.random() * pollMs));
     }
+  }
+
+  /** Creates the lock file exclusively. Returns false when it already exists; any other failure throws (and leaves no half-written lock behind). */
+  private tryCreateLock(lockPath: string, info: LockInfo): boolean {
+    let fd: number;
+    try {
+      fd = fs.openSync(lockPath, "wx");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
+    }
+    try {
+      fs.writeSync(fd, JSON.stringify(info), 0, "utf8");
+    } catch (err) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // already closed
+      }
+      try {
+        fs.unlinkSync(lockPath); // never leave an empty lock that would look held
+      } catch {
+        // nothing to remove
+      }
+      throw err;
+    }
+    fs.closeSync(fd);
+    return true;
   }
 
   /** Releases only a lock that is still OURS — never one reclaimed after we were deemed dead. */
@@ -445,7 +488,7 @@ export class FileExecutionStateStore implements ExecutionStateStore {
    * guard file, and the lock is re-verified under the guard, so two waiters cannot both
    * decide the same lock is stale and have the slower one delete the faster one's fresh lock.
    */
-  private reapStaleLock(lockPath: string, stale: LockInfo | "unreadable"): void {
+  private reapStaleLock(lockPath: string, stale: LockInfo | "unreadable"): boolean {
     const guardPath = `${lockPath}.reap`;
     try {
       const fd = fs.openSync(guardPath, "wx");
@@ -458,7 +501,7 @@ export class FileExecutionStateStore implements ExecutionStateStore {
       } catch {
         // raced with the other reaper finishing
       }
-      return;
+      return false; // no progress made: the caller waits a poll interval and re-checks its deadline
     }
     try {
       const current = readLockInfo(lockPath);
@@ -472,6 +515,7 @@ export class FileExecutionStateStore implements ExecutionStateStore {
           // already gone
         }
       }
+      return true;
     } finally {
       try {
         fs.unlinkSync(guardPath);
