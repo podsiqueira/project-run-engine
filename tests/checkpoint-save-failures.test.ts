@@ -527,4 +527,3 @@ describe("NF-2 contract details", () => {
 function adapterNever(): MockRuntimeAdapter {
   return new MockRuntimeAdapter(async () => { throw new Error("no agent work expected"); });
 }
-
