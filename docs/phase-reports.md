@@ -22,8 +22,10 @@ known limitations, and trust boundaries see `docs/backlog.md`.
 | Phase 5 | **NOT STARTED — READY TO PLAN** (see [Phase 5](#phase-5-not-started)) |
 
 Current release: `@incito-labs/project-run-engine@0.1.1` (`package.json`; published to
-npm, `latest` dist-tag). The ENG-001/002/003 follow-up work below is on the source
-branch only and unreleased.
+npm, `latest` dist-tag). The ENG-001/002/003 follow-up work below is unreleased: it is
+versioned `0.2.0` in `package.json` (a minor bump — see ENG-002 in `docs/backlog.md`),
+verified from a packed tarball, but **not yet published to npm**; `latest` on the registry
+is still `0.1.1`. Update this paragraph when `0.2.0` is published and verified.
 
 ## Phase 0 — Coordinator safety gates
 
@@ -138,7 +140,7 @@ detail, ownership, and tests are in `docs/backlog.md`:
   workspace; the engine's contract is documented (`ARCHITECTURE.md` §4.16).
 - **ENG-002** (lost findings/history): CLOSED — durable `step_log`/`stepLog` added and
   `stepsCount` redefined as agent steps; decision-level `history` remains deferred.
-  This is a response-contract change, so it ships with the next release, not `0.1.1`.
+  This is a response-contract change, so it ships as `0.2.0`, not `0.1.1`.
 - **ENG-003** (feature vs. branch identity): OPEN, consumer-owned; no engine action.
 
 ## Phase 5: NOT STARTED

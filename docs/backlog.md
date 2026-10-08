@@ -167,7 +167,17 @@ provisional — this repository has no formal severity taxonomy.
   report `stepsCount: 0`).
 - **Side effect to note**: `ProjectRunHostResponse` gains a required `stepLog` field
   (additive on the wire; a consumer that *constructs* this type must add it) and
-  `stepsCount` changes meaning as above — this is a contract change for the next release.
+  `stepsCount` changes meaning as above — a contract change, versioned **`0.2.0`**
+  (minor, pre-1.0: keeps existing `^0.1.x` ranges from picking it up unannounced).
+  Release status: `0.2.0` is prepared and verified from a packed tarball (including
+  continuing a real checkpoint written by the published `0.1.1`), but publication to npm
+  is pending credentials; consumers should pin the exact version once published.
+- **Review follow-ups folded in before release**: rejected or pre-flight-blocked push
+  responses (e.g. resuming a completed execution) now report the persisted record rather
+  than `stepsCount: 0`; docs corrected to state that only `status()`, `start()`,
+  `resume()` and the terminal `COMPLETED` pull response carry `stepLog` (other pull
+  responses are signals); the two same-named `stepsCount` counters are documented as
+  different things (`ARCHITECTURE.md` §4.4). Tests: 15 in `tests/execution-record.test.ts`.
 
 ### ENG-003 — Feature vs. execution vs. branch identity in prerequisite tooling — OPEN (EXTERNAL / CONSUMER OWNED; no engine action)
 
