@@ -254,6 +254,57 @@ export class ExecutionNotResumableError extends Error {
   }
 }
 
+export type ExecutionLockFailureCode = "EXECUTION_LOCKED" | "EXECUTION_LOCK_UNAVAILABLE";
+
+/**
+ * The engine could not obtain the advisory lock for an execution, so it did NOT run the
+ * operation (and never runs it unlocked). The execution and its checkpoint are untouched.
+ * Raised only from lock acquisition — never for an error thrown by the locked operation
+ * itself. Entry points convert it into a structured, non-terminal failure whose
+ * `failureReason` starts with `code`; see `isExecutionLockFailure`.
+ */
+export class ExecutionLockError extends Error {
+  constructor(
+    readonly code: ExecutionLockFailureCode,
+    readonly executionId: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ExecutionLockError";
+    Object.setPrototypeOf(this, ExecutionLockError.prototype);
+  }
+}
+
+/**
+ * Another operation holds the advisory lock for this execution and did not release it
+ * within the wait budget. The execution itself is fine — retry once that operation ends.
+ */
+export class ExecutionLockTimeoutError extends ExecutionLockError {
+  constructor(executionId: string, message?: string) {
+    super("EXECUTION_LOCKED", executionId, message ?? `EXECUTION_LOCKED: Execution '${executionId}' is being modified by another operation`);
+    this.name = "ExecutionLockTimeoutError";
+    Object.setPrototypeOf(this, ExecutionLockTimeoutError.prototype);
+  }
+}
+
+/**
+ * The lock could not be taken at all because the filesystem refused (the runs directory
+ * is missing or not a directory, is not writable, the disk is full, ...). Retrying
+ * without fixing the environment will not help.
+ */
+export class ExecutionLockUnavailableError extends ExecutionLockError {
+  constructor(executionId: string, message?: string, readonly cause?: unknown) {
+    super("EXECUTION_LOCK_UNAVAILABLE", executionId, message ?? `EXECUTION_LOCK_UNAVAILABLE: Could not lock execution '${executionId}'`);
+    this.name = "ExecutionLockUnavailableError";
+    Object.setPrototypeOf(this, ExecutionLockUnavailableError.prototype);
+  }
+}
+
+/** True when a `failureReason` reports a lock failure (the call was rejected; the execution is intact and not terminal). */
+export function isExecutionLockFailure(reason: string | undefined): boolean {
+  return /^EXECUTION_LOCK(ED|_UNAVAILABLE):/.test(reason ?? "");
+}
+
 export class InvalidPersistedStateError extends Error {
   readonly code = "INVALID_PERSISTED_STATE";
   constructor(readonly executionId: string, message?: string) {

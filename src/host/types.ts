@@ -26,7 +26,7 @@ import type {
   StructuredFinding,
 } from "../domain/types.js";
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
-import type { StepRecord } from "../coordinator/coordinator.js";
+import type { DecisionRecord } from "../decision/types.js";
 import type { ProjectWorkflowConfig } from "../project/project-config.js";
 import type { HumanAnswer, HumanInterventionRequired } from "../decision/human-intervention.js";
 import type { ProjectRunEvent } from "./events.js";
@@ -116,11 +116,18 @@ export interface ProjectRunHostResponse {
    */
   stepsCount: number;
   /**
-   * Live, in-memory only: the Coordinator's step records for the `start()`/`resume()`
-   * call that produced this response. Always `[]` from `status()` and pull-mode
-   * responses. Use `stepLog` for the durable record.
+   * The engine's durable, execution-wide decision history (Phase 5): every transition,
+   * dispatch, completion and human suspension it decided, in order, including those made
+   * before a resume or restart. Compact — no dispatch payloads or result evidence. It is
+   * NOT `stepLog` (which records what agents reported) and NOT an alias of it: transitions
+   * such as the remediation loop appear only here. Empty for checkpoints written before
+   * Phase 5 (earlier decisions are never reconstructed).
+   *
+   * (Before Phase 5 this was the live per-call `StepRecord[]` for `start()`/`resume()` and
+   * always `[]` from `status()`. The live per-call records remain available to programmatic
+   * callers through `onEvent`, `executeProjectRun`'s `onStep`, and `coordinatorResult`.)
    */
-  history: StepRecord[];
+  history: DecisionRecord[];
   /**
    * The findings reported by the MOST RECENT agent result — the same findings the
    * decision engine gates on. A later clean result legitimately replaces this with

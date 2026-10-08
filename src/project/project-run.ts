@@ -10,8 +10,11 @@ import type {
   ExecutionStepRecord,
   HostExecutionOptions,
 } from "../domain/types.js";
+import type { ExecutionLockError, ExecutionLockFailureCode } from "../domain/types.js";
+import { operationFailureReason, runLockedTurn } from "./locked-turn.js";
 import type {
   CoordinatorExecutionContext,
+  DecisionRecord,
   FindingInput,
 } from "../decision/types.js";
 import {
@@ -82,6 +85,15 @@ export interface ProjectRunExecutionResult {
   coordinatorResult?: CoordinatorRunResult;
   /** The execution's durable step log as of this call's end (including prior resumes). */
   stepLog?: ExecutionStepRecord[];
+  /** The execution's durable decision history as of this call's end (including prior resumes). */
+  decisionHistory?: DecisionRecord[];
+  /**
+   * Set ONLY when the engine could not obtain the execution's lock for this call: nothing ran
+   * and the execution is untouched. This explicit field — not the text of `failureReason` — is
+   * what distinguishes a rejected call from a failed one; a lock error raised inside the run
+   * itself is an ordinary failure and leaves this unset.
+   */
+  lockFailure?: ExecutionLockFailureCode;
 }
 
 export interface ProjectResumeOptions {
@@ -263,6 +275,34 @@ export function reconstructStartContext(options: {
 export async function executeProjectRun(
   options: ProjectRunOptions,
 ): Promise<ProjectRunExecutionResult> {
+  const context = options.context;
+  const executionId =
+    options.executionId ?? context.execution?.execution_id ?? context.execution?.id ?? context.execution_id;
+  // No id supplied: reconstructStartContext mints a fresh, unguessable one that no
+  // other host can know yet, so there is nothing to contend for.
+  if (!executionId) return executeProjectRunUnlocked(options);
+
+  const stateStore = options.stateStore ?? new FileExecutionStateStore(options.projectRoot ?? process.cwd());
+  const turn = await runLockedTurn(stateStore, executionId, () => executeProjectRunUnlocked({ ...options, stateStore }));
+  return turn.acquired ? turn.value : lockedResult(context, turn.error);
+}
+
+function lockedResult(context: CoordinatorExecutionContext, err: ExecutionLockError): ProjectRunExecutionResult {
+  return {
+    status: "FAILED",
+    state: context.execution?.state ?? context.state ?? "INTAKE",
+    agentExecuted: false,
+    stepsCount: 0,
+    history: [],
+    failureReason: err.message,
+    lockFailure: err.code,
+  };
+}
+
+/** The push-mode run itself. Callers hold the execution's lock; never call this nested inside another lock for the same id. */
+async function executeProjectRunUnlocked(
+  options: ProjectRunOptions,
+): Promise<ProjectRunExecutionResult> {
   const projectRoot = options.projectRoot ?? process.cwd();
   const context = options.context;
   if (options.executionOptions && !context.executionOptions) {
@@ -360,6 +400,7 @@ export async function executeProjectRun(
         missingSkills: validation.missingRequiredSkills,
         failureReason: validation.failureReason,
         stepLog: context.stepLog,
+        decisionHistory: context.history,
       };
     }
   }
@@ -396,6 +437,7 @@ export async function executeProjectRun(
       history: coordinatorResult.history,
       coordinatorResult,
       stepLog: context.stepLog,
+      decisionHistory: context.history,
     };
   } catch (err) {
     if (err instanceof SkillValidationError) {
@@ -410,6 +452,7 @@ export async function executeProjectRun(
         missingSkills: err.result.missingRequiredSkills,
         failureReason: err.result.failureReason,
         stepLog: context.stepLog,
+        decisionHistory: context.history,
       };
     }
 
@@ -420,8 +463,9 @@ export async function executeProjectRun(
       agentExecuted: false,
       stepsCount: 0,
       history: [],
-      failureReason: (err as Error).message,
+      failureReason: operationFailureReason(err),
       stepLog: context.stepLog,
+      decisionHistory: context.history,
     };
   }
 }
@@ -610,6 +654,7 @@ export async function reconstructResumeContext(
     human_resolved: true,
     humanAnswers: mergedAnswers.length > 0 ? mergedAnswers : undefined,
     stepLog: persisted.step_log,
+    history: persisted.history,
     // blockingAmbiguity/blockingFindings are intentionally left unset here: they are
     // derived from `findings` by the decision engine (hasBlockingFindings), not stored
     // independently. Resetting them to `undefined` previously gave the false impression
@@ -635,6 +680,17 @@ export async function executeProjectResume(
 ): Promise<ProjectRunExecutionResult> {
   const projectRoot = options.projectRoot ?? process.cwd();
   const stateStore = options.stateStore ?? new FileExecutionStateStore(projectRoot);
+  // The whole turn — load, answer persistence, and the run loop — is one read-modify-
+  // write of this execution, so it is one lock hold. Re-entry goes to the unlocked run.
+  const turn = await runLockedTurn(stateStore, options.executionId, () => resumeUnlocked(options, projectRoot, stateStore));
+  return turn.acquired ? turn.value : lockedResult({ state: "HUMAN_INTERVENTION_REQUIRED" }, turn.error);
+}
+
+async function resumeUnlocked(
+  options: ProjectResumeOptions,
+  projectRoot: string,
+  stateStore: ExecutionStateStore,
+): Promise<ProjectRunExecutionResult> {
 
   const reconstructed = await reconstructResumeContext({
     executionId: options.executionId,
@@ -660,8 +716,8 @@ export async function executeProjectResume(
 
   const { context, config } = reconstructed;
 
-  // 5. Continue execution using Coordinator via executeProjectRun
-  return executeProjectRun({
+  // 5. Continue execution using Coordinator (already holding this execution's lock)
+  return executeProjectRunUnlocked({
     projectRoot,
     config,
     context,

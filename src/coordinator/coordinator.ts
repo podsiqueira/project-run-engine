@@ -12,6 +12,7 @@ import type {
   CoordinatorDecision,
   CoordinatorExecutionContext,
   CompleteDecision,
+  DecisionRecord,
   DispatchAgentDecision,
   FindingInput,
   RequireHumanInterventionDecision,
@@ -19,6 +20,7 @@ import type {
 import { CoordinatorDecisionEngine } from "../decision/decision-engine.js";
 import { deriveHumanQuestions, type HumanInterventionRequired } from "../decision/human-intervention.js";
 import { AgentDispatcher } from "../agents/agent-dispatcher.js";
+import { operationFailureReason } from "../project/locked-turn.js";
 import type {
   ExecutionLifecycleState,
   ExecutionStateStore,
@@ -213,6 +215,7 @@ export class Coordinator {
         last_result: (lastResult ?? context.result) as AgentResult | undefined,
         findings,
         step_log: context.stepLog,
+        history: context.history,
         human_intervention: humanIntervention,
         // Carried forward from the context (see CoordinatorExecutionContext.humanAnswers)
         // since the state store overwrites the whole record on every save rather than
@@ -239,6 +242,7 @@ export class Coordinator {
    */
   async step(context: CoordinatorExecutionContext): Promise<CoordinatorStepResult> {
     const decision = this.decisionEngine.decide(context);
+    this.recordDecision(context, decision);
 
     switch (decision.action) {
       case "COMPLETE": {
@@ -346,6 +350,35 @@ export class Coordinator {
     await this.checkpoint(context, "IN_PROGRESS", result);
   }
 
+  /**
+   * Appends the decision to the execution-wide history BEFORE any checkpoint that
+   * follows it, so the persisted record can never lag the state it explains. Stores
+   * only the compact, scalar form (see `DecisionRecord`).
+   */
+  private recordDecision(
+    context: CoordinatorExecutionContext,
+    decision: CoordinatorDecision,
+    stepId?: string,
+  ): void {
+    const log = context.history ?? [];
+    const state = context.execution?.state ?? context.state ?? "INTAKE";
+    let recorded: DecisionRecord["decision"];
+    if (decision.action === "DISPATCH_AGENT") {
+      recorded = {
+        action: "DISPATCH_AGENT",
+        role: decision.role,
+        runtime: decision.runtime,
+        state: decision.state,
+        iteration: decision.iteration,
+        remediation_iteration: decision.remediation_iteration,
+        ...(stepId !== undefined ? { step_id: stepId } : {}),
+      };
+    } else {
+      recorded = { ...decision };
+    }
+    context.history = [...log, { step: log.length + 1, state, decision: recorded, timestamp: new Date().toISOString() }];
+  }
+
   private recordHumanIntervention(
     context: CoordinatorExecutionContext,
     decision: RequireHumanInterventionDecision,
@@ -387,6 +420,8 @@ export class Coordinator {
   ): Promise<PreparedAction> {
     for (let i = 0; i < maxSteps; i++) {
       const decision = this.decisionEngine.decide(context);
+      // A dispatch is recorded below, once its stepId exists; everything else now.
+      if (decision.action !== "DISPATCH_AGENT") this.recordDecision(context, decision);
 
       switch (decision.action) {
         case "COMPLETE": {
@@ -419,6 +454,7 @@ export class Coordinator {
           const enrichedRequest = await this.dispatcher.prepareRequest(decision.request, decision.runtime);
 
           const stepId = generateStepId();
+          this.recordDecision(context, decision, stepId);
           const pendingAction: PersistedPendingAction = {
             step_id: stepId,
             role: decision.role,
@@ -520,7 +556,7 @@ export class Coordinator {
         `Coordinator execution exceeded maximum step limit of ${this.maxSteps} steps. Terminal state was not reached.`,
       );
     } catch (err) {
-      await this.checkpoint(context, "FAILED", undefined, (err as Error).message);
+      await this.checkpoint(context, "FAILED", undefined, operationFailureReason(err));
       throw err;
     }
   }

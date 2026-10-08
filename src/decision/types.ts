@@ -71,6 +71,53 @@ export type CoordinatorDecision =
   | CompleteDecision
   | RequireHumanInterventionDecision;
 
+/**
+ * What a `DISPATCH_AGENT` decision looks like once recorded: the scalar facts of the
+ * choice, without the dispatch payload (`request`, `context`, skills, options). The
+ * payload is large (it embeds the feature context), is only meaningful while the
+ * action is pending (it lives on `PersistedExecutionState.pending_action` then), and
+ * is not needed to explain how an execution reached its current state.
+ */
+export interface DispatchDecisionSummary {
+  action: "DISPATCH_AGENT";
+  role: AgentRole;
+  runtime: AgentRuntime;
+  state: CoordinatorState;
+  iteration: number;
+  remediation_iteration: number;
+  /** Pull-mode only: the correlation id of the pending action this decision raised. */
+  step_id?: string;
+}
+
+export type RecordedDecision =
+  | DispatchDecisionSummary
+  | TransitionDecision
+  | CompleteDecision
+  | RequireHumanInterventionDecision;
+
+/**
+ * One entry in an execution's durable, append-only decision history (Phase 5): a
+ * decision the engine made, in order, across resumes and restarts. Complements — and
+ * is deliberately not an alias of — `ExecutionStepRecord` (`stepLog`):
+ *
+ * - `history` answers "what did the engine decide, and why" (including pure
+ *   transitions such as the remediation loop, which `stepLog` never sees);
+ * - `stepLog` answers "what actually happened" (agent results with their findings,
+ *   and human suspensions).
+ *
+ * Every `DISPATCH_AGENT` entry is followed, once its result is applied, by exactly one
+ * `AGENT_STEP` in `stepLog`, in the same order. Result payloads and evidence are never
+ * stored here.
+ */
+export interface DecisionRecord {
+  /** 1-based position in the execution-wide history; continues across resumes. */
+  step: number;
+  /** The state the engine was in when it made the decision. */
+  state: CoordinatorState;
+  decision: RecordedDecision;
+  timestamp: string;
+}
+
 export interface ExecutionIdentity {
   id?: string;
   execution_id?: string;
@@ -141,6 +188,12 @@ export interface CoordinatorExecutionContext {
    * would be dropped. Never read by the decision engine — gates use `findings`/`result`.
    */
   stepLog?: ExecutionStepRecord[];
+  /**
+   * The running, append-only decision history (see `DecisionRecord`). Carried on the
+   * context for the same reason as `stepLog`/`humanAnswers`. Never read by the
+   * decision engine.
+   */
+  history?: DecisionRecord[];
   executionOptions?: HostExecutionOptions;
 }
 

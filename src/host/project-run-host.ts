@@ -12,12 +12,13 @@ import { countAgentSteps, type ExecutionStepRecord, type AgentDispatchRequest, t
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
 import type { HostExecutionOptions } from "../runtime/host-execution-contract.js";
 import type { StepRecord } from "../coordinator/coordinator.js";
+import type { DecisionRecord } from "../decision/types.js";
 import {
   executeProjectRun,
   executeProjectResume,
   type ProjectRunExecutionResult,
 } from "../project/project-run.js";
-import { FileExecutionStateStore } from "../project/state-store.js";
+import { FileExecutionStateStore, type PersistedExecutionState } from "../project/state-store.js";
 import { deriveHumanQuestions, type HumanInterventionRequired } from "../decision/human-intervention.js";
 import type {
   ProjectRunHost,
@@ -102,25 +103,27 @@ function extractFindings(result: ProjectRunExecutionResult): StructuredFinding[]
 }
 
 /**
- * The durable, execution-wide step log for a response. Normally taken from the run that
- * just happened; when the call was rejected before any context existed (e.g. resuming a
- * completed execution, or a missing config), falls back to whatever the checkpoint
- * already holds — so a rejected call never reports an existing execution as having
- * zero steps. Unreadable/absent checkpoint -> empty log.
+ * The durable, execution-wide records (`stepLog`, decision `history`) for a response.
+ * Normally taken from the run that just happened; when the call was rejected before any
+ * context existed (e.g. resuming a completed execution, or a missing config), falls back
+ * to whatever the checkpoint already holds — so a rejected call never reports an existing
+ * execution as having no record. Unreadable/absent checkpoint -> empty.
  */
-async function resolveStepLog(
+async function resolveDurableRecord(
   executionId: string,
   result: ProjectRunExecutionResult,
   projectRoot: string | undefined,
-): Promise<ExecutionStepRecord[]> {
-  const live = result.stepLog ?? result.coordinatorResult?.context.stepLog;
-  if (live) return live;
+): Promise<{ stepLog: ExecutionStepRecord[]; history: DecisionRecord[] }> {
+  const liveLog = result.stepLog ?? result.coordinatorResult?.context.stepLog;
+  const liveHistory = result.decisionHistory ?? result.coordinatorResult?.context.history;
+  if (liveLog && liveHistory) return { stepLog: liveLog, history: liveHistory };
+  let persisted: PersistedExecutionState | null = null;
   try {
-    const persisted = await new FileExecutionStateStore(projectRoot ?? process.cwd()).load(executionId);
-    return persisted?.step_log ?? [];
+    persisted = await new FileExecutionStateStore(projectRoot ?? process.cwd()).load(executionId);
   } catch {
-    return [];
+    // unreadable checkpoint: report what we have
   }
+  return { stepLog: liveLog ?? persisted?.step_log ?? [], history: liveHistory ?? persisted?.history ?? [] };
 }
 
 async function buildHostResponse(
@@ -129,12 +132,12 @@ async function buildHostResponse(
   emit: ProjectRunEventSink,
   projectRoot: string | undefined,
 ): Promise<ProjectRunHostResponse> {
-  const { state, history } = result;
+  const { state } = result;
   const findings = extractFindings(result);
   // `stepsCount` is the number of agent steps in the whole execution, derived from the
   // durable step log — NOT `result.stepsCount`, the Coordinator's per-call loop counter
   // (which also counts pure transitions and restarts at 0 on every resume).
-  const stepLog = await resolveStepLog(executionId, result, projectRoot);
+  const { stepLog, history } = await resolveDurableRecord(executionId, result, projectRoot);
   const stepsCount = countAgentSteps(stepLog);
 
   switch (result.status) {
@@ -208,7 +211,10 @@ async function buildHostResponse(
       });
       return {
         status: "FAILED",
-        terminal: true,
+        // Only an engine-generated lock failure (set explicitly by the engine when it could not
+        // obtain the lock) rejects THIS call alone with the execution untouched. Any other
+        // failure — including a lock error raised inside the run — has failed the execution.
+        terminal: result.lockFailure === undefined,
         executionId,
         state,
         stepsCount,

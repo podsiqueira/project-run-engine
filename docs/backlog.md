@@ -39,35 +39,54 @@ MCP must remain an **integration/transport concern** carrying the existing
 `PROJECT_ENGINE_RUN_TOOL_SCHEMA`, never an engine architectural dependency — the engine
 itself must never import an MCP SDK.
 
-## Execution persistence under concurrent submission — DEFERRED
+## Execution persistence under concurrent submission — ADDRESSED in Phase 5 (cross-machine / optimistic concurrency still DEFERRED)
 
-**Current behavior**: `FileExecutionStateStore` persists with plain file
-read/modify/write (`src/project/state-store.ts`) — no locking, no atomic replace, no
-optimistic-concurrency check. Two near-simultaneous `submitProjectRunStep()` calls for
-the same pending action can both pass validation (`STALE_STEP` etc.) before either
-writes, and simultaneous writes from independent hosts could race.
+**Original observation (kept for history)**: `FileExecutionStateStore` persisted with plain
+file read/modify/write — no locking, no atomic replace, no optimistic-concurrency check.
+Two near-simultaneous `submitProjectRunStep()` calls for the same pending action could
+both pass validation (`STALE_STEP` etc.) before either wrote, and simultaneous writes from
+independent hosts could race. It was deferred because only one host at a time had been
+validated.
 
-**Why deferred**: not a blocker for the supported model — one host / one session
-driving an execution at a time, which is what Phases 3–4 validated. There is no current
-multi-host simultaneous-write requirement.
+**Phase 5 outcome** (`ARCHITECTURE.md` §4.17; `tests/phase5-locking.test.ts`):
+- Checkpoint writes are atomic (temp file + fsync + rename). Reproduced beforehand: a reader
+  racing a writer in another process got "Unexpected end of JSON input" from `load()`.
+- A per-execution advisory lock (`FileExecutionStateStore.withLock` / `withExecutionLock`)
+  now serialises every mutating turn — `submitProjectRunStep`, mutating
+  `nextProjectRunStep`, `resume`, and `start`/`executeProjectRun` with an id. Reads stay
+  unlocked. Dead holders are reclaimed by pid probe; contention surfaces as a non-terminal
+  `EXECUTION_LOCKED` failure, and an unusable runs directory as a non-terminal
+  `EXECUTION_LOCK_UNAVAILABLE` (the engine fails closed rather than run unlocked). Verified
+  with real OS processes, including SIGKILL.
+- Duplicate-submission idempotency is preserved and is now race-proof.
 
-**Revisit when**: real multi-host concurrent execution (more than one host submitting
-against the same `executionId` at the same time) becomes a supported requirement. Not
-before.
+**Still deferred (not decided, not scheduled)**:
+- *Cross-machine / network-filesystem coordination.* The engine is limited to
+  `node:fs`/`node:path`, so the lock is scoped to one machine and a local filesystem.
+- *Optimistic concurrency / versioned writes or a database-backed store.* Revisit only if
+  the advisory lock proves insufficient (e.g. hosts on different machines sharing a store).
+- *Lock heartbeat for very long push-mode turns.* A live holder is never displaced; waiters
+  time out (default 30 s, configurable) instead. Mixed-engine-version use of one execution
+  (older engines don't lock and drop `history`) is unsupported.
 
-**Open directions** (none selected, none decided): stronger persistence semantics,
-optimistic concurrency, locking, or a database-backed store.
+## Decision-level `history` — RESOLVED in Phase 5
 
-## Known limitation — `status().history` is always empty
+**Original limitation (kept for history)**: the persisted checkpoint did not retain the
+Coordinator's live `StepRecord[]` (which embeds full decision objects), so
+`statusProjectRun()` always returned `history: []`. ENG-002 (below) added `stepLog` as the
+durable record of *what happened* and deliberately left this open.
 
-The persisted checkpoint does not retain the Coordinator's live `StepRecord[]` (which
-embeds full decision objects); only a live `Coordinator.run()` result carries `history`.
-`statusProjectRun()` therefore still returns `history: []` (`src/host/status.ts`;
-`ARCHITECTURE.md` §4.4). **Still true as of this change — deliberately not redesigned.**
-What changed under ENG-002 (below): the durable record of *what happened* is no longer
-missing — it lives in the append-only `step_log` / response `stepLog`, and `stepsCount`
-is derived from it. A host that wants decision-level detail (every `TRANSITION`) must
-still observe it live via `onEvent`.
+**Phase 5 outcome**: `history` is now the durable, execution-wide, compact record of what
+the engine *decided* (`DecisionRecord[]`; `PersistedExecutionState.history`), recoverable by
+any host after a restart and returned by `status()`, `start()`, `resume()` and the terminal
+pull `COMPLETED` response. It is not an alias of `stepLog` (`ARCHITECTURE.md` §4.17;
+`tests/phase5-history.test.ts`). **Contract change:** the response `history` type is now
+`DecisionRecord[]` (was `StepRecord[]`), and push-mode `history` is no longer the rich
+per-call records — those remain available through `onEvent`/`onStep`/`coordinatorResult`.
+
+**Still deferred**: persisting dispatch payloads, result evidence, or an event stream; any
+event-sourcing redesign. Pre-Phase-5 checkpoints report `history: []` and are not
+back-filled.
 
 ## Trust boundary — result truthfulness
 
@@ -121,8 +140,8 @@ provisional — this repository has no formal severity taxonomy.
 
 ### ENG-002 — Final execution state loses findings and history — CLOSED (history persistence of decisions DEFERRED)
 
-- **Status**: CLOSED for the audit-record gap; decision-level `history` remains DEFERRED
-  (see the limitation above). **Severity**: HIGH (provisional, unchanged) — highest of
+- **Status**: CLOSED for the audit-record gap; decision-level `history` was DEFERRED here
+  and has since been resolved by Phase 5 (see above). **Severity**: HIGH (provisional, unchanged) — highest of
   the three.
 - **Registered observation**: a nine-step run with four findings, a human-intervention
   gate, three human answers, remediation and an `ANALYZE` re-run returned a final
@@ -160,8 +179,8 @@ provisional — this repository has no formal severity taxonomy.
     multiple dispatched steps, resume, human intervention, completed execution, `status()`
     from a second host, and a pre-`step_log` checkpoint. 7 of the 8 fail against the
     pre-change code.
-- **Deferred (explicit)**: persisting decision-level `history` (`StepRecord[]`) or an
-  event stream; retaining per-step evidence payloads (only `evidence_count`; the latest
+- **Deferred (explicit)**: persisting decision-level `history` (`StepRecord[]`) — *since
+  resolved by Phase 5, see above* — or an event stream; retaining per-step evidence payloads (only `evidence_count`; the latest
   result keeps full evidence on `last_result`); engine-inferred "resolved" status for
   findings; back-filling `step_log` for checkpoints written before this change (they
   report `stepsCount: 0`).
@@ -169,9 +188,8 @@ provisional — this repository has no formal severity taxonomy.
   (additive on the wire; a consumer that *constructs* this type must add it) and
   `stepsCount` changes meaning as above — a contract change, versioned **`0.2.0`**
   (minor, pre-1.0: keeps existing `^0.1.x` ranges from picking it up unannounced).
-  Release status: `0.2.0` is prepared and verified from a packed tarball (including
-  continuing a real checkpoint written by the published `0.1.1`), but publication to npm
-  is pending credentials; consumers should pin the exact version once published.
+  Release status: `0.2.0` is published to npm (`latest`) and was verified from a fresh
+  registry install, including continuing a real checkpoint written by `0.1.1`.
 - **Review follow-ups folded in before release**: rejected or pre-flight-blocked push
   responses (e.g. resuming a completed execution) now report the persisted record rather
   than `stepsCount: 0`; docs corrected to state that only `status()`, `start()`,
@@ -204,7 +222,27 @@ provisional — this repository has no formal severity taxonomy.
   feature value as `FEATURE` — and do not force feature and branch names to match.
   Stays OPEN here until the consumer confirms; close it when they do.
 
+## Checkpoint save failures are swallowed — OPEN (pre-existing; documented, not fixed in 0.3.0)
+
+`Coordinator.checkpoint()` catches and ignores every `stateStore.save()` error. It predates Phase 5
+(present since the Coordinator's first checkpointing commit) and Phase 5 did not introduce or
+change it. Atomic writes and the execution lock keep the checkpoint file structurally consistent
+(no torn JSON), but they do not make a failed write visible: after the lock is taken and the first
+checkpoint exists, a failing `save()` (disk full, I/O error) can leave the durable checkpoint at
+the previous step while the call returns the next action or a push-mode result. A later submission
+for that action is then rejected `STALE_STEP`, and a restarted process resumes from the older
+checkpoint. Not data corruption; a failure-observability gap. Mitigated only for the first
+checkpoint of a pull-mode execution (`EXECUTION_LOCK_UNAVAILABLE`). Behaviour is described in
+`ARCHITECTURE.md` §4.17 ("Known limitation").
+
+**Future work (not scheduled):** propagate checkpoint save failures from the Coordinator as a
+structured, non-terminal failure (so the caller sees it before acting on an unpersisted step) for
+both pull and push paths. This changes error-propagation semantics and needs its own review.
+
 ## Phase 5
 
-Not started. See `docs/phase-reports.md` for the phase history, entry criteria, and
-current state.
+Complete and released as `0.3.0`: persistence hardening (decision `history`, atomic
+checkpoints, per-execution advisory lock). See `docs/phase-reports.md` for the baseline,
+evidence, and the release impact (a minor bump, `0.3.0`).
+Host integrations (Antigravity, Cursor, Codex, MCP) are **not** part of Phase 5; they remain
+the backlog items above.

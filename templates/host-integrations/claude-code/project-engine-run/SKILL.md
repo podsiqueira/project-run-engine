@@ -126,6 +126,16 @@ does not have to match the feature (`ARCHITECTURE.md` §4.16).
      the last call was rejected (e.g. a stale `stepId`) — report the reason and, if it
      was your own mistake (wrong `stepId`/`executionId`), call `next-step` again with
      the same `executionId` to recover the correct pending action rather than giving up.
+     Two non-terminal failures concern the execution's lock, not your request; the
+     execution and its checkpoint were not touched, and you must never work around them:
+     - `failureReason` starting `EXECUTION_LOCKED:` — another host or process is working
+       on this same execution right now. Wait a few seconds and repeat the **same** call
+       (same `stepId` and result). If it stays locked, tell the user which lock file the
+       message names; only if they confirm no engine process is running for this
+       execution may that file be deleted (by them — never delete it yourself).
+     - `failureReason` starting `EXECUTION_LOCK_UNAVAILABLE:` — the runs directory
+       cannot be used (missing, not writable, disk full). Retrying will not help: report
+       the reason to the user and stop until the environment is fixed.
    - **`"COMPLETED"`**: report success. `response.result.state` is `"READY_FOR_PR"`.
 
 4. **Present human intervention questions.** `response.humanIntervention.questions` is

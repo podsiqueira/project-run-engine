@@ -11,7 +11,7 @@ Add `@incito-labs/project-run-engine` to your repository's `package.json`:
 ```json
 {
   "dependencies": {
-    "@incito-labs/project-run-engine": "^0.1.0"
+    "@incito-labs/project-run-engine": "^0.3.0"
   }
 }
 ```
@@ -272,6 +272,61 @@ const resumed = await executeProjectResume({
 });
 ```
 
+### Concurrent hosts and the execution lock
+
+Several hosts (separate processes or sessions) may drive the same `executionId`. Every call that
+can **change** an execution — `submitProjectRunStep`, `nextProjectRunStep` when it starts,
+recovers or resumes an execution, `executeProjectResume`/`resumeProjectRun`, and
+`executeProjectRun`/`startProjectRun` with an `executionId` — runs inside a per-execution
+advisory lock (one machine, local filesystem). Reads (`statusProjectRun`, and a
+`nextProjectRunStep` that only returns an already-pending action or reports a suspension or
+terminal state) never take it, so observers never wait behind a writer. Checkpoints are written
+atomically, so a reader never sees a half-written file.
+
+If the lock cannot be had, the call returns a **non-terminal** `FAILED` (it never throws, and the
+CLI still prints exactly one JSON line); the execution is untouched:
+
+| `failureReason` starts with | Meaning | What to do |
+|---|---|---|
+| `EXECUTION_LOCKED:` | Another live operation held the lock for the whole wait (default 30 s). | Repeat the **same** call after a moment. |
+| `EXECUTION_LOCK_UNAVAILABLE:` | The filesystem refused the lock itself: `.project-run/runs` is missing, not a directory, not writable, or the disk is full. A first `next-step` **without** an `executionId` reports the same code (no lock is involved; the first checkpoint could not be written, so no action is issued). | Fix the environment, then retry. Retrying alone will not help. |
+
+A lock error raised *inside* an operation (for example by an adapter that tries to lock the
+same execution from within a push-mode run) is **not** one of these: the turn fails as an ordinary
+terminal `FAILED`, its `failureReason` does not begin with a lock code, and the execution is not resumable.
+
+**Clearing a stale lock by hand.** The lock file is `.project-run/runs/<executionId>.lock`
+(named in the `EXECUTION_LOCKED` message). A lock left by a crashed process is reclaimed
+automatically. The engine will *not* remove a lock whose recorded pid is still alive — it cannot
+tell a busy holder from an unrelated process that was assigned a dead holder's pid (after a crash,
+or a container restart that re-uses pids). So if `EXECUTION_LOCKED` persists and you are **certain
+no engine process is running for that execution**, delete that one file. The checkpoint
+(`<executionId>.json`) is never affected. Add `.project-run/runs/` to `.gitignore` so lock files
+are never committed.
+
+Programmatic use:
+
+```typescript
+import {
+  FileExecutionStateStore,
+  withExecutionLock,
+  ExecutionLockError,           // base class; `.code` is "EXECUTION_LOCKED" | "EXECUTION_LOCK_UNAVAILABLE"
+  isExecutionLockFailure,       // true for a failureReason that reports a lock failure
+} from "@incito-labs/project-run-engine";
+
+// Optional: a longer wait for hosts whose push-mode turns run long.
+const store = new FileExecutionStateStore(projectRoot, undefined, { timeoutMs: 120_000, pollMs: 50 });
+
+// Serialise your own read-modify-write of an execution with the engine's turns.
+// Not re-entrant: never call the engine for the SAME execution from inside `fn`.
+await withExecutionLock(store, executionId, async () => { /* ... */ });
+```
+
+A custom `ExecutionStateStore` may implement the optional
+`withLock<T>(executionId, fn, options?)` to get the same protection; without it the engine runs
+unlocked, exactly as in `0.2.0`. Throw an `ExecutionLockError` subclass from it to have the engine
+return the structured failure; any other error propagates unchanged.
+
 ---
 
 ## 7. Run Diagnostic Doctor
@@ -378,7 +433,17 @@ number of agent steps in the whole execution, including before a resume). The ot
 responses are signals and omit them — call `project-run engine status` to read the record
 of a running or suspended execution. `findings` is only the latest result's findings, so
 a clean final result reports `findings: []`; read `stepLog` for the full record
-(`ARCHITECTURE.md` §4.4). `history` is still always `[]` from `status()` and pull mode.
+(`ARCHITECTURE.md` §4.4). `history` is the engine's durable, compact record of what it
+*decided* (transitions, dispatches, suspensions) — not an alias of `stepLog`
+(`ARCHITECTURE.md` §4.17).
+
+**Concurrent hosts.** Mutating calls on the same `executionId` are serialised by a
+per-execution advisory lock (one machine, local filesystem), and reads never wait. If the lock
+cannot be had you get a non-terminal `FAILED` whose `failureReason` starts with
+`EXECUTION_LOCKED:` (another operation is running: repeat the same call) or
+`EXECUTION_LOCK_UNAVAILABLE:` (the runs directory is unusable: fix the environment). The
+execution is intact in both cases. See section 6, which also covers clearing a stale lock, and
+section 10 if you are upgrading from `0.2.x`.
 
 See `templates/host-integrations/claude-code/project-engine-run/SKILL.md` for a
 complete reference skill built on the pull-based step API — it drives the full
@@ -393,6 +458,59 @@ one genuinely validated so far — see `ARCHITECTURE.md` §4.12–§4.13), Antig
 supported runtime identifier and integration target, not yet live-validated), or a
 future Cursor/Codex/MCP integration (tracked as backlog in `docs/backlog.md`, not
 implemented in this package).
+
+---
+
+## 10. Upgrading from 0.2.x to 0.3.x
+
+`0.3.0` makes the decision history durable and hardens concurrent use. Almost everything is
+additive; **one typed contract changes**.
+
+**What changed**
+
+| | `0.2.x` | `0.3.x` |
+|---|---|---|
+| `ProjectRunHostResponse.history` | `StepRecord[]`: live per-call records for `start()`/`resume()` (with `decision.request`, `result`, ...); always `[]` from `status()` and pull mode | `DecisionRecord[]`: the engine's **durable, execution-wide** record of what it decided (transitions, dispatches, completion, suspensions), on `status()`, `start()`, `resume()` and the terminal pull `COMPLETED` response. Compact: no request, result, evidence or findings |
+| Dispatch payload / agent results | in `history[i].decision.request` / `history[i].result` | **gone from `history`.** Use `stepLog` (below) for results and findings; the dispatch request is the `AGENT_ACTION_REQUIRED` response itself |
+| Concurrent calls on one execution | unprotected (could lose updates) | serialised by the execution lock; `EXECUTION_LOCKED` / `EXECUTION_LOCK_UNAVAILABLE` failures (see section 6) |
+| Checkpoint writes | plain write (a concurrent reader could fail to parse) | atomic write-and-rename |
+| Unusable `.project-run/runs` | engine ran best-effort without persisting | refuses with `EXECUTION_LOCK_UNAVAILABLE` |
+
+**Unchanged:** `stepLog` (append-only record of agent results, their findings and human
+suspensions), `stepsCount` (agent steps in the whole execution), `findings` (the latest result's
+findings, which the gates use), the pull API, and the persisted `version` (`1`). The live per-call
+`StepRecord`s are still available from `onEvent`, `executeProjectRun`'s `onStep`, and
+`coordinatorResult.history`.
+
+**Migrating code that read `history`**
+
+```typescript
+// 0.2.x
+const requests = response.history.map((r) => r.decision.request);   // dispatch payloads
+const results  = response.history.map((r) => r.result);             // agent results
+
+// 0.3.x
+const results  = response.stepLog.filter((r) => r.kind === "AGENT_STEP");   // status, findings, evidence_count per step
+const decisions = response.history;   // { step, state, decision: { action: "TRANSITION"|"DISPATCH_AGENT"|"COMPLETE"|"REQUIRE_HUMAN_INTERVENTION", ... }, timestamp }
+```
+
+Over the CLI JSON transport the same applies: `history[i].result` and `history[i].decision.request`
+are no longer present.
+
+**Upgrade every host together.** All hosts that share a checkout (and so its
+`.project-run/runs/`) should move to `0.3.x` at the same time. A `0.2.x` engine does not know the
+new fields: when it continues an execution it silently **drops `history`** from the checkpoint
+(`stepLog` is kept), and it does not take the lock, so it gives no mutual exclusion against `0.3.x`
+hosts. Do not run mixed versions against one execution.
+
+**Existing executions.** A checkpoint written by `0.2.x` loads unchanged: `history` starts empty
+(earlier decisions are never invented) and fills from the next decision on, numbering from `1`;
+`stepLog` and `stepsCount` carry on across the upgrade.
+
+**New failures to handle.** Treat `failureReason` values beginning `EXECUTION_LOCKED:` (repeat the
+same call) and `EXECUTION_LOCK_UNAVAILABLE:` (fix the environment; do not retry blindly) as
+non-terminal; both arrive as `FAILED` with `terminal: false`. Details and manual recovery are in
+section 6.
 
 ---
 

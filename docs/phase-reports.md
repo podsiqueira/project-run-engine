@@ -19,13 +19,11 @@ known limitations, and trust boundaries see `docs/backlog.md`.
 | Phase 3 — Pull-based execution model | COMPLETE |
 | Phase 4 — Real Claude Code host integration | COMPLETE |
 | Phase 4 Closure — runtime-default hardening, docs, release | COMPLETE |
-| Phase 5 | **NOT STARTED — READY TO PLAN** (see [Phase 5](#phase-5-not-started)) |
+| Phase 5 — Persistence hardening | **COMPLETE — released as `0.3.0`** (see [Phase 5](#phase-5--persistence-hardening)) |
 
-Current release: `@incito-labs/project-run-engine@0.1.1` (`package.json`; published to
-npm, `latest` dist-tag). The ENG-001/002/003 follow-up work below is unreleased: it is
-versioned `0.2.0` in `package.json` (a minor bump — see ENG-002 in `docs/backlog.md`),
-verified from a packed tarball, but **not yet published to npm**; `latest` on the registry
-is still `0.1.1`. Update this paragraph when `0.2.0` is published and verified.
+Current release: `@incito-labs/project-run-engine@0.3.0` (`package.json`). Phase 5 shipped as
+`0.3.0`, not a patch, because it changes the typed `history` contract. `0.2.0` was the previous
+release.
 
 ## Phase 0 — Coordinator safety gates
 
@@ -67,8 +65,8 @@ is still `0.1.1`. Update this paragraph when `0.2.0` is published and verified.
 - **Evidence**: commit `e7df567`; `tests/host-api.test.ts`,
   `tests/host-status-and-restart.test.ts`, `tests/cli-host-compatibility.test.ts`,
   `tests/host-isolation.test.ts`; `ARCHITECTURE.md` §4.1–§4.10.
-- **Status**: COMPLETE. Known limitation carried forward: `status().history` is always
-  empty (`ARCHITECTURE.md` §4.4, `docs/backlog.md`).
+- **Status**: COMPLETE. Known limitation carried forward: `status().history` was always
+  empty — resolved later, in Phase 5 (`ARCHITECTURE.md` §4.17).
 
 ## Phase 3 — Pull-based execution model
 
@@ -140,28 +138,68 @@ detail, ownership, and tests are in `docs/backlog.md`:
   workspace; the engine's contract is documented (`ARCHITECTURE.md` §4.16).
 - **ENG-002** (lost findings/history): CLOSED — durable `step_log`/`stepLog` added and
   `stepsCount` redefined as agent steps; decision-level `history` remains deferred.
-  This is a response-contract change, so it ships as `0.2.0`, not `0.1.1`.
+  This is a response-contract change; it shipped as `0.2.0`.
 - **ENG-003** (feature vs. branch identity): OPEN, consumer-owned; no engine action.
 
-## Phase 5: NOT STARTED
+## Phase 5 — Persistence hardening
 
-Phase 5 has not begun; no Phase 5 code or integration exists in this repository.
-
-**What Phase 5 means**: live-validating the next host(s) against the unchanged
-provider-neutral pull contract — Antigravity first — and deciding whether any deferred
-item below has become a real requirement. It is a planning-ready scope, not a commitment
-to a specific integration order; Cursor, Codex, and MCP remain backlog.
-
-**Entry criteria, as of `0.1.1`**
-
-| Criterion | State |
-|---|---|
-| Phase 4 complete | Yes (above) |
-| Phase 4 Closure complete | Yes (above) |
-| npm `0.1.1` published and verified | Yes — `latest` dist-tag is `0.1.1` |
-| Runtime-default behavior covered by tests | Yes — `tests/runtime-default-resolution.test.ts` |
-| Claude Code pull-mode validated | Yes — `ARCHITECTURE.md` §4.12 |
-| Provider neutrality intact | Yes — `tests/package-boundary.test.ts`; no provider SDK or `claude -p` in `src/` |
-| Remaining deferred work documented | Yes — `docs/backlog.md` |
-
-**Result: Phase 4 Closure COMPLETE · Phase 5 NOT STARTED · Phase 5 READY TO PLAN.**
+- **Objective**: make `Coordinator.checkpoint()` populate recoverable decision `history`,
+  and make `FileExecutionStateStore` safe now that independent host turns (separate
+  processes/sessions) can touch the same `execution_id`.
+- **Correction to earlier text**: this file previously described Phase 5 as "live-validating
+  the next host(s), Antigravity first". That was wrong; Phase 5 is persistence hardening.
+  Host integrations are backlog (`docs/backlog.md`), not Phase 5.
+- **Baseline**: `main` at `c867518`, package `0.2.0` published; `PersistedExecutionState.history`
+  existed in the type but was never written; saves were plain truncating `writeFileSync`
+  calls; no locking.
+- **Where the historical plan was adjusted**: `stepLog` (ENG-002) already provides the
+  execution-level record, so `history` was defined as the *decision* record (including pure
+  transitions) rather than a second copy of it, and stored compactly instead of persisting
+  full `StepRecord`s (≈20× checkpoint growth, measured).
+- **Delivered** (`ARCHITECTURE.md` §4.17): durable compact `history` across resume/restart
+  (pull and push); atomic checkpoint writes; per-execution advisory lock over every mutating
+  turn with dead-holder reclamation and non-terminal `EXECUTION_LOCKED` failures;
+  duplicate-submit/answer idempotency preserved under real contention.
+- **Evidence**: `tests/phase5-history.test.ts` and `tests/phase5-locking.test.ts`. The
+  implementation commit added **27** tests (history 7, locking 20); the review remediation
+  below added **19** more (history +2, locking +17), so Phase 5 now has **46** (history 9,
+  locking 37). The full suite is 230 tests in 28 files. They include genuine child-process
+  races, a SIGKILLed lock holder, and a SIGKILLed host recovered by a second host.
+  Mutation-checked: disabling the lock, atomic writes or recording makes the relevant tests
+  fail, and so does removing the lock from any single entry point.
+- **Compatibility**: schema `version` stays `1`; `history` is optional (legacy checkpoints
+  load with `[]`, nothing back-filled). `stepLog`/`stepsCount` unchanged. **Typed contract
+  change**: `ProjectRunHostResponse.history` is `DecisionRecord[]` (was `StepRecord[]`) and
+  is populated everywhere — a minor-version bump (`0.3.0`) pre-1.0.
+- **Not done / deferred**: cross-machine locking, optimistic concurrency or a database
+  store, lock heartbeats, payload-level or event-stream history, and any host integration.
+- **Review remediation** (findings F1–F8 of the Phase 5 review; no change to the contract
+  above): lock-acquisition failures now return a structured, non-terminal
+  `EXECUTION_LOCK_UNAVAILABLE` (fail-closed) instead of a raw exception that left the CLI
+  with no JSON (F1, required); the acquire loop is bounded by its deadline on every path
+  (F2); the `EXECUTION_LOCKED` message names the lock file and the manual recovery (F3);
+  each mutating entry point and the reap re-verification now have their own tests, plus a
+  push/pull decision-sequence parity test (F4); test counts corrected (F5); the consumer
+  guide gained an "Upgrading from 0.2.x" section and lock/recovery guidance (F6); the stale
+  `PACKAGING.md` publishing note was replaced with the actual release facts (F7); the README
+  export map and consumer guide document the new public API (F8). While verifying exports,
+  the README's `/decision` subpath row was found to describe a subpath that has never been
+  published, and was corrected.
+- **Review remediation 2** (findings N1–N5 of the independent release review; no change to
+  the contract above): `nextProjectRunStep` could classify a call as read-only from one
+  read and then mutate on a second, unlocked read (N3, high) — reproduced deterministically
+  and as spurious `STALE_STEP`s under two-process polling/submission. It now runs a
+  structurally read-only pass and, only if that finds it must mutate, takes the lock and
+  re-decides from a fresh read taken under it. A read that throws can no longer fall
+  through to an unlocked mutation (N4). Lock failures are told apart from operation errors
+  structurally rather than by message prefix (N2, `lockFailure` + `runLockedTurn`). A first
+  `next-step` without an id confirms the first checkpoint was written before issuing an
+  action (N1). `PACKAGING.md` commands corrected for the standalone repository (N5).
+  This added 17 locking tests (N3/N4 7, N2 6, N1 4), so Phase 5 now has **63** tests
+  (history 9, locking 54) and the full suite is **247** tests in 28 files. Mutation-checked:
+  removing the lock re-entry, letting the read pass mutate, letting a failed read fall
+  through to the locked path, restoring prefix classification, and dropping the
+  first-checkpoint check each make a test fail.
+- **Status**: COMPLETE — implemented, validated, review remediation applied, independently
+  reviewed, and released as `0.3.0`. The pre-existing, undocumented-until-now limitation that
+  `Coordinator.checkpoint()` swallows `save()` failures remains open (`docs/backlog.md`).

@@ -20,7 +20,7 @@
 // back the result; this module's only job is translating between that and the
 // Coordinator/DecisionEngine's existing, unmodified machinery.
 
-import type { AgentResult, CoordinatorState } from "../domain/types.js";
+import { ExecutionLockUnavailableError, type AgentResult, type CoordinatorState } from "../domain/types.js";
 import type { CoordinatorExecutionContext, FindingInput } from "../decision/types.js";
 import { Coordinator, type PreparedAction } from "../coordinator/coordinator.js";
 import { CoordinatorDecisionEngine } from "../decision/decision-engine.js";
@@ -39,6 +39,7 @@ import {
   type ExecutionStateStore,
   type PersistedExecutionState,
 } from "../project/state-store.js";
+import { runLockedTurn } from "../project/locked-turn.js";
 import { statusProjectRun } from "./status.js";
 import type { ProjectRunHostResponse } from "./types.js";
 import type {
@@ -128,6 +129,77 @@ export async function nextProjectRunStep(
 ): Promise<ProjectRunStepResponse> {
   const projectRoot = request.projectRoot ?? process.cwd();
   const stateStore = request.stateStore ?? new FileExecutionStateStore(projectRoot);
+  const executionId = request.executionId;
+
+  // No id: a fresh, unguessable one is minted below — nothing else can contend for it.
+  if (!executionId) return settle(await nextProjectRunStepImpl(request, projectRoot, stateStore, "write"));
+
+  // Pass 1 — UNLOCKED and strictly read-only. It reads the checkpoint once; if the call can be
+  // answered without changing anything (return the pending action, report a suspension or a
+  // terminal state, or report a read failure) it is answered right here and never waits behind
+  // a writer. The store it sees cannot write, so it is incapable of mutating.
+  //
+  // If that read shows the call must MUTATE (no checkpoint yet, an in-progress recovery, or
+  // answers for a suspension) — or shows a state this code does not recognise — pass 1 does
+  // nothing and says so. There is deliberately no separate "peek": classifying from one read
+  // and then acting on a second, later read is a check-then-act race (the checkpoint can change
+  // in between, e.g. another host's submit passing through IN_PROGRESS).
+  const first = await nextProjectRunStepImpl(request, projectRoot, readOnlyView(stateStore), "read");
+  if (!isNeedsLock(first)) return first;
+
+  // Pass 2 — LOCKED. Re-evaluates from the checkpoint as it is once the lock is held; whatever
+  // another host did in the meantime is respected (the answer may now be a plain read).
+  const turn = await runLockedTurn(stateStore, executionId, () => nextProjectRunStepImpl(request, projectRoot, stateStore, "write"));
+  if (!turn.acquired) return failed(executionId, first.state, turn.error.message, false);
+  return settle(turn.value);
+}
+
+/** Signal from the read-only pass: "answering this call requires modifying the execution". */
+interface NeedsLock {
+  needsLock: true;
+  state: CoordinatorState;
+}
+
+function needsLock(state: CoordinatorState): NeedsLock {
+  return { needsLock: true, state };
+}
+
+function isNeedsLock(value: ProjectRunStepResponse | NeedsLock): value is NeedsLock {
+  return (value as NeedsLock).needsLock === true;
+}
+
+/** The write pass and the no-id path never ask for a lock (they either hold it or need none). */
+function settle(value: ProjectRunStepResponse | NeedsLock): ProjectRunStepResponse {
+  if (isNeedsLock(value)) throw new Error("INTERNAL: nextProjectRunStep asked for the lock while already allowed to write");
+  return value;
+}
+
+/**
+ * A view of the store that can read but not write. Pass 1 runs against this, so even a future
+ * code path that forgot to ask for the lock fails loudly instead of corrupting a checkpoint.
+ */
+function readOnlyView(store: ExecutionStateStore): ExecutionStateStore {
+  return {
+    load: (id) => store.load(id),
+    exists: (id) => store.exists(id),
+    list: store.list ? () => store.list!() : undefined,
+    save: async () => {
+      throw new Error("INTERNAL: attempted to write a checkpoint from the unlocked read-only pass of nextProjectRunStep");
+    },
+  };
+}
+
+/**
+ * `mode: "read"` is the unlocked pass (see above): it must not write, and returns `NeedsLock`
+ * instead of taking any mutating branch. `mode: "write"` runs with the lock held (or with a
+ * freshly minted id nobody else knows) and may do anything.
+ */
+async function nextProjectRunStepImpl(
+  request: NextProjectRunStepRequest,
+  projectRoot: string,
+  stateStore: ExecutionStateStore,
+  mode: "read" | "write",
+): Promise<ProjectRunStepResponse | NeedsLock> {
 
   if (request.executionId) {
     let persisted: PersistedExecutionState | null;
@@ -167,6 +239,7 @@ export async function nextProjectRunStep(
             const hostResponse = await statusProjectRun({ executionId: persisted.execution_id, projectRoot, stateStore });
             return fromHostResponse(hostResponse);
           }
+          if (mode === "read") return needsLock(persisted.state);
           // Answers were supplied: resume. reconstructResumeContext() persists them
           // durably, decides whether the suspended state needs fresh re-verification
           // (shouldReverifyOnResume — the exact Phase 0/2 safety mechanism, unchanged),
@@ -193,6 +266,7 @@ export async function nextProjectRunStep(
 
         case "IN_PROGRESS":
         default: {
+          if (mode === "read") return needsLock(persisted.state);
           // Mid-sequence with no pending action recorded — a prior prepareNextAction()
           // call checkpointed a pure TRANSITION but the process disappeared before the
           // next decision. Recover via the same reconstruction logic resume() uses and
@@ -215,6 +289,7 @@ export async function nextProjectRunStep(
       }
     }
     // No persisted execution for this id yet — fall through to starting fresh with it.
+    if (mode === "read") return needsLock("INTAKE");
   }
 
   // Fresh start.
@@ -245,7 +320,39 @@ export async function nextProjectRunStep(
     return failed(request.executionId ?? "unknown", "INTAKE", started.failureReason);
   }
 
-  return runPrepare(context, config, projectRoot, stateStore, request.maxSteps);
+  return confirmFirstCheckpoint(await runPrepare(context, config, projectRoot, stateStore, request.maxSteps), stateStore);
+}
+
+/**
+ * A fresh start hands the host an action that it will perform and later submit. Checkpoint
+ * writes are best-effort inside the Coordinator, so if the store is unusable the action would
+ * be issued although nothing was persisted — the host would do the work and only then learn,
+ * at submit, that there is no execution to submit to. Confirm the first checkpoint exists
+ * before issuing the action; otherwise report it now, in the same (non-terminal) way as any
+ * other failure to use the runs directory.
+ */
+async function confirmFirstCheckpoint(
+  response: ProjectRunStepResponse,
+  stateStore: ExecutionStateStore,
+): Promise<ProjectRunStepResponse> {
+  if (response.status !== "AGENT_ACTION_REQUIRED") return response;
+  let persisted = false;
+  try {
+    persisted = await stateStore.exists(response.executionId);
+  } catch {
+    persisted = false;
+  }
+  if (persisted) return response;
+  return failed(
+    response.executionId,
+    "INTAKE",
+    new ExecutionLockUnavailableError(
+      response.executionId,
+      `EXECUTION_LOCK_UNAVAILABLE: The first checkpoint for execution '${response.executionId}' could not be written, so no action was issued ` +
+        `(nothing could ever be submitted against it). Check that '.project-run/runs' exists as a writable directory and that the disk is not full, then retry.`,
+    ).message,
+    false,
+  );
 }
 
 /**
@@ -260,6 +367,27 @@ export async function submitProjectRunStep(
 ): Promise<ProjectRunStepResponse> {
   const projectRoot = request.projectRoot ?? process.cwd();
   const stateStore = request.stateStore ?? new FileExecutionStateStore(projectRoot);
+  // A submission is validate-then-apply on the pending action: two near-simultaneous
+  // submits for the same step would both pass validation against the same checkpoint
+  // and double-apply. Holding the lock across the whole turn makes the loser see the
+  // winner's checkpoint and be rejected as STALE_STEP, exactly as a sequential
+  // duplicate already is.
+  const turn = await runLockedTurn(stateStore, request.executionId, () => submitProjectRunStepUnlocked(request, projectRoot, stateStore));
+  if (turn.acquired) return turn.value;
+  let state: CoordinatorState = "INTAKE";
+  try {
+    state = (await stateStore.load(request.executionId))?.state ?? state;
+  } catch {
+    // best-effort state for the error response only
+  }
+  return failed(request.executionId, state, turn.error.message, false);
+}
+
+async function submitProjectRunStepUnlocked(
+  request: SubmitProjectRunStepRequest,
+  projectRoot: string,
+  stateStore: ExecutionStateStore,
+): Promise<ProjectRunStepResponse> {
 
   let persisted: PersistedExecutionState | null;
   try {
@@ -348,6 +476,7 @@ export async function submitProjectRunStep(
     findings: persisted.findings as FindingInput[] | undefined,
     humanAnswers: persisted.human_answers,
     stepLog: persisted.step_log,
+    history: persisted.history,
     execution: {
       execution_id: persisted.execution_id,
       feature: persisted.feature,

@@ -297,20 +297,20 @@ response (`result.stepLog`, `result.stepsCount`); the non-terminal variants
 (`AGENT_ACTION_REQUIRED`, `HUMAN_INTERVENTION_REQUIRED`, `BLOCKED_MISSING_SKILLS`,
 `FAILED`) are signals and deliberately do not carry them — a pull host reads the record
 of a running or suspended execution through `status()` (`project-run engine status`).
-Three fields are deliberately distinct:
+Four fields are deliberately distinct:
 
 | Field | Meaning |
 |---|---|
 | `findings` | The findings of the **most recent** agent result — the decision engine's gate input. A later clean result replaces it with `[]`; that replacement is what lets a re-run clear a blocking gate, so it is intentionally unchanged. |
 | `stepLog[].findings` | What each step **reported**, never merged or replaced. A finding raised at step 5 is still there after a clean re-run at step 8. Whether it was resolved is read from later entries, not inferred by the engine. |
 | `stepsCount` | The number of `AGENT_STEP` entries in the whole execution. Pure state transitions and human suspensions are not steps; the count includes steps before a resume. |
+| `history` | What the engine **decided** — transitions, dispatches, completion, suspensions — as a durable, compact, execution-wide record. Not an alias of `stepLog`; see §4.17 (before Phase 5 it was always `[]`). |
 
-**Known limitations**: `history` (the live `StepRecord[]` of decisions, including the
-decision objects) is still not persisted — `status()` and pull responses return
-`history: []`; use `stepLog` for the durable record. Per-step evidence payloads are not
-retained (only `evidence_count`); the latest result's full evidence remains on
-`last_result`. A checkpoint written before `step_log` existed reports `stepsCount: 0` /
-`stepLog: []` until new steps are recorded (earlier steps are not reconstructed).
+**Known limitations**: per-step evidence payloads are not retained (only `evidence_count`);
+the latest result's full evidence remains on `last_result`. A checkpoint written before
+`step_log` existed reports `stepsCount: 0` / `stepLog: []` until new steps are recorded
+(earlier steps are not reconstructed); likewise a checkpoint written before Phase 5 has
+no `history` (§4.17).
 
 **Two counters share the name `stepsCount`; they are not the same thing.**
 `ProjectRunHostResponse.stepsCount` (and the `RUN_COMPLETED` event) is the agent-step
@@ -709,3 +709,173 @@ helper is a possible enhancement, not a decision; see `docs/backlog.md` (ENG-001
 Prerequisite scripts that print a `BRANCH:` value (`.specify/scripts/bash/*.sh`) live in
 the consuming project, not in this package; their reporting of a feature name under
 `BRANCH` is outside the engine (`docs/backlog.md`, ENG-003).
+
+### 4.17 Phase 5: durable decision history, atomic checkpoints, and per-execution locking
+
+Phase 5 hardens persistence for the case this architecture now routinely produces:
+independent host turns (separate processes, separate sessions) touching the same
+`execution_id`. Three changes, all additive to the `0.2.0` contract except where noted.
+
+**1. `history` — the engine's durable decision record.** Each `Coordinator` decision is
+appended to `context.history` *before* the checkpoint that follows it, and persisted as
+`PersistedExecutionState.history` (`DecisionRecord[]`; an optional field that already
+existed in the type but was never written). It records, in order and across resumes:
+
+| Decision | Recorded fields |
+|---|---|
+| `TRANSITION` | `from`, `to`, `reason`, `remediation_iteration` — this is where the remediation/retry loop is visible |
+| `DISPATCH_AGENT` | `role`, `runtime`, `state`, `iteration`, `remediation_iteration`, and (pull mode) the `step_id` that links it to `stepLog` |
+| `COMPLETE` / `REQUIRE_HUMAN_INTERVENTION` | `reason` (and `from` for a suspension) |
+
+Each entry is `{ step, state, decision, timestamp }`, `step` being the 1-based position in
+the whole execution (it does **not** restart after a resume). Entries are deliberately
+compact: **no dispatch request, result, evidence or findings** are stored. (A live
+`StepRecord` for an 8-step run was ~44 KB against a ~2 KB checkpoint, almost all of it
+payloads that `pending_action`, `last_result` and `stepLog` already cover; persisting it
+verbatim would have grown every checkpoint ~20× and rewritten it on every save.)
+
+`history` and `stepLog` answer different questions and are not aliases:
+
+| | `history` | `stepLog` |
+|---|---|---|
+| Question | what did the engine decide, and why? | what actually happened? |
+| Contains | transitions, dispatches, completion, suspensions | agent results (status, reported findings, evidence count), suspensions |
+| Pure transitions (e.g. remediation loop) | yes | no |
+| Findings | no | yes, per step |
+| Relationship | each `DISPATCH_AGENT` is followed, once its result is applied, by exactly one `AGENT_STEP`, in the same order, linked by `step_id` in pull mode. A trailing dispatch with no matching step is either still pending (pull) or was never completed (the dispatch failed or the process died) | |
+
+Surfaces: `ProjectRunHostResponse.history` (type `DecisionRecord[]`) on `status()`,
+`start()`, `resume()` and the terminal pull `COMPLETED` response, plus
+`PersistedExecutionState.history`. **Contract change:** through `0.2.0` this field was the
+live per-call `StepRecord[]` for push-mode and always `[]` from `status()`; it is now the
+durable `DecisionRecord[]` everywhere. The rich live records are still available to
+programmatic callers (`onEvent`, `onStep`, `ProjectRunExecutionResult.history`,
+`coordinatorResult.history`), whose shape is unchanged.
+
+**2. Atomic checkpoint writes.** `FileExecutionStateStore.save()` writes a temp file,
+fsyncs it, then renames it over the checkpoint. A reader — or a process that dies mid-save
+— now only ever sees the previous complete checkpoint or the new complete one. (Previously
+a plain `writeFileSync` truncated first, so a concurrent `load()` could fail with an
+invalid-JSON error; this was reproduced and is covered by a cross-process test.)
+
+**3. Advisory per-execution lock.** `FileExecutionStateStore.withLock(executionId, fn)`
+(and the store-agnostic `withExecutionLock(store, id, fn)`, which simply runs `fn` for a
+store that has no `withLock`) provides mutual exclusion for one execution's
+read-modify-write turn.
+
+- *What is locked* (one hold per turn, from the first read to the last checkpoint):
+  `submitProjectRunStep`; `nextProjectRunStep` whenever it turns out to mutate (a new or
+  `IN_PROGRESS` execution, or a suspended one given `humanAnswers`); `executeProjectResume` /
+  `resumeProjectRun`; `executeProjectRun` / `startProjectRun` when an execution id is
+  supplied. *What is not locked:* `status()`, and every pure-read `nextProjectRunStep`
+  path (returning the pending action, reporting a suspension or a terminal state), so
+  observers never wait behind a writer; and a call with no `executionId`, whose freshly
+  minted id nobody else can know yet.
+- *`nextProjectRunStep` is read-first, lock-on-demand.* With an `executionId` it first runs
+  a **read pass** against a view of the store whose `save()` throws, so that pass cannot
+  write by construction. If everything it needs is already answerable from the checkpoint
+  it read, that is the result (no lock). If it finds it must mutate — an `IN_PROGRESS`
+  checkpoint to recover, a suspension with answers, an execution not yet persisted, or a
+  lifecycle it does not recognise — it does **not** act on that read: it acquires the
+  execution lock and re-runs the whole decision against a **fresh** read taken under the
+  lock (the checkpoint may have changed in between; e.g. another host's `submit` writes
+  `IN_PROGRESS` transiently, which is that host's to finish, not this call's to recover).
+  A read that throws is reported as a structured `FAILED`; it never falls through to a
+  mutation. If the lock cannot be obtained, the call returns the lock failure below,
+  untouched.
+- *Scope:* one lock file per execution (`<runsDir>/<id>.lock`), so different executions
+  never contend. The engine takes it only at the outermost entry points and runs the
+  inner steps unlocked; it is **not re-entrant** (an adapter that calls back into the
+  engine for the same execution from inside a push-mode turn will wait out the timeout).
+- *Lifecycle:* acquired by exclusive file creation, polled with jittered backoff up to a
+  timeout (default 30 s; `new FileExecutionStateStore(root, undefined, { timeoutMs })`),
+  released in `finally` on success, throw or rejection. Release only removes a lock that
+  is still the caller's own. Every pass of the acquire loop checks the deadline and yields
+  to the event loop, including when it is clearing an abandoned lock, so acquisition can
+  never outlive its budget or block the process.
+- *Failure behaviour:* a lock the engine could not take never runs the operation unlocked
+  (it fails closed) and never throws out of an entry point. Both failures derive from
+  `ExecutionLockError` and surface as a **non-terminal** `FAILED` response (pull) or failed
+  result (push) whose `failureReason` starts with the code; the execution and its
+  checkpoint are untouched:
+  - `EXECUTION_LOCKED` (`ExecutionLockTimeoutError`) — another live operation held the
+    lock for the whole wait. Retry once it finishes. The message names the lock file and
+    the pid, and says how to clear a lock that is genuinely stale (below).
+  - `EXECUTION_LOCK_UNAVAILABLE` (`ExecutionLockUnavailableError`) — the filesystem
+    refused the lock itself (runs directory missing/not a directory/not writable, disk
+    full, ...). Retrying will not help until the environment is fixed.
+  Only failures *from acquisition* are mapped, and they are recognised **structurally**: the
+  engine records whether the locked operation had started (`runLockedTurn`), so an
+  `ExecutionLockError` raised *before* it started means "lock not obtained", and anything
+  thrown after it started — including a lock error raised by the operation itself, such as
+  an adapter that locks its own execution — is the operation's failure. Push results carry
+  this as `ProjectRunExecutionResult.lockFailure` (set only for genuine acquisition
+  failures); the host response is non-terminal iff it is set. An operation-thrown lock error
+  fails the turn as an ordinary terminal `FAILED` (the checkpoint is marked `FAILED`) with a
+  `failureReason` that does not begin with a lock code (it reads "The operation was aborted
+  by a lock error raised inside it (EXECUTION_LOCKED): ..."), so a host that reacts to the
+  codes by prefix is never told to retry something that actually failed. Errors from a
+  custom store's `withLock` raised after the operation ran propagate unchanged.
+  *First checkpoint:* a `nextProjectRunStep` without an `executionId` cannot take a lock,
+  so before issuing the first action it confirms the first checkpoint exists; if the
+  runs directory is unusable it returns the same non-terminal `EXECUTION_LOCK_UNAVAILABLE`
+  failure instead of an action that could never be submitted. *Difference from `0.2.0`:* with
+  an unusable runs directory `0.2.0` ran best-effort without persisting, and 0.3 refuses
+  with `EXECUTION_LOCK_UNAVAILABLE` — a deliberate fail-closed choice, since proceeding
+  unlocked would silently defeat the guarantee. (This fail-closed behaviour is at lock
+  acquisition and for the first checkpoint only; later checkpoint `save()` failures are still
+  not surfaced — see "Known limitation" below.) A holder whose process has died is
+  detected by probing its pid and reclaimed (reclamation is itself serialised through a
+  guard file); a live holder is never displaced, however long it holds. A push-mode turn
+  holds the lock for the whole run, so a competing mutation waits (or times out) rather
+  than interleaving.
+- *Manual recovery:* the engine never removes a lock whose pid is alive, because it cannot
+  tell a busy holder from an unrelated process that was handed a dead holder's pid (after a
+  crash, or a container restart that re-uses pids). If `EXECUTION_LOCKED` persists and you
+  are sure **no engine process is running for that execution**, delete the lock file named
+  in the message (`.project-run/runs/<executionId>.lock`). The checkpoint itself is never
+  affected.
+- *Idempotency (unchanged, now race-proof):* the second of two simultaneous submits of one
+  step loses to the first and is rejected `STALE_STEP`, exactly as a sequential duplicate
+  already was; simultaneous identical `humanAnswers` are recorded once and produce one
+  re-dispatch.
+
+**Guarantees and limits.** The lock gives mutual exclusion among cooperating callers using
+this store on one machine and a local filesystem. It does *not* protect against: code that
+bypasses it (direct `save()` calls, a `0.2.0` or older engine continuing the same
+execution — which also drops `history` when it rewrites the checkpoint, so don't mix
+versions on one execution); pid reuse after a crash; other machines or filesystems
+without atomic exclusive create (some network mounts) — the engine is limited to
+`node:fs`/`node:path` and cannot identify other hosts; or a hung-but-alive holder (waiters
+time out instead). `Coordinator` itself performs no locking, so a library caller driving it
+directly must hold the lock itself.
+
+**Known limitation — checkpoint `save()` failures are not surfaced (pre-existing).**
+`Coordinator.checkpoint()` catches and ignores any error from `stateStore.save()` (the code comment calls it non-fatal so the main
+loop is not interrupted). This predates Phase 5 and is unchanged by it; `0.3.0` does not fix it.
+- *Guaranteed:* a checkpoint file is never torn (temp file + fsync + atomic rename, so a reader or
+  a crash sees the previous or the new complete JSON); mutating turns are serialised by the
+  execution lock; and the *first* checkpoint of a pull-mode execution is confirmed before an action
+  is issued (`EXECUTION_LOCK_UNAVAILABLE`, above).
+- *Not guaranteed:* that a *later* checkpoint was written. If a write fails after the lock was
+  taken and the first checkpoint exists (for example the disk fills, or an I/O error), the turn
+  can still return its result — e.g. the next `AGENT_ACTION_REQUIRED`, or a push-mode result — while
+  the durable checkpoint stays at the previous step. Nothing in the response reports the failure.
+  The file is consistent, just behind the result; a host that then submits against the unpersisted
+  step is rejected `STALE_STEP`, and a restarted process resumes from the older checkpoint. The
+  lock and atomic writes do not change this; they protect file integrity and mutual exclusion, not
+  save-failure observability.
+- *Status:* explicit backlog item (`docs/backlog.md`, "Checkpoint save failures are swallowed").
+  Until it is addressed, hosts should treat an unexpected `STALE_STEP` after a successful
+  `next-step`/`submit-step` as a possible persistence failure and check the runs directory
+  (free space, permissions) before retrying.
+
+**Persisted-format compatibility.** `history` is an optional field and `version` stays `1`:
+no migration. A checkpoint written before Phase 5 loads with an empty `history`; decisions
+that were never recorded are never reconstructed, and recording simply resumes from the
+next decision (step numbering restarts at 1 for such an execution).
+
+**Out of scope, and not decided:** optimistic-concurrency/versioned writes, a
+database-backed store, cross-machine coordination, a heartbeat for long-lived holders,
+persisting per-decision payloads or an event stream, and any change to `stepLog` or
+`stepsCount`. See `docs/backlog.md`.
