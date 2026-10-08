@@ -4,7 +4,7 @@ A provider-agnostic, runtime-neutral agent orchestration engine for portable wor
 
 `project-run-engine` automates multi-agent software engineering lifecycles (Specification, Architecture, Implementation, Independent Review, Remediation, and Convergence) without coupling to any specific LLM provider, SDK, or host runtime.
 
-**Status**: Phases 0–4, Phase 4 Closure and the ENG-001/002/003 remediation are complete (current release `0.2.0`). Phase 5 (persistence hardening: durable decision `history`, atomic checkpoints, per-execution locking) is implemented in source and unreleased. See [`docs/phase-reports.md`](docs/phase-reports.md) for phase history and [`docs/backlog.md`](docs/backlog.md) for deferred work and known limitations.
+**Status**: Phases 0–4, Phase 4 Closure and the ENG-001/002/003 remediation are complete (current release `0.2.0`). Phase 5 (persistence hardening: durable decision `history`, atomic checkpoints, per-execution locking) is implemented in source and unreleased. See [`docs/phase-reports.md`](docs/phase-reports.md) for phase history and [`docs/backlog.md`](docs/backlog.md) for deferred work and known limitations. **Upgrading from 0.2.x?** `ProjectRunHostResponse.history` changes type in 0.3 — see [`CONSUMER-GUIDE.md` §10](CONSUMER-GUIDE.md#10-upgrading-from-02x-to-03x).
 
 ---
 
@@ -258,13 +258,14 @@ const resumeResult = await executeProjectResume({
 | Module | Exports |
 |---|---|
 | `@incito-labs/project-run-engine` | Main barrel export exposing all public API components |
-| `@incito-labs/project-run-engine/domain` | `CoordinatorState`, `AgentRole`, `AgentRuntime`, `StructuredFinding`, `AgentResult`, `AgentSkillRequirement`, domain error classes |
-| `@incito-labs/project-run-engine/coordinator` | `Coordinator`, `CoordinatorOptions`, `CoordinatorRunResult`, `StepRecord` |
-| `@incito-labs/project-run-engine/decision` | `CoordinatorDecisionEngine`, `CoordinatorDecision`, `CoordinatorExecutionContext`, `isFindingActionable` |
+| `@incito-labs/project-run-engine/domain` | `CoordinatorState`, `AgentRole`, `AgentRuntime`, `StructuredFinding`, `AgentResult`, `AgentSkillRequirement`, `ExecutionStepRecord`, `countAgentSteps`, domain error classes (including `ExecutionLockError`, `ExecutionLockTimeoutError`, `ExecutionLockUnavailableError`, `isExecutionLockFailure`) |
+| `@incito-labs/project-run-engine/coordinator` | `Coordinator`, `CoordinatorOptions`, `CoordinatorRunResult`, `StepRecord` (the live, per-call record — not the durable `history`) |
+| *(no `/decision` subpath)* | The decision layer — `CoordinatorDecisionEngine`, `CoordinatorDecision`, `CoordinatorExecutionContext`, `isFindingActionable`, and the durable-history types `DecisionRecord`, `RecordedDecision`, `DispatchDecisionSummary` — is exported from the **root** barrel only |
 | `@incito-labs/project-run-engine/runtime` | `HostDispatchAdapter`, `HostAgentDispatcher`, `MockRuntimeAdapter`, `executeWithHostGuards` |
 | `@incito-labs/project-run-engine/skills` | `SkillResolver`, `SkillValidator`, `SkillValidationError` |
 | `@incito-labs/project-run-engine/presets` | Spec-Kit preset definitions (`ROLE_SKILLS_MAP`, `getSkillsForRole`, etc.) |
-| `@incito-labs/project-run-engine/project` | `executeProjectRun`, `executeProjectResume`, `discoverProjectContext`, `FileExecutionStateStore`, `runProjectDoctor`, `loadProjectConfig` |
+| `@incito-labs/project-run-engine/project` | `executeProjectRun`, `executeProjectResume`, `discoverProjectContext`, `FileExecutionStateStore` (including `withLock` and its lock-default options), `ExecutionStateStore` (optional `withLock`), `ExecutionLockOptions`, `withExecutionLock`, `PersistedExecutionState`, `runProjectDoctor`, `loadProjectConfig` |
+| `@incito-labs/project-run-engine/host` | `startProjectRun`, `resumeProjectRun`, `statusProjectRun`, `nextProjectRunStep`, `submitProjectRunStep`, `projectEngineRun`, and the `ProjectRunHostResponse` / `ProjectRunStepResponse` types |
 
 ---
 

@@ -778,14 +778,35 @@ read-modify-write turn.
 - *Lifecycle:* acquired by exclusive file creation, polled with jittered backoff up to a
   timeout (default 30 s; `new FileExecutionStateStore(root, undefined, { timeoutMs })`),
   released in `finally` on success, throw or rejection. Release only removes a lock that
-  is still the caller's own.
-- *Failure behaviour:* a timeout raises `ExecutionLockTimeoutError` (`EXECUTION_LOCKED`),
-  surfaced as a **non-terminal** `FAILED` response (pull) or failed result (push) —
-  the execution and its checkpoint are untouched and the call can simply be retried. A
-  holder whose process has died is detected by probing its pid and reclaimed (reclamation
-  is itself serialised through a guard file); a live holder is never displaced, however
-  long it holds. A push-mode turn holds the lock for the whole run, so a competing
-  mutation waits (or times out) rather than interleaving.
+  is still the caller's own. Every pass of the acquire loop checks the deadline and yields
+  to the event loop, including when it is clearing an abandoned lock, so acquisition can
+  never outlive its budget or block the process.
+- *Failure behaviour:* a lock the engine could not take never runs the operation unlocked
+  (it fails closed) and never throws out of an entry point. Both failures derive from
+  `ExecutionLockError` and surface as a **non-terminal** `FAILED` response (pull) or failed
+  result (push) whose `failureReason` starts with the code; the execution and its
+  checkpoint are untouched:
+  - `EXECUTION_LOCKED` (`ExecutionLockTimeoutError`) — another live operation held the
+    lock for the whole wait. Retry once it finishes. The message names the lock file and
+    the pid, and says how to clear a lock that is genuinely stale (below).
+  - `EXECUTION_LOCK_UNAVAILABLE` (`ExecutionLockUnavailableError`) — the filesystem
+    refused the lock itself (runs directory missing/not a directory/not writable, disk
+    full, ...). Retrying will not help until the environment is fixed.
+  Only failures *from acquisition* are mapped: an error thrown by the locked operation, or
+  by a custom store's own `withLock`, propagates unchanged. *Difference from `0.2.0`:* with
+  an unusable runs directory `0.2.0` ran best-effort without persisting, and 0.3 refuses
+  with `EXECUTION_LOCK_UNAVAILABLE` — a deliberate fail-closed choice, since proceeding
+  unlocked would silently defeat the guarantee. A holder whose process has died is
+  detected by probing its pid and reclaimed (reclamation is itself serialised through a
+  guard file); a live holder is never displaced, however long it holds. A push-mode turn
+  holds the lock for the whole run, so a competing mutation waits (or times out) rather
+  than interleaving.
+- *Manual recovery:* the engine never removes a lock whose pid is alive, because it cannot
+  tell a busy holder from an unrelated process that was handed a dead holder's pid (after a
+  crash, or a container restart that re-uses pids). If `EXECUTION_LOCKED` persists and you
+  are sure **no engine process is running for that execution**, delete the lock file named
+  in the message (`.project-run/runs/<executionId>.lock`). The checkpoint itself is never
+  affected.
 - *Idempotency (unchanged, now race-proof):* the second of two simultaneous submits of one
   step loses to the first and is rejected `STALE_STEP`, exactly as a sequential duplicate
   already was; simultaneous identical `humanAnswers` are recorded once and produce one

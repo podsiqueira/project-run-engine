@@ -161,14 +161,30 @@ detail, ownership, and tests are in `docs/backlog.md`:
   (pull and push); atomic checkpoint writes; per-execution advisory lock over every mutating
   turn with dead-holder reclamation and non-terminal `EXECUTION_LOCKED` failures;
   duplicate-submit/answer idempotency preserved under real contention.
-- **Evidence**: `tests/phase5-history.test.ts`, `tests/phase5-locking.test.ts` (26 tests,
-  including genuine child-process races, a SIGKILLed lock holder and a SIGKILLed host with
-  recovery by a second host). Mutation-checked: disabling the lock, the recording, or atomic
-  writes each makes the relevant tests fail.
+- **Evidence**: `tests/phase5-history.test.ts` and `tests/phase5-locking.test.ts`. The
+  implementation commit added **27** tests (history 7, locking 20); the review remediation
+  below added **19** more (history +2, locking +17), so Phase 5 now has **46** (history 9,
+  locking 37). The full suite is 230 tests in 28 files. They include genuine child-process
+  races, a SIGKILLed lock holder, and a SIGKILLed host recovered by a second host.
+  Mutation-checked: disabling the lock, atomic writes or recording makes the relevant tests
+  fail, and so does removing the lock from any single entry point.
 - **Compatibility**: schema `version` stays `1`; `history` is optional (legacy checkpoints
   load with `[]`, nothing back-filled). `stepLog`/`stepsCount` unchanged. **Typed contract
   change**: `ProjectRunHostResponse.history` is `DecisionRecord[]` (was `StepRecord[]`) and
   is populated everywhere — a minor-version bump (`0.3.0`) pre-1.0.
 - **Not done / deferred**: cross-machine locking, optimistic concurrency or a database
   store, lock heartbeats, payload-level or event-stream history, and any host integration.
-- **Status**: IMPLEMENTED in source and validated; **unreleased** (release is a separate step).
+- **Review remediation** (findings F1–F8 of the Phase 5 review; no change to the contract
+  above): lock-acquisition failures now return a structured, non-terminal
+  `EXECUTION_LOCK_UNAVAILABLE` (fail-closed) instead of a raw exception that left the CLI
+  with no JSON (F1, required); the acquire loop is bounded by its deadline on every path
+  (F2); the `EXECUTION_LOCKED` message names the lock file and the manual recovery (F3);
+  each mutating entry point and the reap re-verification now have their own tests, plus a
+  push/pull decision-sequence parity test (F4); test counts corrected (F5); the consumer
+  guide gained an "Upgrading from 0.2.x" section and lock/recovery guidance (F6); the stale
+  `PACKAGING.md` publishing note was replaced with the actual release facts (F7); the README
+  export map and consumer guide document the new public API (F8). While verifying exports,
+  the README's `/decision` subpath row was found to describe a subpath that has never been
+  published, and was corrected.
+- **Status**: IMPLEMENTED in source, validated, review remediation applied; **unreleased**
+  (release is a separate step: the next version must be `0.3.0`).

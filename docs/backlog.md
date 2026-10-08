@@ -55,7 +55,9 @@ validated.
   now serialises every mutating turn — `submitProjectRunStep`, mutating
   `nextProjectRunStep`, `resume`, and `start`/`executeProjectRun` with an id. Reads stay
   unlocked. Dead holders are reclaimed by pid probe; contention surfaces as a non-terminal
-  `EXECUTION_LOCKED` failure. Verified with real OS processes, including SIGKILL.
+  `EXECUTION_LOCKED` failure, and an unusable runs directory as a non-terminal
+  `EXECUTION_LOCK_UNAVAILABLE` (the engine fails closed rather than run unlocked). Verified
+  with real OS processes, including SIGKILL.
 - Duplicate-submission idempotency is preserved and is now race-proof.
 
 **Still deferred (not decided, not scheduled)**:
@@ -222,8 +224,9 @@ provisional — this repository has no formal severity taxonomy.
 
 ## Phase 5
 
-In progress / implemented in source: persistence hardening (decision `history`, atomic
-checkpoints, per-execution advisory lock). See `docs/phase-reports.md` for the baseline,
-evidence, and the release impact (the next release must be a minor bump, `0.3.0`).
+Implemented in source and review-remediated, unreleased: persistence hardening (decision
+`history`, atomic checkpoints, per-execution advisory lock). See `docs/phase-reports.md` for
+the baseline, evidence, and the release impact (the next release must be a minor bump,
+`0.3.0`).
 Host integrations (Antigravity, Cursor, Codex, MCP) are **not** part of Phase 5; they remain
 the backlog items above.

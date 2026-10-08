@@ -145,7 +145,8 @@ npm pack --dry-run
 
 ---
 
-## 6. Publishing Note
+## 6. Publishing
 
-Per current architectural guidelines, the package is kept in local mono-repository / workspace packaging mode. **Do not publish to public npm until the Incito consumption migration is scheduled and validated.**
+`@incito-labs/project-run-engine` is published to the public npm registry (`"publishConfig": { "access": "public" }`). Versions `0.1.0`, `0.1.1` and `0.2.0` have been published so far.
 
+A release is prepared and published by a maintainer from an authenticated session, after the verification in section 5 (tests, typecheck, build and `npm pack --dry-run`). The version bump (`package.json` and `package-lock.json`) is committed on its own before publishing, and a published version is never modified. The sandboxed environments used for implementation work so far have held no npm credentials, so they prepared releases and a maintainer published them.
