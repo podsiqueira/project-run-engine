@@ -377,12 +377,13 @@ async function nextProjectRunStepImpl(
 }
 
 /**
- * A fresh start hands the host an action that it will perform and later submit. Checkpoint
- * writes are best-effort inside the Coordinator, so if the store is unusable the action would
- * be issued although nothing was persisted — the host would do the work and only then learn,
- * at submit, that there is no execution to submit to. Confirm the first checkpoint exists
- * before issuing the action; otherwise report it now, in the same (non-terminal) way as any
- * other failure to use the runs directory.
+ * A fresh start hands the host an action that it will perform and later submit. A failed
+ * checkpoint write is reported by the Coordinator (CheckpointWriteError), so the action is not
+ * issued for an unusable store; this guards the remaining case, a store that RESOLVES a save
+ * without persisting anything. The host would do the work and only then learn, at submit, that
+ * there is no execution to submit to. Confirm the first checkpoint exists before issuing the
+ * action; otherwise report it now, in the same (non-terminal) way as any other failure to use
+ * the runs directory.
  */
 async function confirmFirstCheckpoint(
   response: ProjectRunStepResponse,

@@ -97,7 +97,15 @@ export interface ProjectRunStatusRequest {
  *   or simply disappeared) between two checkpoints.
  * - `HUMAN_INTERVENTION_REQUIRED` / `BLOCKED_MISSING_SKILLS`: non-terminal, actionable —
  *   see `ProjectRunHostResponse.terminal`.
- * - `COMPLETED` / `FAILED`: terminal — no further `resume()` call will progress them.
+ * - `COMPLETED` / `FAILED`: terminal — no further `resume()` call will progress them, where
+ *   "terminal" is what the RESPONSE reports. The durable lifecycle is authoritative: when a run
+ *   fails for an ordinary reason the engine also records a terminal `FAILED` checkpoint, but that
+ *   marker is advisory (best-effort). If it could not be written the response is still `FAILED` /
+ *   `terminal: true` while the persisted execution stays at its last durable checkpoint — `status()`
+ *   then reports it as `RUNNING` and `resume()` can still continue it. Rely on `status()` for the
+ *   persisted lifecycle; see `ARCHITECTURE.md` §4.17.1.
+ * - A `FAILED` response that carries `failureCode` (`EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`,
+ *   `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`) is NOT terminal: see `terminal`.
  */
 export type ProjectRunHostStatus =
   | "RUNNING"
@@ -110,7 +118,9 @@ export interface ProjectRunHostResponse {
   status: ProjectRunHostStatus;
   /**
    * `true` for `COMPLETED`/`FAILED` (no further `resume()` call can progress this
-   * execution); `false` for every other status, including `BLOCKED_MISSING_SKILLS`
+   * execution — as far as this response knows; the persisted lifecycle from `status()` is
+   * authoritative, see `ProjectRunHostStatus`); `false` for a `FAILED` that carries a
+   * `failureCode`, and for every other status, including `BLOCKED_MISSING_SKILLS`
    * (resuming again after the host installs the missing skill is expected to work,
    * since the underlying suspended checkpoint — if any — was never touched by the
    * failed attempt).
@@ -163,9 +173,12 @@ export interface ProjectRunHostResponse {
   /**
    * Present on a `FAILED` response for the failures a host can handle without reading
    * `failureReason`: `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE` and
-   * `CHECKPOINT_WRITE_FAILED`. All three are non-terminal (`terminal: false`): the call did not
-   * take effect beyond the last durable checkpoint. For `CHECKPOINT_WRITE_FAILED`, `state`,
-   * `stepLog` and `history` describe that last durable checkpoint, never unsaved progress.
+   * `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`. All are non-terminal (`terminal: false`): the
+   * call did not take effect beyond the last durable checkpoint. For `CHECKPOINT_WRITE_FAILED`,
+   * `stepLog` and `history` come from that last durable checkpoint, never from unsaved progress, and so
+   * does `state` whenever the store can still be read after the failed write. If it cannot, `state`
+   * is only a best-effort placeholder (pull: `"INTAKE"`; push: the in-memory state) and is NOT a
+   * confirmed durable state — call `status()` / `next-step` once storage works to learn the real one.
    */
   failureCode?: ExecutionFailureCode;
 }

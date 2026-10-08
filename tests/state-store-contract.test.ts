@@ -535,3 +535,43 @@ describe("the engine is storage-neutral", () => {
     expect(again.status === "AGENT_ACTION_REQUIRED" && again.stepId).toBe(first.stepId);
   });
 });
+
+// =======================================================================================
+// What is NOT revision-protected (documented in ARCHITECTURE.md §4.17.2)
+// =======================================================================================
+describe("initial push start is unconditional (characterisation of documented behaviour)", () => {
+  const adapterFor = (store: ExecutionStateStore) => new MockRuntimeAdapter(async (req) => resultForRequest(store, req));
+
+  it("a second push start with an existing execution id restarts that execution — its first write does not use expectedRevision 0 — while pull next-step on the same id continues it", async () => {
+    class SpyStore extends FileExecutionStateStore {
+      calls: Array<{ expected: number | undefined }> = [];
+      override async save(state: PersistedExecutionState, options?: { expectedRevision?: number }) {
+        this.calls.push({ expected: options?.expectedRevision });
+        return super.save(state, options);
+      }
+    }
+    const store = new SpyStore(tmpDir);
+    const first = await executeProjectRun({ projectRoot: tmpDir, executionId: "reuse", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapterFor(store)], stateStore: store });
+    expect(first.status).toBe("HUMAN_INTERVENTION_REQUIRED");
+    // The first write of a push start carries no expected revision; later writes chain from its receipt.
+    expect(store.calls[0].expected).toBeUndefined();
+    expect(store.calls.slice(1).every((c, i) => c.expected === i + 1)).toBe(true);
+    const before = (await store.load("reuse"))!;
+    expect(before.step_log!.length).toBeGreaterThan(0);
+
+    store.calls = [];
+    const again = await executeProjectRun({ projectRoot: tmpDir, executionId: "reuse", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapterFor(store)], stateStore: store });
+    expect(again.status).toBe("HUMAN_INTERVENTION_REQUIRED"); // no conflict, no rejection: the id is simply reused
+    expect(again.persistenceFailure).toBeUndefined();
+    expect(store.calls[0].expected).toBeUndefined();
+    const after = (await store.load("reuse"))!;
+    expect(after.revision).toBeGreaterThan(before.revision!); // revisions keep counting across the restart
+    expect(after.step_log![0].seq).toBe(1); // ...but the record is the new run's: the old run's log was replaced
+
+    // Pull mode is different: an explicit id that exists is CONTINUED, never reset.
+    const pullStore = new MemoryExecutionStateStore();
+    const a = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "p1", runtime: "MOCK", stateStore: pullStore });
+    const b = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "p1", runtime: "MOCK", stateStore: pullStore });
+    expect(a.status === "AGENT_ACTION_REQUIRED" && b.status === "AGENT_ACTION_REQUIRED" && a.stepId === b.stepId).toBe(true);
+  }, 60_000);
+});

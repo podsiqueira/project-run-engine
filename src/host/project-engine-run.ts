@@ -136,6 +136,26 @@ export const PROJECT_ENGINE_RUN_TOOL_SCHEMA = {
     status: ["RUNNING", "COMPLETED", "HUMAN_INTERVENTION_REQUIRED", "BLOCKED_MISSING_SKILLS", "FAILED"],
     terminal_statuses: ["COMPLETED", "FAILED"],
     human_intervention_field: "humanIntervention",
+    // Machine-readable discriminator on a FAILED response (use it instead of parsing `failureReason`).
+    // Every response that carries one is non-terminal (`terminal: false`): the call did not take
+    // effect beyond the execution's last durable checkpoint, and the execution is intact.
+    failure_code_field: "failureCode",
+    failure_codes: [
+      "EXECUTION_LOCKED",
+      "EXECUTION_LOCK_UNAVAILABLE",
+      "CHECKPOINT_WRITE_FAILED",
+      "CHECKPOINT_CONFLICT",
+    ],
+    failure_code_semantics: {
+      EXECUTION_LOCKED:
+        "Another live operation held the execution's lock for the whole wait. Repeat the same call after a moment.",
+      EXECUTION_LOCK_UNAVAILABLE:
+        "The runs directory is unusable (missing, not writable, disk full), or the first checkpoint could not be written. Fix the environment, then retry.",
+      CHECKPOINT_WRITE_FAILED:
+        "The store rejected a checkpoint write. The execution stays at its last durable checkpoint and the response describes it (see the failure notes in ARCHITECTURE.md 4.17.1). Fix the storage problem, then call resume/start again with the same executionId.",
+      CHECKPOINT_CONFLICT:
+        "Another operation changed the execution while this call was in progress; nothing of this call was written. Read the current state with `status` instead of retrying blindly.",
+    },
     safety_note:
       "An answer supplied on resume never directly forces a transition or mutates a " +
       "finding; the agent responsible for the suspended state is always re-dispatched " +

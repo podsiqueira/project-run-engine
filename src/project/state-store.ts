@@ -391,8 +391,13 @@ export class FileExecutionStateStore implements ExecutionStateStore {
    * compare-and-swap here, not a best-effort check. Same scope as the lock: one machine, a local
    * filesystem with atomic exclusive create; callers that bypass the guard (an older engine, direct
    * file edits) are not covered.
+   *
+   * This implementation always resolves with the `ExecutionSaveReceipt`, but the declared return type is
+   * the contract's `void | ExecutionSaveReceipt` so that a subclass written against `0.3.0`
+   * (`override async save(state): Promise<void>`) keeps type-checking. Callers that need the revision
+   * narrow it: `const receipt = await store.save(s); if (receipt) receipt.revision`.
    */
-  async save(state: PersistedExecutionState, options: ExecutionSaveOptions = {}): Promise<ExecutionSaveReceipt> {
+  async save(state: PersistedExecutionState, options: ExecutionSaveOptions = {}): Promise<void | ExecutionSaveReceipt> {
     if (!fs.existsSync(this.runsDir)) {
       fs.mkdirSync(this.runsDir, { recursive: true });
     }

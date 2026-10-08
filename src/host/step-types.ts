@@ -123,12 +123,15 @@ export type ProjectRunStepResponse =
       failureReason: string;
       /**
        * Present for the failures a host can handle without reading `failureReason`:
-       * `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE` and `CHECKPOINT_WRITE_FAILED`.
-       * All three are non-terminal: this call did not take effect beyond the last durable
-       * checkpoint, and calling `nextProjectRunStep()` again with the same `executionId`
+       * `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`, `CHECKPOINT_WRITE_FAILED` and
+       * `CHECKPOINT_CONFLICT` (another operation changed the execution meanwhile; nothing of this
+       * call was written). All are non-terminal: this call did not take effect beyond the last
+       * durable checkpoint, and calling `nextProjectRunStep()` again with the same `executionId`
        * returns the authoritative current state (the same pending action, or the recovered
        * next one). For `CHECKPOINT_WRITE_FAILED` the cause is the storage environment —
-       * fix it first; the engine never reports progress that is not durable.
+       * fix it first; the engine never reports progress that is not durable. In that response
+       * `state` is the last durable state whenever the store can still be read; if it cannot, it is
+       * only a placeholder (`"INTAKE"`) and not a confirmed durable state.
        */
       failureCode?: ExecutionFailureCode;
     };
