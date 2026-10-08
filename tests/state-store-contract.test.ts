@@ -188,6 +188,39 @@ describe("FileExecutionStateStore — revisions and compatibility", () => {
     expect((await store.load("corrupt"))!.revision).toBe(1);
   });
 
+  it("a write guard abandoned by a process that died is reclaimed (dead holder), so a crash inside save() can never wedge an execution", async () => {
+    const store = new FileExecutionStateStore(tmpDir);
+    await store.save(sampleState("wedge"));
+    const dead = spawn(process.execPath, ["-e", "process.exit(0)"]);
+    await new Promise((r) => dead.on("close", r));
+    fs.writeFileSync(
+      path.join(store.runsDir, "wedge.cas"),
+      JSON.stringify({ pid: dead.pid, token: "dead-writer", acquired_at: new Date().toISOString() }),
+    );
+    const started = Date.now();
+    const receipt = await store.save(sampleState("wedge", { state: "CLARIFY" }), { expectedRevision: 1 });
+    expect(receipt.revision).toBe(2);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(fs.readdirSync(store.runsDir).filter((f) => !f.endsWith(".json"))).toEqual([]);
+  });
+
+  it("a write guard held by a LIVE process is never stolen: the save fails (as a checkpoint write failure) instead of racing it", async () => {
+    const store = new FileExecutionStateStore(tmpDir);
+    await store.save(sampleState("held"));
+    // Held by this very process (alive): a second save must give up after its bounded wait, not reclaim it.
+    fs.writeFileSync(path.join(store.runsDir, "held.cas"), JSON.stringify({ pid: process.pid, token: "someone-else", acquired_at: new Date().toISOString() }));
+    const slowStore = new FileExecutionStateStore(tmpDir);
+    const err = await Promise.race([
+      slowStore.save(sampleState("held", { state: "CLARIFY" })).then(() => "saved", (e) => e),
+      new Promise((r) => setTimeout(() => r("still-waiting"), 1_500)),
+    ]);
+    expect(err).toBe("still-waiting"); // waiting on the live holder (bounded by its 10s guard budget), never overwriting
+    expect((await store.load("held"))!.state).toBe("SPECIFY");
+    fs.rmSync(path.join(store.runsDir, "held.cas"), { force: true }); // release it; the waiting save then completes
+    await new Promise((r) => setTimeout(r, 300));
+    expect((await store.load("held"))!.state).toBe("CLARIFY");
+  });
+
   it("leaves no guard, lock or temp files behind after saves, conflicts and failures", async () => {
     const store = new FileExecutionStateStore(tmpDir);
     await store.save(sampleState("tidy"));
@@ -461,6 +494,19 @@ describe("the engine is storage-neutral", () => {
     expect(resumed.status).toBe("COMPLETED");
     expect(resumed.stepLog.length).toBeGreaterThan(started.stepLog.length);
     expect(fs.existsSync(path.join(tmpDir, ".project-run", "runs"))).toBe(false); // no filesystem knowledge leaked
+  }, 60_000);
+
+  it("a call rejected before any run context exists still reports the durable record from the supplied store (not the file store, not empty)", async () => {
+    const store = new MemoryExecutionStateStore();
+    const adapter = new MockRuntimeAdapter(async (req) => resultForRequest(store, req));
+    let res = await startProjectRun({ projectRoot: tmpDir, executionId: "mem-done", runtime: "MOCK", adapters: [adapter], stateStore: store });
+    res = await resumeProjectRun({ projectRoot: tmpDir, executionId: "mem-done", runtime: "MOCK", adapters: [adapter], stateStore: store, humanAnswers: res.humanIntervention!.questions.map((q) => ({ questionId: q.id, answer: "ok" })) });
+    expect(res.status).toBe("COMPLETED");
+    const again = await resumeProjectRun({ projectRoot: tmpDir, executionId: "mem-done", runtime: "MOCK", adapters: [adapter], stateStore: store });
+    expect(again.status).toBe("FAILED"); // EXECUTION_NOT_RESUMABLE: rejected before a context was built
+    expect(again.stepLog).toEqual(res.stepLog);
+    expect(again.history).toEqual(res.history);
+    expect(again.stepsCount).toBe(res.stepsCount);
   }, 60_000);
 
   it("a store written against the 0.3.0 contract (void save, no revisions, no lock) keeps working: pull and push complete", async () => {
