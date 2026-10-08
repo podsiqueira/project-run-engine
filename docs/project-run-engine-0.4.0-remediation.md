@@ -25,7 +25,7 @@ store, distributed locking, event-stream history, host integrations).
   documentation now states the real contract. It remains available as a future, deliberate change.
 - **F2 decision.** Widening the declared type removes the TypeScript break instead of documenting it. Callers
   of the concrete class that want the revision narrow it (`if (receipt)`), as documented.
-- **Release note.** The `READY_FOR_PR` crash-recovery bug fix is recorded as a draft `0.4.0` release note in
+- **Release note.** The `READY_FOR_PR` crash-recovery bug fix is recorded in the `0.4.0` release notes in
   `docs/phase-reports.md` (the repository has no changelog file).
 - **Left unchanged on purpose** (observations, not remediated): duplicate human-answer audit records after a
   later failed write, `created_at` being rewritten on save, write-guard cost, and every deferred backlog item.

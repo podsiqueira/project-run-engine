@@ -4,7 +4,7 @@ A provider-agnostic, runtime-neutral agent orchestration engine for portable wor
 
 `project-run-engine` automates multi-agent software engineering lifecycles (Specification, Architecture, Implementation, Independent Review, Remediation, and Convergence) without coupling to any specific LLM provider, SDK, or host runtime.
 
-**Status**: Phases 0–4, Phase 4 Closure, the ENG-001/002/003 remediation and Phase 5 (persistence hardening: durable decision `history`, atomic checkpoints, per-execution locking) are complete (current release `0.3.0`). Post-`0.3.0` work that is **not released yet** (next release `0.4.0`): failed checkpoint writes are reported instead of swallowed (`CHECKPOINT_WRITE_FAILED`), and the storage contract gained revisioned compare-and-swap writes (`CHECKPOINT_CONFLICT`) — see [`CONSUMER-GUIDE.md` §11](CONSUMER-GUIDE.md#11-upgrading-from-03x-to-04x-unreleased). See [`docs/phase-reports.md`](docs/phase-reports.md) for phase history and [`docs/backlog.md`](docs/backlog.md) for deferred work and known limitations. **Upgrading from 0.2.x?** `ProjectRunHostResponse.history` changes type in 0.3 — see [`CONSUMER-GUIDE.md` §10](CONSUMER-GUIDE.md#10-upgrading-from-02x-to-03x).
+**Status**: Phases 0–4, Phase 4 Closure, the ENG-001/002/003 remediation and Phase 5 (persistence hardening: durable decision `history`, atomic checkpoints, per-execution locking) are complete (current release `0.4.0`). `0.4.0` reports failed checkpoint writes instead of swallowing them (`CHECKPOINT_WRITE_FAILED`), gives the storage contract revisioned compare-and-swap writes (`CHECKPOINT_CONFLICT`), and fixes a crash-recovery bug at the final `READY_FOR_PR` transition — see [`CONSUMER-GUIDE.md` §11](CONSUMER-GUIDE.md#11-upgrading-from-03x-to-04x). See [`docs/phase-reports.md`](docs/phase-reports.md) for phase history and [`docs/backlog.md`](docs/backlog.md) for deferred work and known limitations. **Upgrading from 0.2.x?** `ProjectRunHostResponse.history` changes type in 0.3 — see [`CONSUMER-GUIDE.md` §10](CONSUMER-GUIDE.md#10-upgrading-from-02x-to-03x).
 
 ---
 
@@ -98,7 +98,7 @@ export interface ExecutionStateStore {
 ```
 
 `save` resolves only once the checkpoint is durable. `expectedRevision` (compare-and-swap) and `revision` are
-the optimistic-concurrency part of the contract *(unreleased, next release `0.4.0` — `ARCHITECTURE.md` §4.17.2)*.
+the optimistic-concurrency part of the contract *(added in `0.4.0` — `ARCHITECTURE.md` §4.17.2)*.
 Persisted runs are saved to `.project-run/runs/<execution_id>.json`.
 
 ### Persisted State Schema
@@ -111,7 +111,7 @@ Persisted runs are saved to `.project-run/runs/<execution_id>.json`.
 - `last_result` (the last `AgentResult`), `findings` (the latest result's), `context`.
 - `history` (`DecisionRecord[]`, what the engine decided) and `step_log` (what happened: agent steps and human suspensions).
 - `human_intervention` (the latest suspension), `human_answers` (append-only), `pending_action` (the outstanding pull-mode step).
-- `revision`: store-assigned write counter *(unreleased)*; `created_at` / `updated_at` ISO-8601 strings.
+- `revision`: store-assigned write counter *(since `0.4.0`)*; `created_at` / `updated_at` ISO-8601 strings.
 
 ### Secret Scrubbing & Privacy
 
@@ -260,13 +260,13 @@ const resumeResult = await executeProjectResume({
 | Module | Exports |
 |---|---|
 | `@incito-labs/project-run-engine` | Main barrel export exposing all public API components |
-| `@incito-labs/project-run-engine/domain` | `CoordinatorState`, `AgentRole`, `AgentRuntime`, `StructuredFinding`, `AgentResult`, `AgentSkillRequirement`, `ExecutionStepRecord`, `countAgentSteps`, domain error classes (including `ExecutionLockError`, `ExecutionLockTimeoutError`, `ExecutionLockUnavailableError`, `isExecutionLockFailure`; unreleased: `CheckpointWriteError`, `CheckpointConflictError`, `ExecutionFailureCode`, `PersistenceFailureCode`) |
+| `@incito-labs/project-run-engine/domain` | `CoordinatorState`, `AgentRole`, `AgentRuntime`, `StructuredFinding`, `AgentResult`, `AgentSkillRequirement`, `ExecutionStepRecord`, `countAgentSteps`, domain error classes (including `ExecutionLockError`, `ExecutionLockTimeoutError`, `ExecutionLockUnavailableError`, `isExecutionLockFailure`; since `0.4.0`: `CheckpointWriteError`, `CheckpointConflictError`, `ExecutionFailureCode`, `PersistenceFailureCode`) |
 | `@incito-labs/project-run-engine/coordinator` | `Coordinator`, `CoordinatorOptions`, `CoordinatorRunResult`, `StepRecord` (the live, per-call record — not the durable `history`) |
 | *(no `/decision` subpath)* | The decision layer — `CoordinatorDecisionEngine`, `CoordinatorDecision`, `CoordinatorExecutionContext`, `isFindingActionable`, and the durable-history types `DecisionRecord`, `RecordedDecision`, `DispatchDecisionSummary` — is exported from the **root** barrel only |
 | `@incito-labs/project-run-engine/runtime` | `HostDispatchAdapter`, `HostAgentDispatcher`, `MockRuntimeAdapter`, `executeWithHostGuards` |
 | `@incito-labs/project-run-engine/skills` | `SkillResolver`, `SkillValidator`, `SkillValidationError` |
 | `@incito-labs/project-run-engine/presets` | Spec-Kit preset definitions (`ROLE_SKILLS_MAP`, `getSkillsForRole`, etc.) |
-| `@incito-labs/project-run-engine/project` | `executeProjectRun`, `executeProjectResume`, `discoverProjectContext`, `FileExecutionStateStore` (including `withLock` and its lock-default options), `ExecutionStateStore` (optional `withLock`; unreleased: revisioned `save`), `ExecutionLockOptions`, `withExecutionLock`, `PersistedExecutionState`, unreleased: `ExecutionSaveOptions`, `ExecutionSaveReceipt`, `runProjectDoctor`, `loadProjectConfig` |
+| `@incito-labs/project-run-engine/project` | `executeProjectRun`, `executeProjectResume`, `discoverProjectContext`, `FileExecutionStateStore` (including `withLock` and its lock-default options), `ExecutionStateStore` (optional `withLock`; since `0.4.0`: revisioned `save`), `ExecutionLockOptions`, `withExecutionLock`, `PersistedExecutionState`, since `0.4.0`: `ExecutionSaveOptions`, `ExecutionSaveReceipt`, `runProjectDoctor`, `loadProjectConfig` |
 | `@incito-labs/project-run-engine/host` | `startProjectRun`, `resumeProjectRun`, `statusProjectRun`, `nextProjectRunStep`, `submitProjectRunStep`, `projectEngineRun`, and the `ProjectRunHostResponse` / `ProjectRunStepResponse` types |
 
 ---

@@ -113,7 +113,7 @@ This constraint is continuously enforced by automated package-boundary tests.
 
 ## 3. Runtime Persistence Directory
 
-During execution, `project-run-engine` checkpoints state to `.project-run/runs/<execution_id>.json`. This directory is managed by the consumer project and should be added to `.gitignore`. Checkpoints are sanitized of credentials and sensitive tokens prior to disk persistence. Besides `<id>.json`, the directory transiently holds `<id>.lock` (execution lock), `<id>.cas` (write guard, unreleased `0.4.0` work) and `*.tmp` files; they are removed after use, so ignore the whole directory in version control.
+During execution, `project-run-engine` checkpoints state to `.project-run/runs/<execution_id>.json`. This directory is managed by the consumer project and should be added to `.gitignore`. Checkpoints are sanitized of credentials and sensitive tokens prior to disk persistence. Besides `<id>.json`, the directory transiently holds `<id>.lock` (execution lock), `<id>.cas` (write guard, since `0.4.0`) and `*.tmp` files; they are removed after use, so ignore the whole directory in version control.
 
 ---
 

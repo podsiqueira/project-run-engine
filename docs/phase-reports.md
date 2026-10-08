@@ -20,11 +20,11 @@ known limitations, and trust boundaries see `docs/backlog.md`.
 | Phase 4 — Real Claude Code host integration | COMPLETE |
 | Phase 4 Closure — runtime-default hardening, docs, release | COMPLETE |
 | Phase 5 — Persistence hardening | **COMPLETE — released as `0.3.0`** (see [Phase 5](#phase-5--persistence-hardening)) |
-| Post-0.3.0 — Persistence correctness and storage contract | **IMPLEMENTED in source — unreleased** (next release `0.4.0`; see [Post-0.3.0](#post-030--persistence-correctness-and-the-storage-contract)) |
+| Post-0.3.0 — Persistence correctness and storage contract | **COMPLETE — released as `0.4.0`** (see [Post-0.3.0](#post-030--persistence-correctness-and-the-storage-contract)) |
 
-Current release: `@incito-labs/project-run-engine@0.3.0` (`package.json`). Phase 5 shipped as
-`0.3.0`, not a patch, because it changes the typed `history` contract. `0.2.0` was the previous
-release.
+Current release: `@incito-labs/project-run-engine@0.4.0` (`package.json`). The post-0.3.0 persistence work
+shipped as `0.4.0` (a minor release: the public surface only grows). Phase 5 had shipped as `0.3.0`, not a
+patch, because it changed the typed `history` contract; `0.3.0` was the previous release.
 
 ## Phase 0 — Coordinator safety gates
 
@@ -203,8 +203,8 @@ detail, ownership, and tests are in `docs/backlog.md`:
   first-checkpoint check each make a test fail.
 - **Status**: COMPLETE — implemented, validated, review remediation applied, independently
   reviewed, and released as `0.3.0`. `0.3.0` shipped with one documented, pre-existing limitation:
-  `Coordinator.checkpoint()` swallowed `save()` failures (NF-2). That is fixed after `0.3.0`, in the
-  unreleased `0.4.0` work (see [Post-0.3.0](#post-030--persistence-correctness-and-the-storage-contract)).
+  `Coordinator.checkpoint()` swallowed `save()` failures (NF-2). That is fixed after `0.3.0`, in
+  `0.4.0` (see [Post-0.3.0](#post-030--persistence-correctness-and-the-storage-contract)).
 
 ## Post-0.3.0 — Persistence correctness and the storage contract
 
@@ -242,14 +242,14 @@ detail, ownership, and tests are in `docs/backlog.md`:
   `ExecutionSaveReceipt`, `PersistedExecutionState.revision`, `failureCode`, `persistenceFailure`,
   `stateStore` on the host requests); schema `version` stays `1`; `0.3.0` checkpoints and
   `void`-returning stores keep working. One behaviour change: save errors that were silently ignored now
-  surface — recommended version **`0.4.0`** (minor, pre-1.0). Details for consumers: `CONSUMER-GUIDE.md` §11.
+  surface — released as **`0.4.0`** (minor, pre-1.0). Details for consumers: `CONSUMER-GUIDE.md` §11.
 - **Release-review remediation** (`docs/project-run-engine-0.4.0-remediation.md`): an independent review found
   no blocker; its two MEDIUM findings and five LOW ones were closed without changing runtime behaviour — the
   push-`start` revision claim was corrected (the initial push start is unconditional, as in `0.3.0`),
   `FileExecutionStateStore.save` is declared `Promise<void | ExecutionSaveReceipt>` so `0.3.0`-era subclasses
   still compile, the public export surface got a consumer-level test, and the caveats on write-failure `state`,
   at-least-once agent execution and the advisory `FAILED` marker were documented.
-- **Draft release notes for `0.4.0`** (unreleased; the release step turns these into the published notes):
+- **Release notes for `0.4.0`:**
   - *Fixed — crash/restart recovery at completion.* An execution left `IN_PROGRESS` at `READY_FOR_PR` (a crash,
     or a failed `COMPLETED` write, between the final transition and the completion checkpoint) was refused by
     `resume` and `next-step` as "completed" and could never finish. It now recovers and completes exactly once.
@@ -261,6 +261,14 @@ detail, ownership, and tests are in `docs/backlog.md`:
     `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`); revisioned checkpoints and compare-and-swap writes
     (`CheckpointConflictError`); `stateStore` on host `start`/`resume`/`status`; an exact CAS in the file store
     (`<id>.cas` write guard).
-  - *Known limits.* The initial push `start` is not revision-protected; push agent work around a lost write is
-    at-least-once; the file store is single-machine only. See `ARCHITECTURE.md` §4.17.
-- **Status**: implemented, validated, documented; **not released** (release preparation is a separate step).
+  - *Known limits.* The initial push `start` is not revision-protected (a reused `executionId` restarts the
+    execution, as in `0.3.0`); push agent work around a lost write is at-least-once; after a failed write the
+    response `state` is only a placeholder if the store cannot be re-read; the advisory terminal `FAILED`
+    marker is best-effort (trust `status()` for the durable lifecycle); a retry after a recorded human answer
+    and a failed later write records the answers twice (audit trail only); the file store is single-machine
+    only and mixing `0.3.x` and `0.4.x` on one execution is unsupported. See `ARCHITECTURE.md` §4.17.
+- **Status**: COMPLETE — implemented, independently reviewed, review actions remediated, and released as `0.4.0`. Validation at
+  release: 31 test files / 306 tests, typecheck, build, package-boundary and the public-surface tests all green;
+  the packed tarball was installed fresh and exercised (CLI, every entry point, pull/push lifecycles, lock,
+  write-failure and conflict behaviour, an in-memory store). Still deferred (`docs/backlog.md`): lock heartbeat,
+  a database-backed store, distributed locking, event-stream history, host integrations, ENG-003.

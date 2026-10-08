@@ -12,8 +12,8 @@ provider-neutral boundary stays a deliberate choice, not an accidental gap.
 **Sequencing decision (after `0.3.0`)**: the persistence work (checkpoint write failures, the revisioned
 store contract — `ARCHITECTURE.md` §4.17) changes what a host can rely on and must handle
 (`failureCode`: `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`). The four integrations below are
-therefore **deferred until that release (`0.4.0`) is out**, so no host integration is built on, or hides,
-a persistence limitation. They stay thin: a skill/adapter or transport over
+therefore **deferred until that release (`0.4.0`) was out** so that no host integration is built on, or hides,
+a persistence limitation. `0.4.0` has shipped, so they are now unblocked; none is started. They stay thin: a skill/adapter or transport over
 `nextProjectRunStep`/`submitProjectRunStep`, with no provider SDK in the core, no provider branch in
 the Coordinator, no second persistence mechanism and no workflow logic of their own. None is started.
 
@@ -68,7 +68,7 @@ validated.
   with real OS processes, including SIGKILL.
 - Duplicate-submission idempotency is preserved and is now race-proof.
 
-**Post-`0.3.0` follow-up (unreleased; next release `0.4.0`)** — see `ARCHITECTURE.md` §4.17.1–§4.17.4:
+**Post-`0.3.0` follow-up (delivered in `0.4.0`)** — see `ARCHITECTURE.md` §4.17.1–§4.17.4:
 - *Optimistic concurrency* — **contract and file-store implementation delivered**: revisioned
   checkpoints, `save(state, { expectedRevision })` compare-and-swap, `CHECKPOINT_CONFLICT`, an
   exact CAS in the file store independent of the lock, and a host API that accepts any
@@ -242,7 +242,7 @@ provisional — this repository has no formal severity taxonomy.
   feature value as `FEATURE` — and do not force feature and branch names to match.
   Stays OPEN here until the consumer confirms; close it when they do.
 
-## Checkpoint save failures are swallowed — RESOLVED (unreleased; next release `0.4.0`)
+## Checkpoint save failures are swallowed — RESOLVED in `0.4.0`
 
 `Coordinator.checkpoint()` used to catch and ignore every `stateStore.save()` error (pre-existing,
 present since the Coordinator's first checkpointing commit; documented in `0.3.0`). A later write

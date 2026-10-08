@@ -11,7 +11,7 @@ Add `@incito-labs/project-run-engine` to your repository's `package.json`:
 ```json
 {
   "dependencies": {
-    "@incito-labs/project-run-engine": "^0.3.0"
+    "@incito-labs/project-run-engine": "^0.4.0"
   }
 }
 ```
@@ -295,7 +295,7 @@ A lock error raised *inside* an operation (for example by an adapter that tries 
 same execution from within a push-mode run) is **not** one of these: the turn fails as an ordinary
 terminal `FAILED`, its `failureReason` does not begin with a lock code, and the execution is not resumable.
 
-**Checkpoint write failures and conflicts** *(unreleased; next release `0.4.0` — `ARCHITECTURE.md` §4.17.1–§4.17.2)*. The engine never reports progress that is not durable. If a checkpoint it
+**Checkpoint write failures and conflicts** *(since `0.4.0` — `ARCHITECTURE.md` §4.17.1–§4.17.2)*. The engine never reports progress that is not durable. If a checkpoint it
 needs cannot be written, or the execution was changed by someone else while the call was in
 progress, the call returns a non-terminal `FAILED` with `terminal: false` and a machine-readable
 `failureCode` (the same field now also carries the two lock codes):
@@ -537,9 +537,9 @@ section 6.
 
 ---
 
-## 11. Upgrading from 0.3.x to 0.4.x (unreleased)
+## 11. Upgrading from 0.3.x to 0.4.x
 
-The next release after `0.3.0` is recommended as `0.4.0` (minor, pre-1.0): the public surface only grows,
+`0.4.0` is a minor, pre-1.0 release after `0.3.0`: the public surface only grows,
 the persisted `version` stays `1`, and `0.3.x` checkpoints and `void`-returning stores keep working. **One
 behaviour changes:** a failed checkpoint write used to be silently ignored and is now reported.
 

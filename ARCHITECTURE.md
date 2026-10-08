@@ -849,7 +849,7 @@ without atomic exclusive create (some network mounts) — the engine is limited 
 time out instead). `Coordinator` itself performs no locking, so a library caller driving it
 directly must hold the lock itself.
 
-#### 4.17.1 Checkpoint write failures (unreleased; next release `0.4.0`)
+#### 4.17.1 Checkpoint write failures (`0.4.0`)
 
 Through `0.3.0`, `Coordinator.checkpoint()` caught and ignored every `save()` error, so a turn
 could return an action, a result or a completion that the durable checkpoint did not contain
@@ -911,7 +911,7 @@ that is not durable.**
   documented path, and checks the final record (contiguous history, every dispatch matched by exactly one
   agent step, no step applied twice). 11 of its first 13 tests fail on `0.3.0`.
 
-#### 4.17.2 The storage contract, revisions and optimistic concurrency (unreleased)
+#### 4.17.2 The storage contract, revisions and optimistic concurrency (`0.4.0`)
 
 The Coordinator and every entry point are written against `ExecutionStateStore` and know nothing
 about files; the host `start()`/`resume()`/`status()` accept a `stateStore` like the pull and
