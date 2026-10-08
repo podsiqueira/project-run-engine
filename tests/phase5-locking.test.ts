@@ -19,7 +19,7 @@ import { statusProjectRun } from "../src/host/status.js";
 import { FileExecutionStateStore, withExecutionLock, type PersistedExecutionState } from "../src/project/state-store.js";
 import { runProjectInit } from "../src/project/bootstrap.js";
 import { MockRuntimeAdapter } from "../src/runtime/mock-runtime-adapter.js";
-import { ExecutionLockError, ExecutionLockTimeoutError, ExecutionLockUnavailableError, type AgentResult } from "../src/domain/types.js";
+import { ExecutionLockError, ExecutionLockTimeoutError, ExecutionLockUnavailableError, isExecutionLockFailure, type AgentResult } from "../src/domain/types.js";
 import type { ProjectRunStepResponse } from "../src/host/step-types.js";
 
 type ActionRequired = Extract<ProjectRunStepResponse, { status: "AGENT_ACTION_REQUIRED" }>;
@@ -78,6 +78,20 @@ if (mode === "increment") {
   }
   console.log("DIED_AFTER " + JSON.stringify({ stepId: r.stepId }));
   process.kill(process.pid, "SIGKILL");
+} else if (mode === "poll") {
+  // A second host that only ever calls plain next-step (the skill's documented recovery/poll call)
+  // against whichever execution is current, until told to stop.
+  const { nextProjectRunStep } = await import(arg.dist + "/host/project-run-step.js");
+  console.log("READY");
+  let n = 0;
+  while (!fs.existsSync(arg.stopFile)) {
+    let id = "";
+    try { id = fs.readFileSync(arg.currentFile, "utf8").trim(); } catch {}
+    if (!id) { await sleep(1); continue; }
+    await nextProjectRunStep({ projectRoot: arg.root, executionId: id });
+    n++;
+  }
+  console.log("COUNT " + n);
 } else if (mode === "next-at") {
   const { nextProjectRunStep } = await import(arg.dist + "/host/project-run-step.js");
   while (Date.now() < arg.startAt) await sleep(1);
@@ -1012,4 +1026,385 @@ describe("Phase 5 remediation F4 — each mutating entry point is individually l
     }
     expect(lockFiles(tmpDir)).toEqual([]);
   }, 90_000);
+});
+
+// =======================================================================================
+// Remediation 2 / N3 + N4: a call that turns out to need a mutation always takes the lock.
+// =======================================================================================
+describe("Phase 5 remediation 2 (N3/N4) — nextProjectRunStep never mutates without the lock", () => {
+  let tmpDir: string;
+  let real: FileExecutionStateStore;
+  type Base = Record<"awaiting" | "hitl" | "completed", PersistedExecutionState>;
+  let base: Base;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "p5-n3-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+    real = new FileExecutionStateStore(tmpDir);
+
+    // Realistic checkpoints produced by the real engine.
+    await nextProjectRunStep({ projectRoot: tmpDir, executionId: "m-await", runtime: "MOCK" });
+    const drive = async (id: string, stopAtHitl: boolean) => {
+      let r = await nextProjectRunStep({ projectRoot: tmpDir, executionId: id, runtime: "MOCK" });
+      for (let g = 0; g < 40 && r.status === "AGENT_ACTION_REQUIRED"; g++) {
+        const block = stopAtHitl && r.request.state === "ANALYZE";
+        r = await submitProjectRunStep({ projectRoot: tmpDir, executionId: id, stepId: r.stepId, result: resultFor(r, block ? "FINDINGS" : "PASS", block ? [{ id: "A", severity: "HIGH", status: "OPEN" }] : []) });
+      }
+      return r;
+    };
+    await drive("m-hitl", true);
+    await drive("m-done", false);
+    base = { awaiting: (await real.load("m-await"))!, hitl: (await real.load("m-hitl"))!, completed: (await real.load("m-done"))! };
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** A store that records every load/save/lock, and whether each save happened while the lock was held. */
+  function spy(script: (loadNumber: number) => PersistedExecutionState | null | "THROW") {
+    const log = { loads: 0, saves: 0, locks: 0, savesOutsideLock: 0, inLock: false };
+    const store = {
+      load: async () => {
+        log.loads++;
+        const r = script(log.loads);
+        if (r === "THROW") throw new Error("EMFILE: too many open files (transient)");
+        return r;
+      },
+      save: async (s: PersistedExecutionState) => {
+        log.saves++;
+        if (!log.inLock) log.savesOutsideLock++;
+        return real.save(s);
+      },
+      exists: (id: string) => real.exists(id),
+      withLock: async <T>(id: string, fn: () => Promise<T>, o?: Parameters<FileExecutionStateStore["withLock"]>[2]) => {
+        log.locks++;
+        return real.withLock(id, async () => {
+          log.inLock = true;
+          try { return await fn(); } finally { log.inLock = false; }
+        }, o);
+      },
+    };
+    return { store, log };
+  }
+
+  const withState = (b: PersistedExecutionState, patch: Partial<PersistedExecutionState>): PersistedExecutionState => ({ ...b, ...patch });
+  const answersFor = (b: PersistedExecutionState) => (b.human_intervention?.questions ?? []).map((q) => ({ questionId: q.id, answer: "x" }));
+
+  it("matrix: pure-read states take no lock and write nothing; every state that mutates takes the lock first and writes only inside it", async () => {
+    const inProgress = withState(base.awaiting, { lifecycle_status: "IN_PROGRESS", pending_action: undefined });
+    const failedState = withState(base.awaiting, { lifecycle_status: "FAILED", pending_action: undefined, terminal_reason: "boom" });
+    const unknown = withState(base.awaiting, { lifecycle_status: "SOMETHING_NEW" as never, pending_action: undefined });
+    const cases: Array<{ name: string; id: string; persisted: PersistedExecutionState | null; humanAnswers?: ReturnType<typeof answersFor>; mutates: boolean; expect: string }> = [
+      { name: "AWAITING_AGENT_ACTION", id: "m-await", persisted: base.awaiting, mutates: false, expect: "AGENT_ACTION_REQUIRED" },
+      { name: "HUMAN_INTERVENTION_REQUIRED, no answers", id: "m-hitl", persisted: base.hitl, mutates: false, expect: "HUMAN_INTERVENTION_REQUIRED" },
+      { name: "COMPLETED", id: "m-done", persisted: base.completed, mutates: false, expect: "COMPLETED" },
+      { name: "FAILED", id: "m-await", persisted: failedState, mutates: false, expect: "FAILED" },
+      { name: "HUMAN_INTERVENTION_REQUIRED with answers", id: "m-hitl", persisted: base.hitl, humanAnswers: answersFor(base.hitl), mutates: true, expect: "AGENT_ACTION_REQUIRED" },
+      { name: "IN_PROGRESS (recovery)", id: "m-await", persisted: inProgress, mutates: true, expect: "AGENT_ACTION_REQUIRED" },
+      { name: "not persisted yet, explicit id", id: "m-new", persisted: null, mutates: true, expect: "AGENT_ACTION_REQUIRED" },
+      { name: "an unrecognised lifecycle status (conservative)", id: "m-await", persisted: unknown, mutates: true, expect: "AGENT_ACTION_REQUIRED" },
+    ];
+    for (const c of cases) {
+      const { store, log } = spy(() => c.persisted);
+      const r = await nextProjectRunStep({ projectRoot: tmpDir, executionId: c.id, runtime: "MOCK", humanAnswers: c.humanAnswers, stateStore: store as never });
+      expect(r.status, c.name).toBe(c.expect);
+      expect(log.savesOutsideLock, `${c.name}: checkpoint writes outside the lock`).toBe(0);
+      if (c.mutates) {
+        expect(log.locks, `${c.name}: lock acquisitions`).toBe(1);
+        expect(log.saves, `${c.name}: it should have written`).toBeGreaterThan(0);
+      } else {
+        expect(log.locks, `${c.name}: lock acquisitions`).toBe(0);
+        expect(log.saves, `${c.name}: writes`).toBe(0);
+      }
+    }
+  });
+
+  it("the original race: the checkpoint reads as AWAITING and BECOMES IN_PROGRESS right after — the call answers from what it read and never acts on the later state", async () => {
+    const inProgress = withState(base.awaiting, { lifecycle_status: "IN_PROGRESS", pending_action: undefined });
+    const { store, log } = spy((n) => (n === 1 ? base.awaiting : inProgress));
+    const r = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "m-await", stateStore: store as never });
+    expect(r.status === "AGENT_ACTION_REQUIRED" && r.stepId).toBe(base.awaiting.pending_action!.step_id);
+    expect(log).toMatchObject({ loads: 1, locks: 0, saves: 0, savesOutsideLock: 0 });
+  });
+
+  it("when the read shows a mutation is needed, the work is re-evaluated from the checkpoint as it is UNDER the lock (another host may have finished it)", async () => {
+    const inProgress = withState(base.awaiting, { lifecycle_status: "IN_PROGRESS", pending_action: undefined });
+    // First (unlocked) read: IN_PROGRESS. By the time the lock is held, another host has issued the next action.
+    const { store, log } = spy((n) => (n === 1 ? inProgress : base.awaiting));
+    const r = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "m-await", stateStore: store as never });
+    expect(r.status === "AGENT_ACTION_REQUIRED" && r.stepId).toBe(base.awaiting.pending_action!.step_id); // adopted, not re-decided
+    expect(log.locks).toBe(1);
+    expect(log.loads).toBeGreaterThanOrEqual(2);
+    expect(log.saves).toBe(0); // nothing left to do once locked
+  });
+
+  it("suspension + answers: the answers are applied only under the lock, and are NOT applied if another host already resumed it meanwhile", async () => {
+    const answers = answersFor(base.hitl);
+    const a = spy(() => base.hitl);
+    const applied = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "m-hitl", humanAnswers: answers, stateStore: a.store as never });
+    expect(applied.status).toBe("AGENT_ACTION_REQUIRED");
+    expect(a.log).toMatchObject({ locks: 1, savesOutsideLock: 0 });
+    expect(a.log.saves).toBeGreaterThan(0);
+
+    const b = spy((n) => (n === 1 ? base.hitl : withState(base.awaiting, { execution_id: base.hitl.execution_id })));
+    const moved = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "m-hitl", humanAnswers: answers, stateStore: b.store as never });
+    expect(moved.status).toBe("AGENT_ACTION_REQUIRED");
+    expect(b.log).toMatchObject({ locks: 1, saves: 0, savesOutsideLock: 0 }); // answers recorded once, by whoever got there first
+  });
+
+  it("N4: a read that fails is reported as the existing structured failure — it can never fall through into an unlocked mutation", async () => {
+    const inProgress = withState(base.awaiting, { lifecycle_status: "IN_PROGRESS", pending_action: undefined });
+    for (const script of [
+      (n: number) => (n === 1 ? ("THROW" as const) : inProgress), // transient failure, then a mutating state
+      () => "THROW" as const,
+    ]) {
+      const { store, log } = spy(script);
+      const r = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "m-await", stateStore: store as never });
+      expect(r.status).toBe("FAILED");
+      expect(r.status === "FAILED" && r.failureReason).toContain("EMFILE");
+      expect(log).toMatchObject({ loads: 1, locks: 0, saves: 0, savesOutsideLock: 0 }); // no second read, no lock, no write
+    }
+  });
+
+  it("a held lock still refuses an escalated call with the structured EXECUTION_LOCKED, reporting the state it read", async () => {
+    const impatient = new FileExecutionStateStore(tmpDir, undefined, { timeoutMs: 120, pollMs: 10 });
+    let release!: () => void;
+    const held = new FileExecutionStateStore(tmpDir).withLock("m-hitl", () => new Promise<void>((r) => (release = r)));
+    await new Promise((r) => setTimeout(r, 20));
+    const r = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "m-hitl", humanAnswers: answersFor(base.hitl), stateStore: impatient });
+    release();
+    await held;
+    expect(r.status === "FAILED" && r.failureReason).toMatch(/^EXECUTION_LOCKED:/);
+    expect(r.status === "FAILED" && r.terminal).toBe(false);
+    expect(r.status === "FAILED" && r.state).toBe(base.hitl.state);
+  });
+
+  it("two real processes — one submitting, one polling plain next-step — produce no spurious STALE_STEP and no dispatch/step mismatch", async () => {
+    const currentFile = path.join(tmpDir, "current");
+    const stopFile = path.join(tmpDir, "stop-poller");
+    fs.writeFileSync(currentFile, "");
+    const poller = runWorker("poll", { root: tmpDir, currentFile, stopFile });
+    let polled = "";
+    poller.stdout?.on("data", (d) => (polled += d));
+    await waitForLine(poller, "READY");
+
+    const failures: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      const id = `race-${i}`;
+      let r = await nextProjectRunStep({ projectRoot: tmpDir, executionId: id, runtime: "MOCK" });
+      fs.writeFileSync(currentFile, id);
+      while (r.status === "AGENT_ACTION_REQUIRED") {
+        r = await submitProjectRunStep({ projectRoot: tmpDir, executionId: id, stepId: r.stepId, result: resultFor(r) });
+        if (r.status === "FAILED") { failures.push(`${id}: ${r.failureReason.slice(0, 60)}`); break; }
+      }
+      fs.writeFileSync(currentFile, "");
+      const cp = (await real.load(id))!;
+      const dispatches = (cp.history ?? []).filter((h) => h.decision.action === "DISPATCH_AGENT");
+      const steps = (cp.step_log ?? []).filter((e) => e.kind === "AGENT_STEP");
+      if (r.status === "COMPLETED" && dispatches.length !== steps.length) failures.push(`${id}: ${dispatches.length} dispatch decisions vs ${steps.length} agent steps`);
+      if ((cp.history ?? []).some((h, k) => h.step !== k + 1)) failures.push(`${id}: history numbering broken`);
+    }
+    fs.writeFileSync(stopFile, "x");
+    await collect(poller);
+    expect(Number((polled.match(/COUNT (\d+)/) ?? [])[1] ?? 0)).toBeGreaterThan(0); // the poller really was running concurrently
+    expect(failures).toEqual([]);
+    expect(lockFiles(tmpDir)).toEqual([]);
+  }, 120_000);
+});
+
+// =======================================================================================
+// Remediation 2 (N2): lock failures are classified by structure, not by message text.
+// =======================================================================================
+describe("Phase 5 remediation 2 (N2) — engine lock failures vs operation-thrown lock errors", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "p5-n2-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const pass = (req: { execution_id: string; role: string; state: string }): AgentResult =>
+    ({ execution_id: req.execution_id, agent: req.role, state: req.state, status: "PASS", evidence: [], findings: [] }) as AgentResult;
+
+  /** An adapter that tries to lock the SAME execution from inside the turn (non-reentrant), as a careless integration might. */
+  function selfLockingAdapter(store: FileExecutionStateStore, id: string, kind: "timeout" | "unavailable" | "real") {
+    return new MockRuntimeAdapter(async (req) => {
+      if (kind === "timeout") throw new ExecutionLockTimeoutError(id);
+      if (kind === "unavailable") throw new ExecutionLockUnavailableError(id);
+      await store.withLock(id, async () => undefined, { timeoutMs: 150, pollMs: 10 }); // genuinely contends with the engine's own lock
+      return pass(req);
+    });
+  }
+
+  for (const kind of ["timeout", "unavailable", "real"] as const) {
+    it(`push: an ExecutionLockError thrown by the operation (${kind}) is a TERMINAL FAILED turn with a non-lock reason, and the checkpoint says FAILED`, async () => {
+      const store = new FileExecutionStateStore(tmpDir);
+      const result = await executeProjectRun({
+        projectRoot: tmpDir, executionId: "n2-op", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" },
+        adapters: [selfLockingAdapter(store, "n2-op", kind)], stateStore: store,
+      });
+      expect(result.status).toBe("FAILED");
+      expect(result.lockFailure).toBeUndefined();
+      expect(result.failureReason).toBeDefined();
+      expect(isExecutionLockFailure(result.failureReason)).toBe(false);
+      expect(result.failureReason).not.toMatch(/^EXECUTION_LOCK/);
+      expect(result.failureReason).toMatch(/lock error raised inside it/);
+      // The checkpoint reflects the operation's outcome, not "lock rejected, execution intact".
+      const cp = (await store.load("n2-op"))!;
+      expect(cp.lifecycle_status).toBe("FAILED");
+      expect(isExecutionLockFailure(cp.terminal_reason)).toBe(false);
+
+      // The host response for the same kind of failure is TERMINAL (an operation failure, not a rejected call).
+      const { startProjectRun } = await import("../src/host/project-run-host.js");
+      const hostStore = new FileExecutionStateStore(tmpDir);
+      const host = await startProjectRun({ projectRoot: tmpDir, executionId: "n2-op-host", runtime: "MOCK", adapters: [selfLockingAdapter(hostStore, "n2-op-host", kind)] });
+      expect(host.status).toBe("FAILED");
+      expect(host.terminal).toBe(true);
+      expect(host.failureReason).not.toMatch(/^EXECUTION_LOCK/);
+
+      // The FAILED execution stays FAILED and terminal on the next call — never reported as a retryable lock rejection.
+      const again = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "n2-op", runtime: "MOCK", stateStore: store });
+      expect(again.status).toBe("FAILED");
+      expect(again.status === "FAILED" && again.terminal).toBe(true);
+      expect(again.status === "FAILED" && isExecutionLockFailure(again.failureReason)).toBe(false);
+    });
+  }
+
+  it("a genuine acquisition failure keeps lockFailure + a non-terminal host response (EXECUTION_LOCKED and EXECUTION_LOCK_UNAVAILABLE)", async () => {
+    const store = new FileExecutionStateStore(tmpDir, undefined, { timeoutMs: 120, pollMs: 10 });
+    const adapter = new MockRuntimeAdapter((req) => pass(req));
+    const { startProjectRun } = await import("../src/host/project-run-host.js");
+
+    // EXECUTION_LOCKED: someone really holds the lock.
+    const held = store.withLock("n2-held", async () => {
+      const r = await executeProjectRun({ projectRoot: tmpDir, executionId: "n2-held", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter], stateStore: store });
+      expect(r.status).toBe("FAILED");
+      expect(r.lockFailure).toBe("EXECUTION_LOCKED");
+      expect(r.failureReason).toMatch(/^EXECUTION_LOCKED:/);
+      // (the host entry points share this code path; the non-terminal host mapping is asserted for UNAVAILABLE below)
+    }, { timeoutMs: 5_000 });
+    await held;
+
+    // EXECUTION_LOCK_UNAVAILABLE: runs dir unusable.
+    const runsPath = path.join(tmpDir, ".project-run", "runs");
+    fs.rmSync(runsPath, { recursive: true, force: true });
+    fs.writeFileSync(runsPath, "file");
+    const r = await executeProjectRun({ projectRoot: tmpDir, executionId: "n2-un", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter] });
+    expect(r.lockFailure).toBe("EXECUTION_LOCK_UNAVAILABLE");
+    expect(r.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+    const host = await startProjectRun({ projectRoot: tmpDir, executionId: "n2-un-host", runtime: "MOCK", adapters: [adapter] });
+    expect(host.status).toBe("FAILED");
+    expect(host.terminal).toBe(false);
+    expect(host.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+  });
+
+  it("a failureReason that merely LOOKS like a lock code is not a lock failure for a push turn (no prefix sniffing)", async () => {
+    const adapter = new MockRuntimeAdapter(() => { throw new Error("EXECUTION_LOCKED: pretending to be a lock failure"); });
+    const result = await executeProjectRun({ projectRoot: tmpDir, executionId: "n2-fake", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter] });
+    expect(result.status).toBe("FAILED");
+    expect(result.lockFailure).toBeUndefined();
+    const { startProjectRun } = await import("../src/host/project-run-host.js");
+    const host = await startProjectRun({ projectRoot: tmpDir, executionId: "n2-fake-host", runtime: "MOCK", adapters: [adapter] });
+    expect(host.status).toBe("FAILED");
+    expect(host.terminal).toBe(true); // an ordinary operation failure, whatever its text says
+    expect(host.failureReason).toMatch(/^EXECUTION_LOCKED:/); // text is preserved verbatim for ordinary errors
+  });
+
+  it("custom store: a lock error thrown BEFORE the operation starts maps to a structured failure; one thrown AFTER it ran propagates", async () => {
+    const real = new FileExecutionStateStore(tmpDir);
+    const before = {
+      save: real.save.bind(real), load: real.load.bind(real), exists: real.exists.bind(real),
+      withLock: async () => { throw new ExecutionLockTimeoutError("n2-c", "EXECUTION_LOCKED: custom store says busy"); },
+    };
+    const refused = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "n2-c", runtime: "MOCK", stateStore: before as never });
+    expect(refused.status).toBe("FAILED");
+    expect(refused.status === "FAILED" && refused.terminal).toBe(false);
+    expect(refused.status === "FAILED" && refused.failureReason).toBe("EXECUTION_LOCKED: custom store says busy");
+
+    let ran = 0;
+    const after = {
+      save: real.save.bind(real), load: real.load.bind(real), exists: real.exists.bind(real),
+      withLock: async <T>(_id: string, fn: () => Promise<T>) => { await fn(); ran++; throw new ExecutionLockTimeoutError("n2-c", "EXECUTION_LOCKED: release failed"); },
+    };
+    const adapter = new MockRuntimeAdapter((req) => pass(req));
+    await expect(
+      executeProjectRun({ projectRoot: tmpDir, executionId: "n2-d", runtime: "MOCK", context: { state: "INTAKE", runtime: "MOCK" }, adapters: [adapter], stateStore: after as never }),
+    ).rejects.toBeInstanceOf(ExecutionLockError);
+    expect(ran).toBe(1);
+  });
+});
+
+// =======================================================================================
+// Remediation 2 (N1): the very first next-step must not issue an action it cannot persist.
+// =======================================================================================
+describe("Phase 5 remediation 2 (N1) — first next-step with an unusable runs directory", () => {
+  let tmpDir: string;
+  let runsPath: string;
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "p5-n1-"));
+    await runProjectInit({ projectRoot: tmpDir, silent: true });
+    setUpProject(tmpDir);
+    runsPath = path.join(tmpDir, ".project-run", "runs");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("without an executionId, a runs path that is a file yields a non-terminal EXECUTION_LOCK_UNAVAILABLE, not an action", async () => {
+    fs.rmSync(runsPath, { recursive: true, force: true });
+    fs.writeFileSync(runsPath, "not a directory");
+    const r = await nextProjectRunStep({ projectRoot: tmpDir, runtime: "MOCK" });
+    expect(r.status).toBe("FAILED");
+    if (r.status !== "FAILED") return;
+    expect(r.terminal).toBe(false);
+    expect(r.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+    expect(r.failureReason).toMatch(/first checkpoint/);
+  });
+
+  it("a store that silently drops saves cannot cause an action to be issued", async () => {
+    const real = new FileExecutionStateStore(tmpDir);
+    const dropping = {
+      save: async () => undefined, load: real.load.bind(real), exists: real.exists.bind(real),
+      withLock: real.withLock.bind(real),
+    };
+    const r = await nextProjectRunStep({ projectRoot: tmpDir, runtime: "MOCK", stateStore: dropping as never });
+    expect(r.status).toBe("FAILED");
+    expect(r.status === "FAILED" && r.terminal).toBe(false);
+    expect(r.status === "FAILED" && r.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+  });
+
+  it("normal fresh starts are unaffected (with and without an id), and the first checkpoint exists", async () => {
+    const a = await nextProjectRunStep({ projectRoot: tmpDir, runtime: "MOCK" });
+    expect(a.status).toBe("AGENT_ACTION_REQUIRED");
+    const b = await nextProjectRunStep({ projectRoot: tmpDir, executionId: "n1-id", runtime: "MOCK" });
+    expect(b.status).toBe("AGENT_ACTION_REQUIRED");
+    const real = new FileExecutionStateStore(tmpDir);
+    if (a.status === "AGENT_ACTION_REQUIRED") expect(await real.exists(a.executionId)).toBe(true);
+    expect(await real.exists("n1-id")).toBe(true);
+    expect(lockFiles(tmpDir)).toEqual([]);
+  });
+
+  it("the real CLI: next-step with no executionId prints one JSON line, exit 0, FAILED non-terminal EXECUTION_LOCK_UNAVAILABLE", () => {
+    fs.rmSync(runsPath, { recursive: true, force: true });
+    fs.writeFileSync(runsPath, "not a directory");
+    const cli = path.join(distDir(), "cli", "project-run-cli.js");
+    const out = spawnSync(process.execPath, [cli, "engine", "next-step", "--json", JSON.stringify({ runtime: "MOCK" }), "--dir", tmpDir], { encoding: "utf8" });
+    expect(out.status, out.stderr).toBe(0);
+    expect(out.stderr).toBe("");
+    const lines = out.stdout.trim().split("\n");
+    expect(lines).toHaveLength(1);
+    const body = JSON.parse(lines[0]);
+    expect(body.status).toBe("FAILED");
+    expect(body.terminal).toBe(false);
+    expect(body.failureReason).toMatch(/^EXECUTION_LOCK_UNAVAILABLE:/);
+  });
 });

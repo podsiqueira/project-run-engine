@@ -10,7 +10,8 @@ import type {
   ExecutionStepRecord,
   HostExecutionOptions,
 } from "../domain/types.js";
-import { ExecutionLockError } from "../domain/types.js";
+import type { ExecutionLockError, ExecutionLockFailureCode } from "../domain/types.js";
+import { operationFailureReason, runLockedTurn } from "./locked-turn.js";
 import type {
   CoordinatorExecutionContext,
   DecisionRecord,
@@ -39,7 +40,6 @@ import {
   type ExecutionStateStore,
   type PersistedExecutionState,
   FileExecutionStateStore,
-  withExecutionLock,
 } from "./state-store.js";
 
 export interface ProjectRunOptions {
@@ -87,6 +87,13 @@ export interface ProjectRunExecutionResult {
   stepLog?: ExecutionStepRecord[];
   /** The execution's durable decision history as of this call's end (including prior resumes). */
   decisionHistory?: DecisionRecord[];
+  /**
+   * Set ONLY when the engine could not obtain the execution's lock for this call: nothing ran
+   * and the execution is untouched. This explicit field — not the text of `failureReason` — is
+   * what distinguishes a rejected call from a failed one; a lock error raised inside the run
+   * itself is an ordinary failure and leaves this unset.
+   */
+  lockFailure?: ExecutionLockFailureCode;
 }
 
 export interface ProjectResumeOptions {
@@ -276,12 +283,8 @@ export async function executeProjectRun(
   if (!executionId) return executeProjectRunUnlocked(options);
 
   const stateStore = options.stateStore ?? new FileExecutionStateStore(options.projectRoot ?? process.cwd());
-  try {
-    return await withExecutionLock(stateStore, executionId, () => executeProjectRunUnlocked({ ...options, stateStore }));
-  } catch (err) {
-    if (err instanceof ExecutionLockError) return lockedResult(context, err);
-    throw err;
-  }
+  const turn = await runLockedTurn(stateStore, executionId, () => executeProjectRunUnlocked({ ...options, stateStore }));
+  return turn.acquired ? turn.value : lockedResult(context, turn.error);
 }
 
 function lockedResult(context: CoordinatorExecutionContext, err: ExecutionLockError): ProjectRunExecutionResult {
@@ -292,6 +295,7 @@ function lockedResult(context: CoordinatorExecutionContext, err: ExecutionLockEr
     stepsCount: 0,
     history: [],
     failureReason: err.message,
+    lockFailure: err.code,
   };
 }
 
@@ -459,7 +463,7 @@ async function executeProjectRunUnlocked(
       agentExecuted: false,
       stepsCount: 0,
       history: [],
-      failureReason: (err as Error).message,
+      failureReason: operationFailureReason(err),
       stepLog: context.stepLog,
       decisionHistory: context.history,
     };
@@ -678,14 +682,8 @@ export async function executeProjectResume(
   const stateStore = options.stateStore ?? new FileExecutionStateStore(projectRoot);
   // The whole turn — load, answer persistence, and the run loop — is one read-modify-
   // write of this execution, so it is one lock hold. Re-entry goes to the unlocked run.
-  try {
-    return await withExecutionLock(stateStore, options.executionId, () => resumeUnlocked(options, projectRoot, stateStore));
-  } catch (err) {
-    if (err instanceof ExecutionLockError) {
-      return lockedResult({ state: "HUMAN_INTERVENTION_REQUIRED" }, err);
-    }
-    throw err;
-  }
+  const turn = await runLockedTurn(stateStore, options.executionId, () => resumeUnlocked(options, projectRoot, stateStore));
+  return turn.acquired ? turn.value : lockedResult({ state: "HUMAN_INTERVENTION_REQUIRED" }, turn.error);
 }
 
 async function resumeUnlocked(

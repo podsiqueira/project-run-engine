@@ -8,7 +8,7 @@
 // engine's existing internal shapes, so the CLI and any future host integration can
 // share a single, machine-readable, non-CLI-output-parsing entry point.
 
-import { countAgentSteps, isExecutionLockFailure, type ExecutionStepRecord, type AgentDispatchRequest, type AgentResult, type StructuredFinding } from "../domain/types.js";
+import { countAgentSteps, type ExecutionStepRecord, type AgentDispatchRequest, type AgentResult, type StructuredFinding } from "../domain/types.js";
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
 import type { HostExecutionOptions } from "../runtime/host-execution-contract.js";
 import type { StepRecord } from "../coordinator/coordinator.js";
@@ -211,9 +211,10 @@ async function buildHostResponse(
       });
       return {
         status: "FAILED",
-        // A lock failure (EXECUTION_LOCKED / EXECUTION_LOCK_UNAVAILABLE) rejects THIS call
-        // only; the execution and its checkpoint are untouched.
-        terminal: !isExecutionLockFailure(result.failureReason),
+        // Only an engine-generated lock failure (set explicitly by the engine when it could not
+        // obtain the lock) rejects THIS call alone with the execution untouched. Any other
+        // failure — including a lock error raised inside the run — has failed the execution.
+        terminal: result.lockFailure === undefined,
         executionId,
         state,
         stepsCount,

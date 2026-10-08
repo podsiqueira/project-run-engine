@@ -20,6 +20,7 @@ import type {
 import { CoordinatorDecisionEngine } from "../decision/decision-engine.js";
 import { deriveHumanQuestions, type HumanInterventionRequired } from "../decision/human-intervention.js";
 import { AgentDispatcher } from "../agents/agent-dispatcher.js";
+import { operationFailureReason } from "../project/locked-turn.js";
 import type {
   ExecutionLifecycleState,
   ExecutionStateStore,
@@ -555,7 +556,7 @@ export class Coordinator {
         `Coordinator execution exceeded maximum step limit of ${this.maxSteps} steps. Terminal state was not reached.`,
       );
     } catch (err) {
-      await this.checkpoint(context, "FAILED", undefined, (err as Error).message);
+      await this.checkpoint(context, "FAILED", undefined, operationFailureReason(err));
       throw err;
     }
   }
