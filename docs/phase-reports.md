@@ -186,5 +186,20 @@ detail, ownership, and tests are in `docs/backlog.md`:
   export map and consumer guide document the new public API (F8). While verifying exports,
   the README's `/decision` subpath row was found to describe a subpath that has never been
   published, and was corrected.
+- **Review remediation 2** (findings N1–N5 of the independent release review; no change to
+  the contract above): `nextProjectRunStep` could classify a call as read-only from one
+  read and then mutate on a second, unlocked read (N3, high) — reproduced deterministically
+  and as spurious `STALE_STEP`s under two-process polling/submission. It now runs a
+  structurally read-only pass and, only if that finds it must mutate, takes the lock and
+  re-decides from a fresh read taken under it. A read that throws can no longer fall
+  through to an unlocked mutation (N4). Lock failures are told apart from operation errors
+  structurally rather than by message prefix (N2, `lockFailure` + `runLockedTurn`). A first
+  `next-step` without an id confirms the first checkpoint was written before issuing an
+  action (N1). `PACKAGING.md` commands corrected for the standalone repository (N5).
+  This added 17 locking tests (N3/N4 7, N2 6, N1 4), so Phase 5 now has **63** tests
+  (history 9, locking 54) and the full suite is **247** tests in 28 files. Mutation-checked:
+  removing the lock re-entry, letting the read pass mutate, letting a failed read fall
+  through to the locked path, restoring prefix classification, and dropping the
+  first-checkpoint check each make a test fail.
 - **Status**: IMPLEMENTED in source, validated, review remediation applied; **unreleased**
   (release is a separate step: the next version must be `0.3.0`).

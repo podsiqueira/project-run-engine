@@ -289,7 +289,11 @@ CLI still prints exactly one JSON line); the execution is untouched:
 | `failureReason` starts with | Meaning | What to do |
 |---|---|---|
 | `EXECUTION_LOCKED:` | Another live operation held the lock for the whole wait (default 30 s). | Repeat the **same** call after a moment. |
-| `EXECUTION_LOCK_UNAVAILABLE:` | The filesystem refused the lock itself: `.project-run/runs` is missing, not a directory, not writable, or the disk is full. | Fix the environment, then retry. Retrying alone will not help. |
+| `EXECUTION_LOCK_UNAVAILABLE:` | The filesystem refused the lock itself: `.project-run/runs` is missing, not a directory, not writable, or the disk is full. A first `next-step` **without** an `executionId` reports the same code (no lock is involved; the first checkpoint could not be written, so no action is issued). | Fix the environment, then retry. Retrying alone will not help. |
+
+A lock error raised *inside* an operation (for example by an adapter that tries to lock the
+same execution from within a push-mode run) is **not** one of these: the turn fails as an ordinary
+terminal `FAILED`, its `failureReason` does not begin with a lock code, and the execution is not resumable.
 
 **Clearing a stale lock by hand.** The lock file is `.project-run/runs/<executionId>.lock`
 (named in the `EXECUTION_LOCKED` message). A lock left by a crashed process is reclaimed

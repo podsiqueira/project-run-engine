@@ -764,13 +764,25 @@ store that has no `withLock`) provides mutual exclusion for one execution's
 read-modify-write turn.
 
 - *What is locked* (one hold per turn, from the first read to the last checkpoint):
-  `submitProjectRunStep`; `nextProjectRunStep` when it can mutate (a new or `IN_PROGRESS`
-  execution, or a suspended one given `humanAnswers`); `executeProjectResume` /
+  `submitProjectRunStep`; `nextProjectRunStep` whenever it turns out to mutate (a new or
+  `IN_PROGRESS` execution, or a suspended one given `humanAnswers`); `executeProjectResume` /
   `resumeProjectRun`; `executeProjectRun` / `startProjectRun` when an execution id is
   supplied. *What is not locked:* `status()`, and every pure-read `nextProjectRunStep`
   path (returning the pending action, reporting a suspension or a terminal state), so
   observers never wait behind a writer; and a call with no `executionId`, whose freshly
   minted id nobody else can know yet.
+- *`nextProjectRunStep` is read-first, lock-on-demand.* With an `executionId` it first runs
+  a **read pass** against a view of the store whose `save()` throws, so that pass cannot
+  write by construction. If everything it needs is already answerable from the checkpoint
+  it read, that is the result (no lock). If it finds it must mutate — an `IN_PROGRESS`
+  checkpoint to recover, a suspension with answers, an execution not yet persisted, or a
+  lifecycle it does not recognise — it does **not** act on that read: it acquires the
+  execution lock and re-runs the whole decision against a **fresh** read taken under the
+  lock (the checkpoint may have changed in between; e.g. another host's `submit` writes
+  `IN_PROGRESS` transiently, which is that host's to finish, not this call's to recover).
+  A read that throws is reported as a structured `FAILED`; it never falls through to a
+  mutation. If the lock cannot be obtained, the call returns the lock failure below,
+  untouched.
 - *Scope:* one lock file per execution (`<runsDir>/<id>.lock`), so different executions
   never contend. The engine takes it only at the outermost entry points and runs the
   inner steps unlocked; it is **not re-entrant** (an adapter that calls back into the
@@ -792,8 +804,22 @@ read-modify-write turn.
   - `EXECUTION_LOCK_UNAVAILABLE` (`ExecutionLockUnavailableError`) — the filesystem
     refused the lock itself (runs directory missing/not a directory/not writable, disk
     full, ...). Retrying will not help until the environment is fixed.
-  Only failures *from acquisition* are mapped: an error thrown by the locked operation, or
-  by a custom store's own `withLock`, propagates unchanged. *Difference from `0.2.0`:* with
+  Only failures *from acquisition* are mapped, and they are recognised **structurally**: the
+  engine records whether the locked operation had started (`runLockedTurn`), so an
+  `ExecutionLockError` raised *before* it started means "lock not obtained", and anything
+  thrown after it started — including a lock error raised by the operation itself, such as
+  an adapter that locks its own execution — is the operation's failure. Push results carry
+  this as `ProjectRunExecutionResult.lockFailure` (set only for genuine acquisition
+  failures); the host response is non-terminal iff it is set. An operation-thrown lock error
+  fails the turn as an ordinary terminal `FAILED` (the checkpoint is marked `FAILED`) with a
+  `failureReason` that does not begin with a lock code (it reads "The operation was aborted
+  by a lock error raised inside it (EXECUTION_LOCKED): ..."), so a host that reacts to the
+  codes by prefix is never told to retry something that actually failed. Errors from a
+  custom store's `withLock` raised after the operation ran propagate unchanged.
+  *First checkpoint:* a `nextProjectRunStep` without an `executionId` cannot take a lock,
+  so before issuing the first action it confirms the first checkpoint exists; if the
+  runs directory is unusable it returns the same non-terminal `EXECUTION_LOCK_UNAVAILABLE`
+  failure instead of an action that could never be submitted. *Difference from `0.2.0`:* with
   an unusable runs directory `0.2.0` ran best-effort without persisting, and 0.3 refuses
   with `EXECUTION_LOCK_UNAVAILABLE` — a deliberate fail-closed choice, since proceeding
   unlocked would silently defeat the guarantee. A holder whose process has died is

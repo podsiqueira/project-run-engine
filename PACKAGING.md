@@ -22,6 +22,7 @@ project-run-engine/
 │   ├── skills/
 │   ├── presets/
 │   ├── project/
+│   ├── host/
 │   └── templates/skills/     # Compiled/copied offline skill templates
 ├── templates/skills/         # Canonical offline Spec-Kit skill templates
 ├── src/                      # TypeScript sources
@@ -84,6 +85,11 @@ project-run-engine/
       "types": "./dist/project/index.d.ts",
       "import": "./dist/project/index.js",
       "default": "./dist/project/index.js"
+    },
+    "./host": {
+      "types": "./dist/host/index.d.ts",
+      "import": "./dist/host/index.js",
+      "default": "./dist/host/index.js"
     }
   }
 }
@@ -113,35 +119,30 @@ During execution, `project-run-engine` checkpoints state to `.project-run/runs/<
 
 ## 4. Build & Clean
 
-To build the package:
+This repository is the package root; every command below runs from the repository root (the directory containing `package.json`). Install dependencies first with `npm ci`.
 
 ```bash
-cd packages/project-run-engine
-npm run build
+npm run build       # clean (prebuild), compile with tsconfig.build.json, copy templates/ into dist/, chmod the CLI
+npm run clean       # remove dist/
 ```
 
-Or from repository root:
-
-```bash
-npx tsc -p packages/project-run-engine/tsconfig.build.json
-```
+`npm run build` is the single supported way to produce `dist/`; it cleans first (`prebuild`), so a stale `dist/` can never leak into the package.
 
 ---
 
 ## 5. Verification Before Release
 
-Run the test suite to verify:
+Run all of these from the repository root. Each must pass; none publishes anything.
 
 ```bash
-npx vitest run packages/project-run-engine/tests
+npm run typecheck   # tsc --noEmit over src/ and tests/ (tsconfig.json)
+npm test            # vitest run — the whole suite, including the compiled-package and multi-process tests
+npm run build       # production build (see section 4); the locking/CLI tests also compile into a temporary directory
+git diff --check    # no whitespace errors in the working tree
+npm pack --dry-run  # lists exactly what would be published (dist/, templates/, LICENSE and the *.md files in "files")
 ```
 
-To verify pack archive contents without publishing:
-
-```bash
-cd packages/project-run-engine
-npm pack --dry-run
-```
+`npm test` requires the build tooling only (`tsc` is a dev dependency); it does not need a prior `npm run build`. Run the tests *before* the final build so the build output is not left half-validated, and run `npm pack --dry-run` *after* `npm run build` so the listing reflects the fresh `dist/`.
 
 ---
 
@@ -149,4 +150,4 @@ npm pack --dry-run
 
 `@incito-labs/project-run-engine` is published to the public npm registry (`"publishConfig": { "access": "public" }`). Versions `0.1.0`, `0.1.1` and `0.2.0` have been published so far.
 
-A release is prepared and published by a maintainer from an authenticated session, after the verification in section 5 (tests, typecheck, build and `npm pack --dry-run`). The version bump (`package.json` and `package-lock.json`) is committed on its own before publishing, and a published version is never modified. The sandboxed environments used for implementation work so far have held no npm credentials, so they prepared releases and a maintainer published them.
+A release is prepared and published by a maintainer from an authenticated session, after the verification in section 5 (typecheck, tests, build, `git diff --check` and `npm pack --dry-run`). The version bump (`package.json` and `package-lock.json`) is committed on its own before publishing, and a published version is never modified. The sandboxed environments used for implementation work so far have held no npm credentials, so they prepared releases and a maintainer published them.
