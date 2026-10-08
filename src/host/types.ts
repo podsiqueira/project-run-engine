@@ -27,6 +27,7 @@ import type {
   StructuredFinding,
 } from "../domain/types.js";
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
+import type { ExecutionStateStore } from "../project/state-store.js";
 import type { DecisionRecord } from "../decision/types.js";
 import type { ProjectWorkflowConfig } from "../project/project-config.js";
 import type { HumanAnswer, HumanInterventionRequired } from "../decision/human-intervention.js";
@@ -53,6 +54,11 @@ export interface ProjectRunHostRequest {
   configPath?: string;
   executionOptions?: HostExecutionOptions;
   maxSteps?: number;
+  /**
+   * Where executions are persisted. Defaults to the file store under `<projectRoot>/.project-run/runs`.
+   * Any `ExecutionStateStore` works — the engine is storage-neutral (see its contract).
+   */
+  stateStore?: ExecutionStateStore;
   /** Optional progress/event sink — see `ProjectRunEvent` in `./events.js`. */
   onEvent?: (event: ProjectRunEvent) => void | Promise<void>;
 }
@@ -71,12 +77,16 @@ export interface ProjectRunResumeRequest {
    * HUMAN_INTERVENTION_REQUIRED suspension. See `ProjectRunHostResponse.humanIntervention`.
    */
   humanAnswers?: HumanAnswer[];
+  /** Where the execution is persisted; must be the store `start()` used. Defaults to the file store. */
+  stateStore?: ExecutionStateStore;
   onEvent?: (event: ProjectRunEvent) => void | Promise<void>;
 }
 
 export interface ProjectRunStatusRequest {
   executionId: string;
   projectRoot?: string;
+  /** Where the execution is persisted; must be the store used to start it. Defaults to the file store. */
+  stateStore?: ExecutionStateStore;
 }
 
 /**

@@ -297,7 +297,7 @@ async function nextProjectRunStepImpl(
           if (!reconstructed.ok) {
             return failed(persisted.execution_id, reconstructed.state, reconstructed.failureReason);
           }
-          return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps);
+          return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps, reconstructed.baseRevision);
         }
 
         case "COMPLETED":
@@ -326,7 +326,7 @@ async function nextProjectRunStepImpl(
           if (!reconstructed.ok) {
             return failed(persisted.execution_id, reconstructed.state, reconstructed.failureReason);
           }
-          return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps);
+          return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps, reconstructed.baseRevision);
         }
       }
     }
@@ -363,7 +363,7 @@ async function nextProjectRunStepImpl(
   }
 
   try {
-    return await confirmFirstCheckpoint(await runPrepare(context, config, projectRoot, stateStore, request.maxSteps), stateStore);
+    return await confirmFirstCheckpoint(await runPrepare(context, config, projectRoot, stateStore, request.maxSteps, 0), stateStore);
   } catch (err) {
     // Nothing durable exists yet: the very first checkpoint could not be written. Report it as
     // the documented "runs directory unusable" failure (same as the unwritable-dir case that
@@ -555,7 +555,7 @@ async function submitProjectRunStepUnlocked(
     },
   };
 
-  const coordinator = buildStepCoordinator(persisted.execution_id, projectRoot, config, persisted, stateStore, request.maxSteps);
+  const coordinator = buildStepCoordinator(persisted.execution_id, projectRoot, config, persisted, stateStore, request.maxSteps, persisted.revision ?? 0);
 
   // Apply the host's result exactly as a real dispatch would have — this is the one
   // place the engine ever "believes" what the host reports, and it does so by
@@ -590,6 +590,7 @@ function buildStepCoordinator(
   persisted: { project: string; feature: string; branch: string; runtime: string; preset: string } | undefined,
   stateStore: ExecutionStateStore,
   maxSteps: number | undefined,
+  baseRevision: number,
 ): Coordinator {
   const { validator, registry } = buildEngineServices(projectRoot, config, {});
   // No real AgentRuntimeAdapter is ever registered: prepareNextAction()/
@@ -609,6 +610,7 @@ function buildStepCoordinator(
       branch: persisted?.branch ?? "",
       runtime: (persisted?.runtime as never) ?? config.runtime.default_runtime,
       preset: persisted?.preset ?? config.project.workflow_version ?? "spec-kit-v1",
+      baseRevision,
     },
   });
 }
@@ -619,9 +621,10 @@ async function runPrepare(
   projectRoot: string,
   stateStore: ExecutionStateStore,
   maxSteps: number | undefined,
+  baseRevision: number,
 ): Promise<ProjectRunStepResponse> {
   const executionId = context.execution_id ?? context.execution?.execution_id ?? "unknown";
-  const coordinator = buildStepCoordinator(executionId, projectRoot, config, undefined, stateStore, maxSteps);
+  const coordinator = buildStepCoordinator(executionId, projectRoot, config, undefined, stateStore, maxSteps, baseRevision);
 
   try {
     const prepared = await coordinator.prepareNextAction(context, maxSteps);

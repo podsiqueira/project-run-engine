@@ -305,7 +305,7 @@ export function isExecutionLockFailure(reason: string | undefined): boolean {
   return /^EXECUTION_LOCK(ED|_UNAVAILABLE):/.test(reason ?? "");
 }
 
-export type PersistenceFailureCode = "CHECKPOINT_WRITE_FAILED";
+export type PersistenceFailureCode = "CHECKPOINT_WRITE_FAILED" | "CHECKPOINT_CONFLICT";
 
 /** Every machine-readable failure code a response can carry in `failureCode`. */
 export type ExecutionFailureCode = ExecutionLockFailureCode | PersistenceFailureCode;
@@ -323,22 +323,60 @@ export type ExecutionFailureCode = ExecutionLockFailureCode | PersistenceFailure
  * write the engine required; never for a lock failure (see `ExecutionLockError`).
  */
 export class CheckpointWriteError extends Error {
-  readonly code: PersistenceFailureCode = "CHECKPOINT_WRITE_FAILED";
+  readonly code: PersistenceFailureCode;
   constructor(
     readonly executionId: string,
     /** The lifecycle status the failed checkpoint would have recorded. */
     readonly lifecycleStatus: string,
     readonly cause?: unknown,
+    /** For subclasses: a more specific code and message. */
+    refinement?: { code: PersistenceFailureCode; message: string },
   ) {
     const detail = cause instanceof Error ? cause.message : cause === undefined ? "unknown error" : String(cause);
     super(
-      `CHECKPOINT_WRITE_FAILED: The ${lifecycleStatus} checkpoint for execution '${executionId}' could not be written (${detail}). ` +
-        `The engine does not report progress that is not durable, so this call did not take effect beyond the last durable checkpoint, ` +
-        `and the execution is intact. Fix the storage problem (free disk space, permissions on '.project-run/runs'), then call next-step ` +
-        `(pull mode) or resume/start (push mode) again with the same executionId — it continues from the last durable checkpoint.`,
+      refinement?.message ??
+        `CHECKPOINT_WRITE_FAILED: The ${lifecycleStatus} checkpoint for execution '${executionId}' could not be written (${detail}). ` +
+          `The engine does not report progress that is not durable, so this call did not take effect beyond the last durable checkpoint, ` +
+          `and the execution is intact. Fix the storage problem (free disk space, permissions on '.project-run/runs'), then call next-step ` +
+          `(pull mode) or resume/start (push mode) again with the same executionId — it continues from the last durable checkpoint.`,
     );
+    this.code = refinement?.code ?? "CHECKPOINT_WRITE_FAILED";
     this.name = "CheckpointWriteError";
     Object.setPrototypeOf(this, CheckpointWriteError.prototype);
+  }
+}
+
+/**
+ * A store refused a checkpoint write because the execution was modified by someone else since
+ * this operation read it (optimistic concurrency: the write named the `expectedRevision` it was
+ * based on, and the stored revision differs). NOTHING was written; the other writer's checkpoint
+ * stands. This is a `CheckpointWriteError` (so every entry point already reports it, as a
+ * non-terminal failure) with its own code, because the right reaction differs: not "fix the
+ * storage", but "re-read — the execution moved on": call next-step / status to get the current state.
+ *
+ * Under the per-execution lock this cannot happen between cooperating engine calls; it is the
+ * safety net for when the lock did not hold (an operator deleted a live lock, a store without
+ * mutual exclusion, an engine that does not use the lock): the loser is rejected instead of
+ * silently overwriting the winner.
+ */
+export class CheckpointConflictError extends CheckpointWriteError {
+  constructor(
+    executionId: string,
+    lifecycleStatus: string,
+    readonly expectedRevision: number,
+    /** The revision actually stored. */
+    readonly actualRevision: number,
+  ) {
+    super(executionId, lifecycleStatus, undefined, {
+      code: "CHECKPOINT_CONFLICT",
+      message:
+        `CHECKPOINT_CONFLICT: Execution '${executionId}' was changed by another operation while this call was in progress ` +
+        `(this call was based on revision ${expectedRevision}; the stored revision is ${actualRevision}). ` +
+        `This call's changes were discarded and the other operation's checkpoint stands — nothing was overwritten. ` +
+        `Call next-step (pull mode) or status again to get the current state; do not retry a submission blindly.`,
+    });
+    this.name = "CheckpointConflictError";
+    Object.setPrototypeOf(this, CheckpointConflictError.prototype);
   }
 }
 

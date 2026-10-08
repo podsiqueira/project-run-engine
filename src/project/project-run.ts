@@ -61,6 +61,12 @@ export interface ProjectRunOptions {
   decisionEngine?: CoordinatorDecisionEngine;
   maxSteps?: number;
   onStep?: (record: StepRecord) => void | Promise<void>;
+  /**
+   * Internal plumbing for `executeProjectResume`: the revision of the checkpoint the resumed
+   * context was read from, so the run's writes are compare-and-swap from it. Leave unset when
+   * starting a run (the first write is then unconditional and later writes chain from it).
+   */
+  baseRevision?: number;
 }
 
 export type ProjectRunStatus =
@@ -462,6 +468,7 @@ async function executeProjectRunUnlocked(
       branch: context.execution?.branch ?? context.branch ?? "",
       runtime,
       preset: config.project.workflow_version ?? "spec-kit-v1",
+      baseRevision: options.baseRevision,
     },
     onStep: options.onStep,
   });
@@ -572,7 +579,14 @@ export interface ResumeContextOptions {
 }
 
 export type ResumeContextResult =
-  | { ok: true; context: CoordinatorExecutionContext; config: ProjectWorkflowConfig; persisted: PersistedExecutionState }
+  | {
+      ok: true;
+      context: CoordinatorExecutionContext;
+      config: ProjectWorkflowConfig;
+      persisted: PersistedExecutionState;
+      /** Revision of the checkpoint the context is based on (after any answer-record write): the Coordinator's `baseRevision`. */
+      baseRevision: number;
+    }
   | { ok: false; failureReason: string; state: CoordinatorState };
 
 /**
@@ -677,10 +691,13 @@ export async function reconstructResumeContext(
   }));
   const mergedAnswers = [...existingAnswers, ...newAnswers];
 
+  let baseRevision = persisted.revision ?? 0;
   if (newAnswers.length > 0) {
     try {
-      await stateStore.save({ ...persisted, human_answers: mergedAnswers });
+      const receipt = await stateStore.save({ ...persisted, human_answers: mergedAnswers }, { expectedRevision: baseRevision });
+      baseRevision = receipt && typeof receipt.revision === "number" ? receipt.revision : baseRevision;
     } catch (err) {
+      if (err instanceof CheckpointWriteError) throw err; // a refused compare-and-swap is already precise
       // Not swallowed: an answer the engine cannot record durably must not be acted on
       // (the agent would be re-dispatched on the strength of an answer that the audit
       // trail does not contain). Nothing was modified; retrying the same call is safe.
@@ -721,7 +738,7 @@ export async function reconstructResumeContext(
     executionOptions: options.executionOptions,
   };
 
-  return { ok: true, context, config, persisted };
+  return { ok: true, context, config, persisted, baseRevision };
 }
 
 export async function executeProjectResume(
@@ -786,6 +803,7 @@ async function resumeUnlocked(
     decisionEngine: options.decisionEngine,
     maxSteps: options.maxSteps,
     onStep: options.onStep,
+    baseRevision: reconstructed.baseRevision,
   });
 }
 
