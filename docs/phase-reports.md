@@ -202,8 +202,9 @@ detail, ownership, and tests are in `docs/backlog.md`:
   through to the locked path, restoring prefix classification, and dropping the
   first-checkpoint check each make a test fail.
 - **Status**: COMPLETE — implemented, validated, review remediation applied, independently
-  reviewed, and released as `0.3.0`. The pre-existing, undocumented-until-now limitation that
-  `Coordinator.checkpoint()` swallows `save()` failures remains open (`docs/backlog.md`).
+  reviewed, and released as `0.3.0`. `0.3.0` shipped with one documented, pre-existing limitation:
+  `Coordinator.checkpoint()` swallowed `save()` failures (NF-2). That is fixed after `0.3.0`, in the
+  unreleased `0.4.0` work (see [Post-0.3.0](#post-030--persistence-correctness-and-the-storage-contract)).
 
 ## Post-0.3.0 — Persistence correctness and the storage contract
 
@@ -228,8 +229,10 @@ detail, ownership, and tests are in `docs/backlog.md`:
   8–10 KB with compact history, no requirement — §4.17.4); a concrete database store (no backend or
   requirement); host integrations (sequenced after this release — `docs/backlog.md`); ENG-003 stays
   consumer-owned.
-- **Evidence**: `tests/checkpoint-save-failures.test.ts` (16), `tests/state-store-contract.test.ts` (29);
-  the full suite is **292** tests in 30 files. Mutation-checked in a scratch copy: 16 mutants of the new
+- **Evidence**: `tests/checkpoint-save-failures.test.ts` (16), `tests/state-store-contract.test.ts` (30),
+  `tests/public-api-surface.test.ts` (13: every published entry point imported from the built package and a
+  TypeScript consumer compiled against its declarations); the full suite is **306** tests in 31 files.
+  Mutation-checked in a scratch copy: 16 mutants of the new
   behaviour (swallowing a save error again, marking `FAILED` after a write failure, dropping the CAS check,
   the write guard, revision chaining, or the base revisions, un-fixing the `READY_FOR_PR` recovery, ...) are all killed.
   The two-process polling/submission stress and the randomized invariants are unchanged: 0 stale steps, 0
@@ -240,4 +243,24 @@ detail, ownership, and tests are in `docs/backlog.md`:
   `stateStore` on the host requests); schema `version` stays `1`; `0.3.0` checkpoints and
   `void`-returning stores keep working. One behaviour change: save errors that were silently ignored now
   surface — recommended version **`0.4.0`** (minor, pre-1.0). Details for consumers: `CONSUMER-GUIDE.md` §11.
+- **Release-review remediation** (`docs/project-run-engine-0.4.0-remediation.md`): an independent review found
+  no blocker; its two MEDIUM findings and five LOW ones were closed without changing runtime behaviour — the
+  push-`start` revision claim was corrected (the initial push start is unconditional, as in `0.3.0`),
+  `FileExecutionStateStore.save` is declared `Promise<void | ExecutionSaveReceipt>` so `0.3.0`-era subclasses
+  still compile, the public export surface got a consumer-level test, and the caveats on write-failure `state`,
+  at-least-once agent execution and the advisory `FAILED` marker were documented.
+- **Draft release notes for `0.4.0`** (unreleased; the release step turns these into the published notes):
+  - *Fixed — crash/restart recovery at completion.* An execution left `IN_PROGRESS` at `READY_FOR_PR` (a crash,
+    or a failed `COMPLETED` write, between the final transition and the completion checkpoint) was refused by
+    `resume` and `next-step` as "completed" and could never finish. It now recovers and completes exactly once.
+    Present in `0.3.0`.
+  - *Changed — failed checkpoint writes are reported.* Save errors that were silently ignored now surface as a
+    non-terminal `FAILED` with `failureCode: "CHECKPOINT_WRITE_FAILED"` (the call did not take effect beyond the
+    last durable checkpoint). Human answers that cannot be recorded are no longer acted on.
+  - *Added.* `failureCode` on `FAILED` responses (`EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`,
+    `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`); revisioned checkpoints and compare-and-swap writes
+    (`CheckpointConflictError`); `stateStore` on host `start`/`resume`/`status`; an exact CAS in the file store
+    (`<id>.cas` write guard).
+  - *Known limits.* The initial push `start` is not revision-protected; push agent work around a lost write is
+    at-least-once; the file store is single-machine only. See `ARCHITECTURE.md` §4.17.
 - **Status**: implemented, validated, documented; **not released** (release preparation is a separate step).

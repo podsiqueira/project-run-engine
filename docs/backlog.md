@@ -158,7 +158,7 @@ provisional — this repository has no formal severity taxonomy.
   friction; it would need to defer to the preset's own naming/numbering rather than
   invent one. Consumers: your host must seed `specs/<feature>/` (see the contract above).
 
-### ENG-002 — Final execution state loses findings and history — CLOSED (history persistence of decisions DEFERRED)
+### ENG-002 — Final execution state loses findings and history — CLOSED (decision-level history was deferred here, then RESOLVED in Phase 5)
 
 - **Status**: CLOSED for the audit-record gap; decision-level `history` was DEFERRED here
   and has since been resolved by Phase 5 (see above). **Severity**: HIGH (provisional, unchanged) — highest of
@@ -266,9 +266,9 @@ the one remaining best-effort write (the advisory terminal `FAILED` marker): `AR
 - The `README.md` persisted-state field list described names that never matched the code
   (`schema_version`, `current_state`, `timestamps`); corrected to the real fields with the
   revision work. The code was right; the documentation was wrong.
-- A TypeScript subclass of `FileExecutionStateStore` that overrides `save()` with a `Promise<void>`
-  return type no longer type-checks (the base now returns `{ revision }`); implementing
-  `ExecutionStateStore` yourself is unaffected.
+- (Resolved before release.) A TypeScript subclass of `FileExecutionStateStore` overriding `save()` with a
+  `Promise<void>` return type briefly failed to type-check once the base returned `{ revision }`; the base is
+  now declared `Promise<void | ExecutionSaveReceipt>` and a consumer-compile test pins that it compiles.
 
 ## Phase 5
 
