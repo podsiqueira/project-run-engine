@@ -307,8 +307,14 @@ export function isExecutionLockFailure(reason: string | undefined): boolean {
 
 export type PersistenceFailureCode = "CHECKPOINT_WRITE_FAILED" | "CHECKPOINT_CONFLICT";
 
+/**
+ * The `humanAnswers` supplied on resume were rejected as a whole (unknown question id, empty or
+ * conflicting answers); nothing was recorded and the execution is unchanged and still suspended.
+ */
+export type HumanAnswerFailureCode = "INVALID_HUMAN_ANSWERS";
+
 /** Every machine-readable failure code a response can carry in `failureCode`. */
-export type ExecutionFailureCode = ExecutionLockFailureCode | PersistenceFailureCode;
+export type ExecutionFailureCode = ExecutionLockFailureCode | PersistenceFailureCode | HumanAnswerFailureCode;
 
 /**
  * A checkpoint the engine needed to write could not be written (`ExecutionStateStore.save`

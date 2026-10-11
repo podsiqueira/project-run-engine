@@ -105,7 +105,7 @@ export interface ProjectRunStatusRequest {
  *   then reports it as `RUNNING` and `resume()` can still continue it. Rely on `status()` for the
  *   persisted lifecycle; see `ARCHITECTURE.md` §4.17.1.
  * - A `FAILED` response that carries `failureCode` (`EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`,
- *   `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`) is NOT terminal: see `terminal`.
+ *   `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`, `INVALID_HUMAN_ANSWERS`) is NOT terminal: see `terminal`.
  */
 export type ProjectRunHostStatus =
   | "RUNNING"
@@ -173,7 +173,8 @@ export interface ProjectRunHostResponse {
   /**
    * Present on a `FAILED` response for the failures a host can handle without reading
    * `failureReason`: `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE` and
-   * `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`. All are non-terminal (`terminal: false`): the
+   * `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT`, `INVALID_HUMAN_ANSWERS` (the `humanAnswers` were
+   * rejected as a whole; nothing was recorded). All are non-terminal (`terminal: false`): the
    * call did not take effect beyond the last durable checkpoint. For `CHECKPOINT_WRITE_FAILED`,
    * `stepLog` and `history` come from that last durable checkpoint, never from unsaved progress, and so
    * does `state` whenever the store can still be read after the failed write. If it cannot, `state`

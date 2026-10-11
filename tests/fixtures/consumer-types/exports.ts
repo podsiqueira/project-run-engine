@@ -16,6 +16,7 @@ import type {
   ExecutionSaveOptions,
   ExecutionSaveReceipt,
   ExecutionStateStore,
+  HumanAnswerFailureCode,
   PersistedExecutionState,
   PersistenceFailureCode,
   ProjectRunExecutionResult,
@@ -24,6 +25,7 @@ import type {
   ProjectRunResumeRequest,
   ProjectRunStatusRequest,
   ProjectRunStepResponse,
+  ResumeContextResult,
 } from "@incito-labs/project-run-engine";
 import {
   CheckpointConflictError as DomainConflict,
@@ -31,6 +33,7 @@ import {
 } from "@incito-labs/project-run-engine/domain";
 import type {
   ExecutionFailureCode as DomainFailureCode,
+  HumanAnswerFailureCode as DomainAnswerCode,
   PersistenceFailureCode as DomainPersistenceCode,
 } from "@incito-labs/project-run-engine/domain";
 import { FileExecutionStateStore as ProjectStore, withExecutionLock } from "@incito-labs/project-run-engine/project";
@@ -50,10 +53,40 @@ import type {
 } from "@incito-labs/project-run-engine/host";
 
 // The failure codes are one closed union, and the public responses carry them.
-const codes: ExecutionFailureCode[] = ["EXECUTION_LOCKED", "EXECUTION_LOCK_UNAVAILABLE", "CHECKPOINT_WRITE_FAILED", "CHECKPOINT_CONFLICT"];
+const codes: ExecutionFailureCode[] = ["EXECUTION_LOCKED", "EXECUTION_LOCK_UNAVAILABLE", "CHECKPOINT_WRITE_FAILED", "CHECKPOINT_CONFLICT", "INVALID_HUMAN_ANSWERS"];
 const persistence: PersistenceFailureCode[] = ["CHECKPOINT_WRITE_FAILED", "CHECKPOINT_CONFLICT"];
+const answerCodes: HumanAnswerFailureCode[] = ["INVALID_HUMAN_ANSWERS"];
 function failureCodes(step: ProjectRunStepResponse, host: ProjectRunHostResponse, push: ProjectRunExecutionResult): Array<ExecutionFailureCode | undefined> {
-  return [step.status === "FAILED" ? step.failureCode : undefined, host.failureCode, push.lockFailure ?? push.persistenceFailure];
+  return [step.status === "FAILED" ? step.failureCode : undefined, host.failureCode, push.lockFailure ?? push.persistenceFailure ?? push.answerFailure];
+}
+
+// Realistic handling of a rejected `humanAnswers` call, on each entry point: it is a non-terminal FAILED.
+function answersRejected(step: ProjectRunStepResponse, host: ProjectRunHostResponse, push: ProjectRunExecutionResult): boolean[] {
+  return [
+    step.status === "FAILED" && step.failureCode === "INVALID_HUMAN_ANSWERS" && !step.terminal,
+    host.status === "FAILED" && host.failureCode === "INVALID_HUMAN_ANSWERS" && !host.terminal,
+    push.status === "FAILED" && push.answerFailure === "INVALID_HUMAN_ANSWERS",
+  ];
+}
+// A consumer that switches over every failure code exhaustively (the `never` check is what a new code breaks).
+function advice(code: ExecutionFailureCode): string {
+  switch (code) {
+    case "EXECUTION_LOCKED":
+    case "EXECUTION_LOCK_UNAVAILABLE":
+      return "retry";
+    case "CHECKPOINT_WRITE_FAILED":
+    case "CHECKPOINT_CONFLICT":
+      return "read status";
+    case "INVALID_HUMAN_ANSWERS":
+      return "fix the answers";
+    default: {
+      const unhandled: never = code;
+      return unhandled;
+    }
+  }
+}
+function answerFailureOf(resumed: ResumeContextResult): HumanAnswerFailureCode | undefined {
+  return resumed.ok ? undefined : resumed.failureCode;
 }
 const decisions: DecisionRecord[] = [];
 
@@ -72,7 +105,7 @@ async function usesContract(store: ExecutionStateStore, state: PersistedExecutio
   return receipt ? receipt.revision : undefined;
 }
 const stores: Array<HostRequest["stateStore"] | HostResumeRequest["stateStore"] | HostStatusRequest["stateStore"] | ProjectStoreContract> = [new FileExecutionStateStore("."), new ProjectStore(".")];
-const sameTypes: [ProjectSaveOptions, ProjectSaveReceipt, ProjectPersisted, ProjectResult, HostStepResponse, DomainFailureCode, DomainPersistenceCode] | null = null;
+const sameTypes: [ProjectSaveOptions, ProjectSaveReceipt, ProjectPersisted, ProjectResult, HostStepResponse, DomainFailureCode, DomainPersistenceCode, DomainAnswerCode] | null = null;
 
-void [codes, persistence, failureCodes, decisions, classify, usesContract, stores, sameTypes, ExecutionLockError, ExecutionLockTimeoutError, ExecutionLockUnavailableError, nextProjectRunStep, startProjectRun, hostStart, statusProjectRun, withExecutionLock, PROJECT_ENGINE_RUN_TOOL_SCHEMA];
+void [codes, persistence, answerCodes, failureCodes, answersRejected, advice, answerFailureOf, decisions, classify, usesContract, stores, sameTypes, ExecutionLockError, ExecutionLockTimeoutError, ExecutionLockUnavailableError, nextProjectRunStep, startProjectRun, hostStart, statusProjectRun, withExecutionLock, PROJECT_ENGINE_RUN_TOOL_SCHEMA];
 export {};

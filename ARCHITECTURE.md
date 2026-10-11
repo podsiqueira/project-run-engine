@@ -231,6 +231,50 @@ responsible for the suspended state is always re-dispatched to independently ver
 the fix, consistent with the Finding Contract's principle that a finding is resolved
 only once independently re-verified, not merely because someone says it is fixed.
 
+Resume applies one policy, in both pull mode (`nextProjectRunStep` with `humanAnswers`) and push
+mode (`resume()`), because both reconstruct the execution through the same function:
+
+- `RE_REVIEW` and `CONVERGE` are always re-verified: the saved result is dropped and the agent
+  runs again.
+- `SPECIFY`, `CLARIFY`, `PLAN`, `TASKS`, `ANALYZE`, `IMPLEMENT`, `INDEPENDENT_REVIEW` and
+  `REMEDIATION` are re-verified when the saved result is still blocking (`BLOCKED`, `FAIL` or
+  blocking findings). A saved result that is already clean is kept.
+- Answers never clear a finding or advance the workflow; only a fresh accepted agent result does.
+  A fresh `BLOCKED` suspends again, and answers recorded earlier are kept.
+- A resume re-grants a fresh remediation budget (`remediation_iteration` back to 0) only for the
+  states above other than `REMEDIATION`. A blocked `REMEDIATION` keeps its counter, since a human
+  answer is not an exhausted remediation gate.
+- Push-mode `resume()` re-verifies a blocking suspension even when no answers are supplied; the
+  pull-mode step API only resumes when answers are present.
+
+The `humanAnswers` themselves are checked before anything is written (audit-trail quality and host
+feedback — the safety rules above do not depend on it). Under the execution's lock, against the
+checkpoint as just loaded:
+
+- every `questionId` must be a question of the execution's *current* suspension
+  (`human_intervention.questions`), so answers to an earlier suspension's questions are rejected. A
+  checkpoint that carries no persisted questions cannot be checked and skips this rule;
+- an answer must be a string with non-whitespace content and is recorded trimmed;
+- inside one call, identical answers to a question are recorded once and different answers to the same
+  question conflict;
+- one invalid entry rejects the whole call as a non-terminal `FAILED` with
+  `failureCode: "INVALID_HUMAN_ANSWERS"` (`failureReason` lists the problems — bounded: up to 20, ids clipped, answer text never echoed; push results also set
+  `answerFailure`). Nothing is recorded, no agent runs, and the execution stays suspended, so the
+  corrected call succeeds;
+- across calls nothing is deduplicated: each call appends, so a correction keeps the earlier answer
+  in the audit trail, and the latest answer for a question is the effective one;
+- answering only some of the questions is not validated: whether the work is acceptable is decided by
+  the re-dispatched agent's fresh result, never by the answers;
+- answers only apply to a suspension. The questions are dropped from the checkpoint once the execution
+  resumes, so answers supplied to an execution that is not suspended (already resumed and waiting for
+  its agent action, mid-sequence, or completed) are neither validated nor recorded — pull mode and push
+  `resume()` alike — and a host's retry of `resume(answers)` after a crash does not duplicate them;
+- racing calls are serialised by the execution's lock and validated against the checkpoint as the lock
+  holder sees it, so an invalid call never records anything, identical calls record once, and the
+  responsible agent is re-dispatched once. When two hosts answer *different* questions at the same
+  moment, the call that takes the lock wins; the other receives the pending action and its answers
+  are not recorded (it can read the suspension again with `status` and answer what is left).
+
 ### 4.3 Progress events
 
 A host supplies an optional `onEvent` callback to both `start()` and `resume()` to

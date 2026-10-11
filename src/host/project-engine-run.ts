@@ -145,6 +145,7 @@ export const PROJECT_ENGINE_RUN_TOOL_SCHEMA = {
       "EXECUTION_LOCK_UNAVAILABLE",
       "CHECKPOINT_WRITE_FAILED",
       "CHECKPOINT_CONFLICT",
+      "INVALID_HUMAN_ANSWERS",
     ],
     failure_code_semantics: {
       EXECUTION_LOCKED:
@@ -155,6 +156,8 @@ export const PROJECT_ENGINE_RUN_TOOL_SCHEMA = {
         "The store rejected a checkpoint write. The execution stays at its last durable checkpoint and the response describes it (see the failure notes in ARCHITECTURE.md 4.17.1). Fix the storage problem, then call resume/start again with the same executionId.",
       CHECKPOINT_CONFLICT:
         "Another operation changed the execution while this call was in progress; nothing of this call was written. Read the current state with `status` instead of retrying blindly.",
+      INVALID_HUMAN_ANSWERS:
+        "The humanAnswers were rejected as a whole and nothing was recorded; the execution is unchanged and still suspended. failureReason lists the problems (unknown questionId, empty or non-string answer, conflicting answers for one question), bounded, without echoing answer text. Fix them and call resume again.",
     },
     safety_note:
       "An answer supplied on resume never directly forces a transition or mutates a " +

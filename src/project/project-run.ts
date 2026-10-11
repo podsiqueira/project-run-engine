@@ -11,7 +11,7 @@ import type {
   HostExecutionOptions,
 } from "../domain/types.js";
 import { CheckpointWriteError, countAgentSteps } from "../domain/types.js";
-import type { ExecutionLockError, ExecutionLockFailureCode, PersistenceFailureCode } from "../domain/types.js";
+import type { ExecutionLockError, ExecutionLockFailureCode, HumanAnswerFailureCode, PersistenceFailureCode } from "../domain/types.js";
 import { operationFailureReason, runLockedTurn } from "./locked-turn.js";
 import type {
   CoordinatorExecutionContext,
@@ -25,6 +25,7 @@ import {
 } from "../coordinator/coordinator.js";
 import { CoordinatorDecisionEngine, hasBlockingFindings, isExplicitlyBlocked } from "../decision/decision-engine.js";
 import type { HumanAnswer, HumanAnswerRecord } from "../decision/human-intervention.js";
+import { describeInvalidHumanAnswers, validateHumanAnswers } from "../decision/human-answer-validation.js";
 import { AgentRegistry } from "../agents/agent-registry.js";
 import { AgentDispatcher } from "../agents/agent-dispatcher.js";
 import type { AgentRuntimeAdapter } from "../runtime/runtime-adapter.js";
@@ -109,6 +110,11 @@ export interface ProjectRunExecutionResult {
    * this explicit field — not the text of `failureReason` — is what says so.
    */
   persistenceFailure?: PersistenceFailureCode;
+  /**
+   * Set ONLY when a resume's `humanAnswers` were rejected (`INVALID_HUMAN_ANSWERS`): nothing was
+   * recorded and nothing ran; the execution is unchanged and still suspended.
+   */
+  answerFailure?: HumanAnswerFailureCode;
 }
 
 export interface ProjectResumeOptions {
@@ -536,8 +542,21 @@ const ALWAYS_REVERIFY_ON_RESUME: ReadonlySet<CoordinatorState> = new Set(["RE_RE
  * reason unrelated to the agent's own result — so an already-clean persisted result
  * must not be discarded unconditionally. Resume only forces re-verification here when
  * the persisted snapshot itself still shows a genuine blocking condition.
+ *
+ * Every agent-gated state outside the ALWAYS set belongs here: each suspends on the agent's
+ * own BLOCKED/FAIL/blocking-findings result, so leaving one out strands the execution — resume
+ * keeps the stale result and the decision engine suspends again without re-dispatching.
  */
-const CONDITIONALLY_REVERIFY_ON_RESUME: ReadonlySet<CoordinatorState> = new Set(["CLARIFY", "ANALYZE"]);
+const CONDITIONALLY_REVERIFY_ON_RESUME: ReadonlySet<CoordinatorState> = new Set([
+  "SPECIFY",
+  "CLARIFY",
+  "PLAN",
+  "TASKS",
+  "ANALYZE",
+  "IMPLEMENT",
+  "INDEPENDENT_REVIEW",
+  "REMEDIATION",
+]);
 
 /**
  * Determines whether a HUMAN_INTERVENTION_REQUIRED suspension from `resumeState` should
@@ -587,7 +606,7 @@ export type ResumeContextResult =
       /** Revision of the checkpoint the context is based on (after any answer-record write): the Coordinator's `baseRevision`. */
       baseRevision: number;
     }
-  | { ok: false; failureReason: string; state: CoordinatorState };
+  | { ok: false; failureReason: string; state: CoordinatorState; failureCode?: HumanAnswerFailureCode };
 
 /**
  * Loads a persisted execution, validates it is actually resumable, resolves project
@@ -644,6 +663,32 @@ export async function reconstructResumeContext(
     };
   }
 
+  // 2.1 Validate the supplied answers BEFORE anything is written: a call with any invalid answer
+  // is rejected whole, so a host never ends up with part of its answers recorded. (Ordering choice:
+  // this deliberately precedes configuration resolution — neither reads or writes the other's
+  // inputs, and the answers are the part the host can fix with the information in this response —
+  // so a call with BOTH invalid answers and an unusable configuration reports the answers first.) This runs under
+  // the execution's lock against the checkpoint as just loaded, so the questions checked are the
+  // execution's CURRENT suspension (answers to an earlier suspension's questions are unknown ids).
+  //
+  // Answers only mean something against a suspension. An execution that is not suspended (its
+  // questions were dropped when it resumed, or it was never suspended) has nothing to answer, so
+  // supplied answers are neither validated nor recorded — exactly what the pull-mode step API
+  // already does — which also keeps a host's retry of `resume(answers)` after a crash harmless.
+  let acceptedAnswers: HumanAnswer[] = [];
+  if (persisted.state === "HUMAN_INTERVENTION_REQUIRED" && options.humanAnswers && options.humanAnswers.length > 0) {
+    const validation = validateHumanAnswers(options.humanAnswers, persisted.human_intervention?.questions);
+    if (!validation.ok) {
+      return {
+        ok: false,
+        state: persisted.state,
+        failureReason: describeInvalidHumanAnswers(executionId, validation.issues),
+        failureCode: "INVALID_HUMAN_ANSWERS",
+      };
+    }
+    acceptedAnswers = validation.answers;
+  }
+
   // 3. Resolve Project Configuration
   const resolvedConfig = await resolveConfig(projectRoot, options.config, options.configPath);
   if (!resolvedConfig.ok) {
@@ -672,9 +717,13 @@ export async function reconstructResumeContext(
       findings: persisted.findings as FindingInput[] | undefined,
     });
 
-  const remediationIteration = isPostHumanEvaluation
-    ? 0
-    : (persisted.remediation_iteration ?? 0);
+  // REMEDIATION is the one re-verified state that sits INSIDE the bounded remediation loop and
+  // is not that loop's exhaustion gate: a human answer to a blocked remediation agent is not a
+  // grant of fresh remediation budget, so its counter is preserved.
+  const remediationIteration =
+    isPostHumanEvaluation && resumeState !== "REMEDIATION"
+      ? 0
+      : (persisted.remediation_iteration ?? 0);
 
   // Human-in-the-Loop answers: persist them durably, immediately, before anything else
   // happens — so the audit trail (what was asked, what was answered, when) survives
@@ -685,7 +734,7 @@ export async function reconstructResumeContext(
   // marked RESOLVED only after ... the Independent Review Agent has verified the
   // correction" — the same principle extended to a human's clarification answer.
   const existingAnswers = persisted.human_answers ?? [];
-  const newAnswers: HumanAnswerRecord[] = (options.humanAnswers ?? []).map((answer: HumanAnswer) => ({
+  const newAnswers: HumanAnswerRecord[] = acceptedAnswers.map((answer: HumanAnswer) => ({
     ...answer,
     recordedAt: new Date().toISOString(),
   }));
@@ -783,6 +832,7 @@ async function resumeUnlocked(
       stepsCount: 0,
       history: [],
       failureReason: reconstructed.failureReason,
+      ...(reconstructed.failureCode !== undefined ? { answerFailure: reconstructed.failureCode } : {}),
     };
   }
 

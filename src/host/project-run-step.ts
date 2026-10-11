@@ -295,7 +295,8 @@ async function nextProjectRunStepImpl(
             humanAnswers: request.humanAnswers,
           });
           if (!reconstructed.ok) {
-            return failed(persisted.execution_id, reconstructed.state, reconstructed.failureReason);
+            // A rejected answer set is non-terminal (the suspension is untouched); any other failure keeps the old shape.
+            return failed(persisted.execution_id, reconstructed.state, reconstructed.failureReason, reconstructed.failureCode === undefined, reconstructed.failureCode);
           }
           return runPrepare(reconstructed.context, reconstructed.config, projectRoot, stateStore, request.maxSteps, reconstructed.baseRevision);
         }

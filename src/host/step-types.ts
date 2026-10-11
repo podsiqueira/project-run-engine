@@ -125,7 +125,8 @@ export type ProjectRunStepResponse =
        * Present for the failures a host can handle without reading `failureReason`:
        * `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`, `CHECKPOINT_WRITE_FAILED` and
        * `CHECKPOINT_CONFLICT` (another operation changed the execution meanwhile; nothing of this
-       * call was written). All are non-terminal: this call did not take effect beyond the last
+       * call was written) and `INVALID_HUMAN_ANSWERS` (the supplied `humanAnswers` were rejected as a
+       * whole; nothing was recorded and the suspension is unchanged). All are non-terminal: this call did not take effect beyond the last
        * durable checkpoint, and calling `nextProjectRunStep()` again with the same `executionId`
        * returns the authoritative current state (the same pending action, or the recovered
        * next one). For `CHECKPOINT_WRITE_FAILED` the cause is the storage environment —

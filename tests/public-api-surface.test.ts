@@ -93,6 +93,16 @@ describe("public API surface — runtime exports of every published entry point"
     }
   });
 
+  it("the human-answer validator stays internal: no entry point exposes it and no subpath reaches it", async () => {
+    for (const sub of Object.keys(manifest.exports)) {
+      const mod = await load(sub as "." | "./domain" | "./project" | "./host");
+      for (const name of ["validateHumanAnswers", "describeInvalidHumanAnswers", "MAX_REFLECTED_ID_LENGTH"]) {
+        expect(mod[name], `${sub} exposes ${name}`).toBeUndefined();
+      }
+    }
+    expect(Object.keys(manifest.exports).some((k) => /decision/.test(k))).toBe(false);
+  });
+
   it("/project exposes the store contract implementation and the push entry points", async () => {
     const project = await load("./project");
     for (const name of ["FileExecutionStateStore", "withExecutionLock", "executeProjectRun", "executeProjectResume", "validatePersistedState"]) {
@@ -131,7 +141,7 @@ describe("public API surface — runtime exports of every published entry point"
     const host = await load("./host");
     const sem = (host.PROJECT_ENGINE_RUN_TOOL_SCHEMA as { response_semantics: { failure_code_field: string; failure_codes: string[] } }).response_semantics;
     expect(sem.failure_code_field).toBe("failureCode");
-    expect([...sem.failure_codes].sort()).toEqual(["CHECKPOINT_CONFLICT", "CHECKPOINT_WRITE_FAILED", "EXECUTION_LOCKED", "EXECUTION_LOCK_UNAVAILABLE"]);
+    expect([...sem.failure_codes].sort()).toEqual(["CHECKPOINT_CONFLICT", "CHECKPOINT_WRITE_FAILED", "EXECUTION_LOCKED", "EXECUTION_LOCK_UNAVAILABLE", "INVALID_HUMAN_ANSWERS"]);
   });
 });
 
@@ -152,6 +162,12 @@ describe("public API surface — a TypeScript consumer compiling against the emi
     const { status, output } = tsc(writeProject("tsconfig.receipt.json", ["receipt-store.ts"]));
     expect(output).toBe("");
     expect(status).toBe(0);
+  }, 120_000);
+
+  it("compatibility: a 0.4.x exhaustive switch over ExecutionFailureCode no longer compiles until INVALID_HUMAN_ANSWERS is handled (documented)", () => {
+    const { status, output } = tsc(writeProject("tsconfig.switch.json", ["must-not-compile-switch.ts"]));
+    expect(status).not.toBe(0);
+    expect(output).toMatch(/TS2322.*INVALID_HUMAN_ANSWERS/);
   }, 120_000);
 
   it("control: a save() resolving to something that is neither void nor a receipt is rejected (the check is not vacuous)", () => {

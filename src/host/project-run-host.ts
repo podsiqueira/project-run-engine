@@ -211,7 +211,7 @@ async function buildHostResponse(
         timestamp: now(),
         reason: result.failureReason ?? "Unknown failure",
       });
-      const failureCode = result.lockFailure ?? result.persistenceFailure;
+      const failureCode = result.lockFailure ?? result.persistenceFailure ?? result.answerFailure;
       return {
         status: "FAILED",
         // Only an engine-generated lock failure (set explicitly by the engine when it could not
