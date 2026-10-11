@@ -150,6 +150,6 @@ Test files are **not** type-checked by `npm run typecheck`; they are transpiled 
 
 ## 6. Publishing
 
-`@incito-labs/project-run-engine` is published to the public npm registry (`"publishConfig": { "access": "public" }`). Versions `0.1.0`, `0.1.1`, `0.2.0`, `0.3.0` and `0.4.0` have been published so far (`0.4.0` verified from a fresh registry install; the `v0.4.0` tag marks release commit `7eee83b`).
+`@incito-labs/project-run-engine` is published to the public npm registry (`"publishConfig": { "access": "public" }`). Versions `0.1.0`, `0.1.1`, `0.2.0`, `0.3.0`, `0.4.0` and `0.5.0` have been published so far (`0.5.0` verified from a fresh registry install, tarball shasum `320b4a87eb32952c04a64a15b6e42a2b91cb180e`; the `v0.5.0` tag marks release commit `dfa6c3d`).
 
 A release is prepared and published by a maintainer from an authenticated session, after the verification in section 5 (typecheck, tests, build, `git diff --check` and `npm pack --dry-run`). The version bump (`package.json` and `package-lock.json`) is committed on its own before publishing, and a published version is never modified. The sandboxed environments used for implementation work so far have held no npm credentials, so they prepared releases and a maintainer published them.
