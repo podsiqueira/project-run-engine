@@ -21,9 +21,11 @@ known limitations, and trust boundaries see `docs/backlog.md`.
 | Phase 4 Closure — runtime-default hardening, docs, release | COMPLETE |
 | Phase 5 — Persistence hardening | **COMPLETE — released as `0.3.0`** (see [Phase 5](#phase-5--persistence-hardening)) |
 | Post-0.3.0 — Persistence correctness and storage contract | **COMPLETE — released as `0.4.0`** (see [Post-0.3.0](#post-030--persistence-correctness-and-the-storage-contract)) |
+| Post-0.4.0 — Resume recovery and human-answer validation | **COMPLETE — `0.5.0`** (see [Post-0.4.0](#post-040--resume-recovery-and-human-answer-validation)) |
 
-Current release: `@incito-labs/project-run-engine@0.4.0` (`package.json`). The post-0.3.0 persistence work
-shipped as `0.4.0` (a minor release: the public surface only grows). Phase 5 had shipped as `0.3.0`, not a
+Current release: `@incito-labs/project-run-engine@0.5.0` (`package.json`). The post-0.4.0 resume and
+human-answer work is `0.5.0` (a minor release: the public surface only grows, two behaviours change). The
+post-0.3.0 persistence work shipped as `0.4.0` (a minor release: the public surface only grows). Phase 5 had shipped as `0.3.0`, not a
 patch, because it changed the typed `history` contract; `0.3.0` was the previous release.
 
 ## Phase 0 — Coordinator safety gates
@@ -272,3 +274,36 @@ detail, ownership, and tests are in `docs/backlog.md`:
   the packed tarball was installed fresh and exercised (CLI, every entry point, pull/push lifecycles, lock,
   write-failure and conflict behaviour, an in-memory store). Still deferred (`docs/backlog.md`): lock heartbeat,
   a database-backed store, distributed locking, event-stream history, host integrations, ENG-003.
+
+## Post-0.4.0 — Resume recovery and human-answer validation
+
+- **Objective**: an execution suspended after a `BLOCKED` result must be recoverable once the human decisions are
+  registered, and the `humanAnswers` that reach the audit trail must be well-formed — without ever letting an
+  answer resolve a finding or advance the workflow by itself.
+- **Baseline**: `main` at `29a043c`, `0.4.0` published (npm `latest`, tag `v0.4.0`).
+- **Root cause (resume loop)**: `reconstructResumeContext` re-verified `RE_REVIEW`/`CONVERGE` (always) and
+  `CLARIFY`/`ANALYZE` (when the saved result was still blocking) but not `SPECIFY`, `PLAN`, `TASKS`, `IMPLEMENT`,
+  `INDEPENDENT_REVIEW` or `REMEDIATION`. Resume kept the stale blocking result and the decision engine suspended
+  again at once, without dispatching the responsible agent. The pull recovery path (`nextProjectRunStep` with
+  `humanAnswers`) existed; `submit-step` returning `NO_PENDING_ACTION` after a suspension is by design.
+- **Delivered**:
+  - all eight agent-gated states other than the "always" pair are re-verified when the saved result is still
+    blocking, in pull and push mode; a clean saved result is kept; `remediation_iteration` of a blocked
+    `REMEDIATION` is preserved (the exhausted `RE_REVIEW` gate keeps its re-grant);
+  - `humanAnswers` validation (`src/decision/human-answer-validation.ts`, internal, not exported): ids must belong
+    to the current suspension, answers are trimmed and non-empty, identical answers in a call collapse, conflicts
+    and any invalid entry reject the whole call with `INVALID_HUMAN_ANSWERS` and nothing is recorded; answers
+    across calls stay append-only; answers to a non-suspended execution are ignored; diagnostics are bounded
+    (ids clipped to 64 characters, control characters neutralised, at most 20 problems listed, answer text never
+    echoed);
+  - the new failure code is on pull step responses, host responses (`failureCode`), push results
+    (`answerFailure`) and the tool schema; the consumer type fixtures and a negative compile control pin the
+    exhaustive-`switch` compatibility note.
+- **Release notes for `0.5.0`**: see `CONSUMER-GUIDE.md` §12 (fixed behaviour, changed behaviour, compatibility,
+  known limits). No persistence schema change; the persisted `version` stays `1`.
+- **Known limits (unchanged, recorded in `docs/backlog.md`)**: concurrent answers to different questions drop the
+  loser's answer without a specific signal; pull and push APIs on one execution are not coordinated (push `resume()`
+  on a pull execution awaiting its agent action runs the agent); no warning for partial answers.
+- **Status**: COMPLETE — implemented and independently reviewed. Validation: 37 test files / 428 tests, typecheck,
+  build, `git diff --check` and `npm pack --dry-run` (206 files, no `tests/` or `src/`) all green, including the
+  public-surface and consumer-type tests and separate-process lock tests for different/valid-vs-invalid answers.

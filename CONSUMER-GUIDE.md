@@ -11,7 +11,7 @@ Add `@incito-labs/project-run-engine` to your repository's `package.json`:
 ```json
 {
   "dependencies": {
-    "@incito-labs/project-run-engine": "^0.4.0"
+    "@incito-labs/project-run-engine": "^0.5.0"
   }
 }
 ```
@@ -304,7 +304,7 @@ progress, the call returns a non-terminal `FAILED` with `terminal: false` and a 
 |---|---|---|
 | `CHECKPOINT_WRITE_FAILED` | The store rejected a `save()` (disk full, I/O error, permissions). The execution is at its last durable checkpoint; `state`/`stepLog`/`history` in the response are that checkpoint's — **unless the store cannot be read either**, in which case `state` is only a placeholder (`"INTAKE"` in pull responses, the abandoned turn's in-memory state in push results) and not a confirmed durable state. | Fix the storage problem, then call `next-step` again with the same `executionId` (pull) or `resume` (push; `start` again only if nothing was ever written). Submitting the same result again is safe — it is applied at most once. |
 | `CHECKPOINT_CONFLICT` | The execution was modified by another operation after this call read it (optimistic concurrency); nothing of this call was written and the other operation's checkpoint stands. Normally prevented by the lock, so it means the lock did not hold. | Do **not** retry blindly: call `next-step` (or `status`) to get the current state. |
-| `INVALID_HUMAN_ANSWERS` | The `humanAnswers` of a resume were rejected **as a whole**: a `questionId` that is not one of the current suspension's questions, an empty (or whitespace-only) answer, a non-string answer, or two different answers to one question inside the same call. Nothing was recorded, no agent ran, and the execution is still suspended. `failureReason` lists the problems (up to 20, then a count of the rest), shows long ids clipped, and never repeats answer text. | Fix the listed answers and call again; read the questions from `humanIntervention` (or `status`). Answers are recorded trimmed; identical answers to one question inside a call are recorded once; a later call's answer is appended (a correction keeps the earlier one in the audit trail). Answers are only meaningful while the execution is suspended: sent to one that is not (already resumed, mid-sequence, completed) they are ignored and not recorded, so retrying `resume(answers)` is harmless. |
+| `INVALID_HUMAN_ANSWERS` *(since `0.5.0`)* | The `humanAnswers` of a resume were rejected **as a whole**: a `questionId` that is not one of the current suspension's questions, an empty (or whitespace-only) answer, a non-string answer, or two different answers to one question inside the same call. Nothing was recorded, no agent ran, and the execution is still suspended. `failureReason` lists the problems (up to 20, then a count of the rest), shows long ids clipped, and never repeats answer text. | Fix the listed answers and call again; read the questions from `humanIntervention` (or `status`). Answers are recorded trimmed; identical answers to one question inside a call are recorded once; a later call's answer is appended (a correction keeps the earlier one in the audit trail). Answers are only meaningful while the execution is suspended: sent to one that is not (already resumed, mid-sequence, completed) they are ignored and not recorded, so retrying `resume(answers)` is harmless. |
 
 **Writing your own store.** `ExecutionStateStore` (exported) is all the engine knows about storage —
 `save` / `load` / `exists`, plus optional `list` and `withLock`. A `save` must resolve only once the
@@ -574,3 +574,50 @@ package does not ship `.claude/commands/...`, a Cursor rule, an MCP server, or a
 Antigravity tool definition — those are built in each host's own configuration using
 the contract described there.
 
+
+---
+
+## 12. Upgrading from 0.4.x to 0.5.x
+
+`0.5.0` is a minor, pre-1.0 release after `0.4.0`: the persisted `version` stays `1`, `0.4.x` checkpoints keep
+working and no migration is needed. The public surface only grows, but **two behaviours change** (a resume bug is
+fixed and `humanAnswers` are now validated) and **one compile break is possible** for exhaustive `switch`
+statements over `ExecutionFailureCode`.
+
+| | `0.4.x` | `0.5.x` |
+|---|---|---|
+| Resuming an execution suspended after a `BLOCKED` result (or `FAIL` / blocking findings) from `SPECIFY`, `PLAN`, `TASKS`, `IMPLEMENT`, `INDEPENDENT_REVIEW` or `REMEDIATION` | the stale blocking result was re-evaluated and the execution re-suspended at once, without the responsible agent ever running, whatever the answers | the responsible agent is re-dispatched; a fresh accepted result is required to advance and a fresh `BLOCKED` suspends again. A saved result that is already clean is kept. (`CLARIFY`, `ANALYZE`, `RE_REVIEW` and `CONVERGE` already behaved this way.) |
+| `humanAnswers` content | recorded as given | validated as a whole before anything is written: every `questionId` must be a question of the current suspension, answers must be non-empty strings (recorded trimmed), identical answers to one question in a call are recorded once, different answers to the same question reject the call. Any invalid entry fails the whole call with `INVALID_HUMAN_ANSWERS`, records nothing and runs no agent |
+| Answers across calls | appended | appended (unchanged, now explicit): a later answer is a correction and the earlier one stays in the audit trail |
+| Answers sent to an execution that is not suspended | pull: ignored; push `resume()`: recorded unchecked | ignored, not recorded, in both modes (a retry of `resume(answers)` after a crash is harmless) |
+| Failure codes | `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`, `CHECKPOINT_WRITE_FAILED`, `CHECKPOINT_CONFLICT` | also `INVALID_HUMAN_ANSWERS` (non-terminal `FAILED`, `terminal: false`); push results carry it as `answerFailure`; `ResumeContextResult.failureCode` |
+| Push `resume()` on a suspension whose saved result is still blocking | re-suspended (for the stages above) | re-invokes the responsible agent, with or without answers, and continues to the next terminal point in the same call |
+| A blocked `REMEDIATION` resumed | (stranded, see above) | keeps its `remediation_iteration`: a human answer is not an exhausted remediation gate. The exhausted `RE_REVIEW` gate keeps its existing fresh budget |
+
+**What to do.**
+
+- **TypeScript:** if you switch exhaustively over `ExecutionFailureCode` (a `never` check in the `default`), add a case
+  for `INVALID_HUMAN_ANSWERS`. Nothing else in the public types changes incompatibly (`answerFailure` and
+  `ResumeContextResult.failureCode` are new optional fields).
+- **Hosts:** treat `INVALID_HUMAN_ANSWERS` as non-terminal like the lock and checkpoint codes (section 6): read the
+  questions from `humanIntervention` (or `status`), fix the answers listed in `failureReason` and call again. The
+  reason lists up to 20 problems, shows long ids clipped and never repeats answer text. Hosts that sent a mistyped
+  or stale `questionId`, an empty string, or two different answers to one question in one call will now be rejected
+  instead of having them recorded.
+- **Executions stranded by the old bug** continue on their first resume. In pull mode send at least one answer (an
+  empty call is a read of the suspension; the resent answer is appended as a new record); in push mode `resume()`
+  runs the agent. That agent work runs for real: do not assume exactly-once external side effects.
+
+**Known limits (not changed in this release).**
+
+- *Concurrent answers to different questions.* Calls are serialised by the execution's lock. When two hosts answer
+  **different** questions at the same moment, the call that takes the lock wins; the other receives the pending
+  action and its answers are **not recorded**, without a specific signal in the response. Read the suspension with
+  `status` and answer what is left. Identical simultaneous answers are recorded once and produce one re-dispatch.
+- *Pull and push on one execution.* This predates `0.5.0` and is unchanged: push `resume()` on an execution that is
+  waiting for a pull-mode agent action runs the agent through the push adapters instead of returning the pending
+  action. Drive one execution with one API only. (Mixing engine versions on one execution stays unsupported.)
+- *Partial answers.* Answering fewer questions than were asked is supported and not warned about: the re-dispatched
+  agent decides whether the work is acceptable, never the answers.
+- A checkpoint written before questions were persisted has no questions to check ids against: the id check is skipped
+  there, and the empty and conflicting-answer rules still apply.

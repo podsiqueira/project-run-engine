@@ -258,6 +258,22 @@ the one remaining best-effort write (the advisory terminal `FAILED` marker): `AR
 §4.17.1. Found along the way and fixed: an `IN_PROGRESS` checkpoint at `READY_FOR_PR` (crash or failed
 `COMPLETED` write) was rejected as completed and could never finish.
 
+## Human answers and execution modes — known limits after `0.5.0` (DEFERRED)
+
+Found while fixing the resume loop and validating `humanAnswers`; none is a regression and none is scheduled.
+
+- **A concurrent caller's answers can be dropped without a specific signal.** Calls are serialised by the
+  execution's lock. When two hosts answer *different* questions at once, the call that takes the lock is validated
+  and recorded; the other finds the execution already resumed, so it is a read: it receives the pending action
+  (same `stepId`) and its answers are not recorded. It is not a revision conflict. Documented in `ARCHITECTURE.md`
+  §4.2 and `CONSUMER-GUIDE.md` §12. A future option is an explicit signal on the response (a new field).
+- **Pull and push on one execution are not coordinated** (predates `0.5.0`). Push `resume()` on an execution that
+  is waiting for a pull-mode agent action runs the agent through the push adapters and completes it, instead of
+  returning the pending action. The documentation forbids mixing engine *versions*, not APIs; drive an execution
+  with one API.
+- **No warning for partial answers.** Answering fewer questions than were asked is supported; whether the work is
+  acceptable is decided by the re-dispatched agent's fresh result. A warning would be a new response field.
+
 ## Observations (not engine contract; no action scheduled)
 
 - `created_at` in a checkpoint is rewritten on every save (it equals `updated_at`), so it is not the
