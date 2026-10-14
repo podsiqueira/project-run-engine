@@ -1,0 +1,36 @@
+# Data Model: Harness MVP
+
+Index of entities, ownership, and cross-entity invariants. Field-level definitions live in the contract named in the last column.
+
+| Entity | Persisted where | Mutability | Defined in |
+|---|---|---|---|
+| `HarnessPolicy` | repository file (trusted config); digest pinned in envelope | edited by humans via normal code review; any change ⇒ envelope stale | `contracts/authorization-envelope.md` §1 |
+| `PhaseAuthorizationEnvelope` | `harness.envelope` + `ENVELOPE_*` events | immutable per revision; amend = new revision | same §2 |
+| `TaskGraph` / `TaskNode` | derived from `tasks.md` (not persisted; digest + `GRAPH_BUILT` event) | recomputed each boundary | `contracts/task-graph.md` |
+| `TaskEligibilityDecision` | `ELIGIBILITY_DECIDED` event | append-only | same §2 |
+| `GateDecision`, `DependencyAttestation`, `UpstreamAcknowledgement`, `FindingDisposition` | events (human-only) | append-only | `contracts/harness-controller.md` §7, `evidence-ledger.md` §3 |
+| `ValidatorDefinition` | policy | protected | `contracts/verification-pipeline.md` §2 |
+| `ValidatorResult` | `VALIDATOR_RAN` event + evidence files | append-only; invalidated by event | same §4 |
+| `SnapshotIdentity`, `DiffArtifact` | `SNAPSHOT_CAPTURED` event + evidence file | write-once | same §6 |
+| `ReviewRequest` / `ReviewResult` | evidence files + `REVIEW_*` events | write-once | `contracts/review-contract.md` |
+| `HarnessFinding` | inside review/validator evidence; open set in `harness.latest` | status transitions by new events only | same §4 |
+| `RemediationBudget`, `RemediationAttemptRecord`, `RemediationBudgetGrant` | `harness.budgets` (+ events) | counters monotonic | `contracts/remediation-budget.md` |
+| `HarnessEvent` | `harness.events[]` | append-only, hash-chained | `contracts/evidence-ledger.md` §3 |
+| `EvidenceReference` | inside events | immutable | same §5 |
+| `HarnessSuspension` | existing `human_intervention` (+ `SUSPENDED` event) | replaced per suspension (as today); history in events | `contracts/harness-controller.md` §4 |
+| `HarnessDecision` | `FINDINGS_EVALUATED` event | pure output | `contracts/review-contract.md` §5 |
+
+## Cross-entity invariants
+
+1. `budgets[k].consumed == count(events kind=REMEDIATION_ATTEMPT_OPENED for k)` and equals `attempts.length`.
+2. Every `DISPATCHED{kind:"REMEDIATE"}` event shares its checkpoint revision with a `REMEDIATION_ATTEMPT_OPENED` event and a `pending_action`.
+3. Every `TASK_ACCEPTED` event references: one implementation result event, the validator results for snapshot S, a `REVIEW_RECEIVED` with `snapshotId == S`, and carries `checkpointRevision`.
+4. `harness.cycle` exists iff exactly one task is `IN_CYCLE` or `SUSPENDED` (a suspended task keeps the slot).
+5. `chain.seq == events.length` and `chain.hash == events[last].hash`; MANIFEST agrees.
+6. For every envelope revision *r > 1*: `supersedes` points at revision `r−1` which is `SUPERSEDED`.
+7. No event `data` contains payload (enforced by a schema allowing only ids, digests, numbers, enums, ISO times, `EvidenceReference`).
+8. The engine's own fields (`remediation_iteration`, `iteration`, `history`, `step_log`) keep their v0.5.0 meaning; Harness code writes them only through the existing coordinator paths.
+
+## State diagram (per task)
+
+`NOT_STARTED → IN_CYCLE → ACCEPTED` · `IN_CYCLE → SUSPENDED → IN_CYCLE` (human) · `SUSPENDED → EXCLUDED` (via envelope amendment removing the task) · `ACCEPTED → ACCEPTED+UPSTREAM_CHANGED` (flag only).
