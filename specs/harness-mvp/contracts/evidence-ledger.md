@@ -40,6 +40,8 @@ type HarnessStep = "IMPLEMENTATION_PENDING" | "VERIFICATION_PENDING" | "REVIEW_P
 
 **Size and payload discipline (FR-102)**: `pending_action.request.context` ≤ 8 KiB and each event `data` ≤ 4 KiB, references and digests only; the block lives outside `context` because `scrubSecrets` redacts keys matching `password|secret|token|api key|auth|bearer|private key` there (e.g. `authorizationId`, `authenticated`). The engine does not sanitise `pending_action`; the guarantee is by construction and by test (SC-014).
 
+**Host-supplied results (revision 4, OD-15 approved)**: validated against a closed schema with explicit limits before any `commit` (`contracts/result-validation.md`); for Harness executions the `step_log` copy of each finding is the compact form (`id`, `severity`, `category`, `blocking`, `fingerprint`, `evidenceRef`, ≤ 512 B) and full text lives only in `last_result` and evidence files.
+
 **Time**: audit timestamps come from events; checkpoint `created_at` is rewritten on every save and is never used (FR-108).
 
 ## 3. `HarnessEvent` (append-only)

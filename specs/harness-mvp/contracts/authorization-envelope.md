@@ -42,7 +42,8 @@ interface HarnessPolicy {
   ignoredExclusions: string[];  // the ONLY ignored paths excluded from snapshots (FR-084)
   redaction: { patterns: string[]; maxOutputBytes: number };
   review: { requireDistinctInvocationId: true };
-  limits: { maxTaskElapsedMs?: number; cost: "unsupported" };
+  limits: { maxTaskElapsedMs?: number; cost: "unsupported";
+            result?: ResultLimits };   // (OD-15) provisional initial limits; defaults and hard ceilings in contracts/result-validation.md §5; envelopes may only lower them
 }
 type PermittedOperation =
   | "EDIT_FILES_IN_ALLOWED_PATHS" | "CREATE_FILES_IN_ALLOWED_PATHS" | "DELETE_FILES_IN_ALLOWED_PATHS"
@@ -50,7 +51,7 @@ type PermittedOperation =
 ```
 
 **Mandatory protected set** (built into the engine, not removable by policy or envelope; patterns per `path-matching.md`):
-`.project-run/harness/**`, `.project-run/config.json`, `.project-run/workflow.json`, `.project-run/runs/**`, `.project-run/evidence/**`, `.git/**`.
+`.project-run/harness/**`, `.project-run/config.json`, `.project-run/workflow.json`, `.project-run/skills/**`, `.agents/skills/**` (OD-18), `.project-run/runs/**`, `.project-run/evidence/**`, `.git/**`.
 
 **Not authorisable in the MVP** (never in the vocabulary): destructive data operations, migrations, deployment, infrastructure, network egress,
 business decisions, scope expansion, policy/allowlist/envelope edits, `git commit|push|merge|tag`, PR, release, publish. The engine does not
@@ -68,7 +69,7 @@ interface PhaseAuthorizationEnvelope {
   allowedPaths: string[];                               // patterns (path-matching.md); must not match the mandatory/protected set
   permittedOperations: PermittedOperation[];            // ⊆ policy vocabulary
   validatorIds: string[];                               // ⊆ policy.validators
-  stopPoints: StopPoint[];
+  stopPoints: StopPoint[];                              // human-listed stop points only; PHASE_END is implicit and mandatory (FR-115) and cannot be removed
   remediation: { limit: 0 | 1 | 2 | 3 };                // initial automatic attempts; ≤ policy.initialLimit; no other fields (FR-091)
   recurrence: { mode: "ESCALATE_ON_NO_PROGRESS" | "EXHAUST_BUDGET"; streak: number };  // not weaker than policy.recurrence (FR-092)
   baseline: { mode: "CLEAN_REQUIRED" | "DIRTY_APPROVED"; dirtyApprovalId?: string; startTreeDigest: string; startCommit: string };

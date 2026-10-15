@@ -82,7 +82,7 @@ Per-boundary table in `contracts/harness-controller.md` §5. Principles: (1) the
 **Implementation pitfall (resolved in revision 3, D-30)**: the Coordinator re-persists only what it builds field by field, and probe 1 showed an injected `harness` key disappearing after one submit. The block is therefore written only by `Coordinator.commit`, built from the persisted record; it is not carried on the context.
 
 ### D-10 A Harness workflow preset; no new states (revised in revision 3)
-**Choice**: a Harness preset (working name `spec-kit-harness-v1`, extending the Spec Kit preset so skills and expected outputs are inherited) used **only to validate and label the Harness' own writes**: `validStates`, `allowedTransitions`, `stateToRole`. Added edges (preset-local, additive): `INDEPENDENT_REVIEW|RE_REVIEW → IMPLEMENT` (task accepted, next task), `IMPLEMENT → REMEDIATION` and `REMEDIATION → REMEDIATION` (validator failure routes to remediation without a review). **No edge to `CONVERGE`** (OD-14). The engine's `decide`/`resolveTransition`, `MAX_REMEDIATION_ITERATIONS` and the push loop are never executed for a Harness execution, so there is no second remediation counter to reconcile and no way for the engine's own 4-dispatch loop to run.
+**Choice**: a Harness preset (working name `spec-kit-harness-v1`, extending the Spec Kit preset so the skill configuration is inherited; `expected_output` falls back to the engine default) used **only to validate and label the Harness' own writes**: `validStates`, `allowedTransitions`, `stateToRole`. Added edges (preset-local, additive): `INDEPENDENT_REVIEW|RE_REVIEW → IMPLEMENT` (task accepted, next task), `IMPLEMENT → REMEDIATION` and `REMEDIATION → REMEDIATION` (validator failure routes to remediation without a review). **No edge to `CONVERGE`** (OD-14 approved). The engine's `decide`/`resolveTransition`, `MAX_REMEDIATION_ITERATIONS` and the push loop are never executed for a Harness execution, so there is no second remediation counter to reconcile and no way for the engine's own 4-dispatch loop to run.
 **Why demonstrated need**: the matrix has no edge back to `IMPLEMENT` (E-3).
 **Rejected**: new states (public type change, breaks consumer exhaustiveness fixtures such as `must-not-compile-switch.ts`); letting the engine's `resolveTransition` drive the cycle (it would need verification outcomes on the context, would run engine remediation logic, and `buildStepCoordinator` hard-wires the default engine).
 
@@ -154,7 +154,7 @@ Evaluation step 6 (envelope validity) precedes step 7 (pending action); a submis
 Policy at `.project-run/harness/policy.json`: tracked, next to the already-tracked `.project-run/config.json`, separate from the ignored mutable dirs `runs/` and `evidence/`; must be committed and unmodified at issuance; mandatory protected set built into the engine (FR-090). Limits: policy ceiling 3 ≥ envelope limit (initial attempts) and grants strictly additional separate authorisations, capped cumulatively, consumption shared across lineages (FR-091). Recurrence floor (FR-092). Verified: `.project-run/` is already a tracked config root (`project-config.ts`, `bootstrap.ts`), and `CONSUMER-GUIDE.md` instructs ignoring only `.project-run/runs/`.
 
 ### D-29 Path matching
-Closed glob subset, anchored, case-sensitive, POSIX only, validated-not-normalised candidates, deny-wins, symlink and traversal rules, 30 normative vectors (`contracts/path-matching.md`, FR-093, FR-094).
+Closed glob subset, anchored, case-sensitive, POSIX only, validated-not-normalised candidates, deny-wins, symlink and traversal rules, 32 normative vectors (`contracts/path-matching.md`, FR-093, FR-094).
 
 ## E. Decisions added in revision 3 (from the T049 technical review)
 
@@ -176,5 +176,15 @@ Persisted pending actions are unscrubbed (E-16); therefore requests, events and 
 ### D-35 Timeouts are host-enforced; validators hold the lock
 `timeout_ms` for agents is advisory to the host in pull mode (E-16, E3); validators run inside the lock with run records to detect orphans after `SIGKILL` (FR-023, FR-106, FR-107).
 
-### D-36 Scope boundary at `PHASE_END` (OD-14 open)
+### D-36 Phase boundary: suspension at `PHASE_END` (OD-14 — approved 2026-10-15 as a specification decision)
 The Harness governs `IMPLEMENT … RE_REVIEW`; after all authorised tasks are accepted the execution stays suspended. Handing off to the engine's `CONVERGE`/`READY_FOR_PR` stages would run the engine's own remediation loop outside the Harness budget and is not part of the MVP unless OD-14 decides otherwise.
+
+## F. Decisions added in revision 4 (OD-14, OD-15, OD-16 approved 2026-10-15 as specification decisions; OD-17 and OD-18 approved 2026-10-15)
+
+### D-37 Host-supplied result validation (OD-15 — architecture approved 2026-10-15; numeric limits provisional)
+Closed schema `harness-result/v1`, explicit byte limits **separate** from the 8 KiB request-context and 4 KiB event limits, bounded counting serializer, evidence-reference verification, bulk content in evidence files, compact `step_log` findings for Harness executions, Harness-only (`contracts/result-validation.md`). **Why**: the engine persists `last_result` and a copy of each finding verbatim (E-18) and validates only `execution_id`; FR-102 limits only Harness-built objects. **Rejected**: reusing 8 KiB/4 KiB as a global limit (they bound request and event payloads, not results; an 8 KiB cap would reject legitimate reviews, a 4 KiB one most of them); sanitising instead of rejecting (silently altering a host's result would break the digest/echo checks); validating inside the engine for all executions (changes non-Harness behaviour, a public-contract risk).
+
+### D-38 Rejection classes and resolution of CF-1 (OD-16 — Option A approved 2026-10-15)
+Class A (structural) rejections write nothing and are not counted; class B (semantic) keep FR-068. The conflict with revision 3's "count every rejection" (CF-1) was surfaced to the owner and resolved by choosing Option A; options B (digest-only event) and C (no counting) were not chosen (`result-validation.md` §9). Existing precedent for zero-write rejections: `INVALID_RESULT` and `INVALID_HUMAN_ANSWERS`.
+
+The limits of D-37 are **initial specification limits**, explicit and testable but not empirically validated production limits (R-27, T065).

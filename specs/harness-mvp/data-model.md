@@ -18,6 +18,7 @@ Index of entities, ownership, and cross-entity invariants. Field-level definitio
 | `DirtyBaselineApproval` | `harness.dirtyBaselineApproval` + `BASELINE_APPROVED` event (human-only; absent by default) | immutable | `contracts/verification-pipeline.md` §6.1 |
 | `PathPattern` / scope decision | policy and envelope fields; pure function | validated, never rewritten | `contracts/path-matching.md` |
 | `StateProjection` (table rows T0–T9 and write sequences W1–W13) | specification table, enforced at evaluation step 4; completeness proved by enumerating W-sequences | fixed | `contracts/harness-controller.md` §3a/§3b |
+| `HarnessResultPayload` / `ResultLimits` (OD-15) | not persisted separately: validated on submission; the accepted result is stored as `last_result`, findings compacted in `step_log` | immutable once accepted | `contracts/result-validation.md` |
 | `HarnessEvent` | `harness.events[]` | append-only, hash-chained | `contracts/evidence-ledger.md` §3 |
 | `EvidenceReference` | inside events | immutable | same §5 |
 | `HarnessSuspension` | existing `human_intervention` (+ `SUSPENDED` event) | replaced per suspension (as today); history in events | `contracts/harness-controller.md` §4 |
@@ -44,3 +45,4 @@ Index of entities, ownership, and cross-entity invariants. Field-level definitio
 12. Every `commit` is one CAS save built from the persisted record; the engine's `remediation_iteration`, `iteration` and `last_result` are changed only where the write sequence says so (never by a human answer); `history`/`step_log`/`human_answers` are append-only.
 13. `request.context` of any persisted `pending_action` ≤ 8 KiB and each event `data` ≤ 4 KiB, references and digests only (FR-102).
 14. A record is a Harness execution iff its `harness` block validates; `preset` and configuration labels never decide it (FR-096).
+15. *(OD-15/OD-16 approved)* For a Harness execution `last_result` ≤ `maxResultBytes`, every persisted `step_log` finding ≤ 512 B in compact form, and a class-A rejection leaves checkpoint bytes, revision, events, counters, pending action, `requested_at` and the evidence directory unchanged.

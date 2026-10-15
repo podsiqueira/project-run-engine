@@ -97,6 +97,8 @@ At validation the pattern is checked, never rewritten, except: repeated `/` is r
 | 28 | pattern `/src/**` | — | `INVALID_PATTERN` | leading `/` |
 | 29 | pattern `src/a**b` | — | `INVALID_PATTERN` | `**` not a whole segment |
 | 30 | pattern `src/../x` | — | `INVALID_PATTERN` | `..` segment |
+| 31 | `**` | `.agents/skills/speckit-implement/SKILL.md` | ✘ | mandatory protected set (OD-18, approved) |
+| 32 | `**` | `.project-run/skills/custom/SKILL.md` | ✘ | mandatory protected set (OD-18, approved) |
 
 ## 8. Implementation constraints
 

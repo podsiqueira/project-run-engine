@@ -12,7 +12,7 @@ Not guaranteed (NG-6): process/model isolation, absence of shared hidden state, 
 
 ## 1a. Transport and payload discipline (FR-102, FR-103)
 
-The `ReviewRequest` is delivered as the dispatch `request.context` of an ordinary `AgentDispatchRequest` and is **persisted unscrubbed** in `pending_action.request`. It therefore contains **references and digests only**: `EvidenceReference`s to the diff artifact, validator logs (redacted ones only), spec/contract excerpts and the criteria files; never diff text, log text or secrets; at most 8 KiB. The reviewer reads the files under `.project-run/evidence/**`. The `ReviewResult` returns in `AgentResult.metadata.harness` (the engine validates only `execution_id`; the controller validates the rest) with evidence by reference.
+The `ReviewRequest` is delivered as the dispatch `request.context` of an ordinary `AgentDispatchRequest` and is **persisted unscrubbed** in `pending_action.request`. It therefore contains **references and digests only**: `EvidenceReference`s to the diff artifact, validator logs (redacted ones only), spec/contract excerpts and the criteria files; never diff text, log text or secrets; at most 8 KiB. The reviewer reads the files under `.project-run/evidence/**`. (Revision 4, OD-15 approved: the result is first validated against `contracts/result-validation.md`; bulky `criteria`/`fileDispositions` travel as validated evidence references when they exceed the inline limits.) The `ReviewResult` returns in `AgentResult.metadata.harness` (the engine validates only `execution_id`; the controller validates the rest) with evidence by reference.
 
 ## 2. `ReviewRequest` (engine → host)
 

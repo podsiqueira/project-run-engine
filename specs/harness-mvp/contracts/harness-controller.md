@@ -1,6 +1,6 @@
 # Contract: Harness Controller, Transitions and Recovery (H7)
 
-**Revision 3** (incorporates the T049 technical review, `t049-technical-review.md`). Drives FR-063..FR-072, FR-087..FR-089, FR-096..FR-108.
+**Revision 3** (incorporates the T049 technical review, `t049-technical-review.md`; published at `2576046`). **Revision 4** (uncommitted) records OD-15/OD-16 (host-result validation of §6.2; class A zero-write) and OD-14 (suspension at `PHASE_END`, §10), all approved 2026-10-15 as specification decisions.
 The controller composes existing contracts and owns **no state of its own** beyond the `harness` block. It does not replace the Coordinator's
 state fields; it refines them (§3a) and writes them only through one additive Coordinator method (`commit`, §8).
 
@@ -23,7 +23,7 @@ state fields; it refines them (§3a) and writes them only through one additive C
 | `nextProjectRunStepGuarded` pass 1 (read-only, unlocked, `project-run-step.ts:189`) | evaluate §2 steps 0–7 read-only; return the pending action / suspension / terminal; if answering needs a write (moving a pending action to `heldAction`, recording answers, recovering a window) return `needsLock` |
 | `nextProjectRunStepImpl` branches `AWAITING_AGENT_ACTION`, `HUMAN_INTERVENTION_REQUIRED` (with and without answers), `IN_PROGRESS`/default, `COMPLETED`/`FAILED` | all handled by the controller; the engine branches that call `reconstructResumeContext` or `runPrepare` are **unreachable** for Harness executions |
 | `submitProjectRunStepUnlocked` after its identity checks (`STALE_STEP`, `execution_id`) and **before** `coordinator.applyExternalResult` (`:566`) | Harness validation (§2a, §6.2) runs first; the result is applied only by `commit` |
-| `executeProjectRun`, `executeProjectResume`, `ProjectRunHost.start/resume`, `reconstructResumeContext` | refuse with `HARNESS_REQUIRES_PULL_API`, **no write**, when the persisted record carries `harness` (entry guards; these functions already load the record). The legacy `Coordinator.step/run/prepareNextAction/applyExternalResult` are public API that cannot see the persisted record and are **not** guarded; misuse by a hand-built Coordinator is detected afterwards by the tripwire (`HARNESS_STATE_DIVERGED`, FR-076) |
+| `executeProjectRun`, `executeProjectResume`, `ProjectRunHost.start/resume`, `reconstructResumeContext` | refuse with `HARNESS_REQUIRES_PULL_API`, **no write**, when the persisted record carries `harness` (entry guards). `executeProjectResume`/`reconstructResumeContext` already load the record; **`executeProjectRun` does not** — with a supplied id it takes the lock and then saves unconditionally (E-19), so its guard must **load the record under that lock before the first checkpoint**. Non-Harness behaviour, including the v0.5.0 same-id overwrite, is unchanged. The legacy `Coordinator.step/run/prepareNextAction/applyExternalResult` are public API that cannot see the persisted record and are **not** guarded; misuse by a hand-built Coordinator is detected afterwards by the tripwire (`HARNESS_STATE_DIVERGED`, FR-076) |
 
 An execution without a `harness` key takes exactly the v0.5.0 code paths (FR-001). A record whose evidence directory has a `MANIFEST.json` but **no** `harness` key is `HARNESS_STATE_DIVERGED` (an older engine dropped the block), not "non-Harness".
 
@@ -72,7 +72,7 @@ REMEDIATION_PENDING               ready: budget re-checked; dispatch REMEDIATION
                                   result valid → DIFF_INSPECTED → VERIFICATION_PENDING
 TASK_ACCEPTED (transient)         one commit: event + task state + cycle cleared + snapshot re-check → TASK_ELIGIBILITY_CHECK | PHASE_END
 ```
-Harness preset (D-10, revision 3): extends the Spec Kit preset (inheriting `getExpectedOutput`, `getStateSkillConfig`, `getSkillsForRole`) and supplies `validStates`, `allowedTransitions`, `stateToRole` **only for validating and labelling the Harness' own writes and for building dispatch requests** (`CoordinatorDecisionEngine.isTransitionAllowed`). Added edges (preset-local, additive): `INDEPENDENT_REVIEW→IMPLEMENT`, `RE_REVIEW→IMPLEMENT`, `IMPLEMENT→REMEDIATION`, `REMEDIATION→REMEDIATION`. There is **no** edge to `CONVERGE` in the MVP (OD-14, §10). The engine's `decide`/`resolveTransition` and `MAX_REMEDIATION_ITERATIONS` logic are never executed for a Harness execution, which makes FR-050 unconditional.
+Harness preset (D-10, revision 3): extends the Spec Kit preset (inheriting `getStateSkillConfig` and `getSkillsForRole`; `SpecKitV1Preset` defines neither `getExpectedOutput` nor `validStates`/`allowedTransitions`/`stateToRole`, so `expected_output` comes from the engine default (`decision-engine.ts:343–345`) and the Harness preset supplies its own tables) and supplies `validStates`, `allowedTransitions`, `stateToRole` **only for validating and labelling the Harness' own writes and for building dispatch requests** (`CoordinatorDecisionEngine.isTransitionAllowed`). Added edges (preset-local, additive): `INDEPENDENT_REVIEW→IMPLEMENT`, `RE_REVIEW→IMPLEMENT`, `IMPLEMENT→REMEDIATION`, `REMEDIATION→REMEDIATION`. There is **no** edge to `CONVERGE` in the MVP (OD-14, §10). The engine's `decide`/`resolveTransition` and `MAX_REMEDIATION_ITERATIONS` logic are never executed for a Harness execution, which makes FR-050 unconditional.
 
 ### 3a. Projection table: engine fields refined by `harness.cycle.step` (FR-087, FR-088, FR-101)
 
@@ -145,7 +145,7 @@ type SuspensionReason = "STOP_POINT" | "GATE_REQUIRED" | "PHASE_END" | "BLOCKED_
   | "GRAPH_INVALID" | "ENVELOPE_EXPIRED" | "ENVELOPE_REVOKED" | "LIMIT_REACHED" | "BASELINE_NOT_CLEAN" | "BASELINE_DRIFT"
   | "IGNORED_FILE_CHANGED" | "PATH_AMBIGUOUS" | "SUBMISSION_REFUSED" | "STALE_VALIDATOR_PROCESS";
 ```
-It is surfaced through the **existing** `HUMAN_INTERVENTION_REQUIRED` fields: `human_intervention.reason` and `human_intervention.questions`. Because the Coordinator derives questions from findings (`deriveHumanQuestions`, which yields one generic `intervention-required` question when there are none), `commit` accepts an explicit `questions` override: one `HumanQuestion` per suspension with `id = suspensionId`, `question` = reason + detail, and `options` = the legal human operations (`HumanQuestionOption{id,label,description}`, no new type). `validateHumanAnswers` then validates answers against these ids exactly as today.
+The `human_intervention.reason` of every Harness suspension starts with the prefix `HARNESS_SUSPENSION:<REASON_CODE>` so that a host can recognise it (the existing host skill would otherwise re-present the same suspension after each answer, see R-31). It is surfaced through the **existing** `HUMAN_INTERVENTION_REQUIRED` fields (the public `statusProjectRun` returns the persisted record unchanged, `status.ts` ≈ lines 88–104, so no public type changes): `human_intervention.reason` and `human_intervention.questions`. Because the Coordinator derives questions from findings (`deriveHumanQuestions`, which yields one generic `intervention-required` question when there are none), `commit` accepts an explicit `questions` override: one `HumanQuestion` per suspension with `id = suspensionId`, `question` = reason + detail, and `options` = the legal human operations (`HumanQuestionOption{id,label,description}`, no new type). `validateHumanAnswers` then validates answers against these ids exactly as today.
 `FAIL_CLOSED` reasons (`HARNESS_STATE_DIVERGED`, `LEDGER_CHAIN_BROKEN`, `ENVELOPE_TAMPERED`, `IN_CYCLE_INVARIANT`, `STATE_INCOHERENT`, `HARNESS_PLATFORM_UNSUPPORTED`, `HARNESS_REQUIRES_PULL_API`, `ADOPTION_STATE_UNSUPPORTED`) refuse all progress until a human resolves them outside the Harness.
 
 ## 5. Recovery by boundary (FR-070, SC-004)
@@ -156,7 +156,8 @@ It is surfaced through the **existing** `HUMAN_INTERVENTION_REQUIRED` fields: `h
 | R2 | after baseline captured, before the commit | T0 | baseline re-captured (same tree ⇒ same id); orphan evidence file tolerated | no |
 | R3 | dispatch commit saved, host not yet told / host crashed | T2/T8 | next call returns the **same** `step_id` | already counted once (remediation) |
 | R4 | host worked, crashed before submit | T2/T5/T8 | as R3; delta verified at submit | once |
-| R5 | submit received, Harness validation fails | T2/T5/T8 | `RESULT_REJECTED` event; **1st** rejection: pending stays, no suspension; **2nd** (`maxSubmissionRejections`=2): step closed unsuccessful, `RESULT_INVALID` suspension | no extra |
+| R28 | submit received, **class A** structural validation fails (OD-15/OD-16 approved) | T2/T5/T8 | zero-write response `RESULT_REJECTED_*`; same row, same `step_id`, `requested_at` unchanged; host resubmits a corrected result, or TTL ⇒ `DISPATCH_TIMEOUT`; never counted | no extra |
+| R5 | submit received, **class B** semantic validation fails | T2/T5/T8 | `RESULT_REJECTED` event; **1st** rejection: pending stays, no suspension; **2nd** (`maxSubmissionRejections`=2): step closed unsuccessful, `RESULT_INVALID` suspension | no extra |
 | R6 | validation passed, `commit` not saved (conflict/write failure) | T2/T5/T8 | non-terminal failure; host re-submits the same `step_id`; applies once | no extra |
 | R7 | after W3 (T3), before validators | T3 | validators run | no |
 | R8 | mid-validator | T3 | partial logs ignored; whole set re-run; **stale-process check first** (R20) | no |
@@ -188,12 +189,14 @@ It is surfaced through the **existing** `HUMAN_INTERVENTION_REQUIRED` fields: `h
 Builds the in-memory view from the **persisted record only**, never mutating engine counters or results: `state = persisted.state` (restored from `suspended_from` only by `resumeSuspension`, §7); `last_result` preserved (never cleared); `remediation_iteration`/`iteration` copied unchanged; `human_approved`/`human_resolved` are **not** set; no `shouldReverifyOnResume`. The `harness` block is copied byte-for-byte except for the fields a `commit` changes.
 
 ### 6.1a Dispatch request construction
+`AgentDispatcher.prepareRequest` **mutates its argument in place** (`agent-dispatcher.ts:66–113`: `capability`, `skill`, `skill_metadata`, `skills`, `required_skills`) and returns the same object; the Harness therefore builds a **fresh transient request per dispatch** and never reuses or caches one.
 Requests are built with the engine's public `resolveDispatch` on a transient context derived from the persisted record (so roles, skills and `expected_output` come from the same preset machinery), enriched/validated by `dispatcher.prepareRequest` (skill validation unchanged; a `SkillValidationError` becomes the existing `BLOCKED_MISSING_SKILLS` response and writes nothing), and then the `context` field is **replaced** by the references-only Harness payload (FR-102). `options.timeout_ms` is set from the envelope (FR-023).
 
 ### 6.2 Submission pipeline (before any write)
 1. engine-level checks as today (`NO_PENDING_ACTION`, `STALE_STEP`, `execution_id`);
 2. §2 steps 0–8;
-3. result schema (`AgentResult.metadata.harness`, FR-103), identity, snapshot/diff inspection, reviewer independence, rejection counting;
+3. **class A structural validation** (OD-15 approved; `result-validation.md`): closed schema, limits, evidence-reference verification. A failure returns `RESULT_REJECTED_TOO_LARGE|MALFORMED|EVIDENCE`, writes **nothing** (no event, no counter, no `applyExternalResult`; OD-16 Option A), is not counted, and leaves the row unchanged (T2/T5/T8);
+3b. **class B semantic checks**: identity, snapshot/diff inspection, reviewer independence, coverage; durable `RESULT_REJECTED` event and rejection counting as FR-068;
 4. only then `commit` (W3 or W6). No call to `applyExternalResult`.
 
 ## 7. Human operations: common rules and answers (FR-098)
@@ -221,7 +224,7 @@ Coordinator.commit(persisted: PersistedExecutionState, change: {
   harness: unknown;                                    // the complete next harness block
 }): Promise<{ revision: number }>
 ```
-Semantics: builds the new record as `{ ...persisted, ...overrides }` (so every existing and unknown field is preserved), validates `state` transitions with the Harness preset's `isTransitionAllowed` (no-op `X→X` allowed; `HUMAN_INTERVENTION_REQUIRED → suspended_from` allowed **only** for `resumeSuspension`, because the engine matrix gives `HUMAN_INTERVENTION_REQUIRED` no outgoing edges; `adoptExecution` W0 is the only other special case), appends (never replaces) `step_log`/`history`/`human_answers`, writes with `expectedRevision = persisted.revision`, and throws the existing `CheckpointWriteError`/`CheckpointConflictError`. It performs **one** save. It does not run the decision engine, a dispatcher or any adapter.
+Semantics: builds the new record as `{ ...persisted, ...overrides }` (so every existing and unknown field is preserved), validates `state` transitions with the Harness preset's `isTransitionAllowed` (no-op `X→X` allowed; `HUMAN_INTERVENTION_REQUIRED → suspended_from` allowed **only** for `resumeSuspension`, because the engine matrix gives `HUMAN_INTERVENTION_REQUIRED` no outgoing edges and `docs/transition-contract.md` (the section before "Transition Persistence") requires rejecting any transition *from* it; the restoration mirrors the engine's own resume, which sets `state = suspended_from` outside the matrix (`project-run.ts:700–703`) and is therefore a restoration, not a transition; `adoptExecution` W0 is the only other special case), appends (never replaces) `step_log`/`history`/`human_answers`, writes with `expectedRevision = persisted.revision`, and throws the existing `CheckpointWriteError`/`CheckpointConflictError`. It performs **one** save. It does not run the decision engine, a dispatcher or any adapter.
 Because it starts from the persisted record, the carry-forward hazard of E-8 does not exist for Harness executions, and **no field is added to `CoordinatorExecutionContext` or `CoordinatorOptions`**.
 
 **Exported type/API delta (complete list; anything else is a spec violation, FR-105, SC-011)**:
@@ -235,13 +238,22 @@ The new failure codes (`HARNESS_REQUIRES_PULL_API`, …) are carried in the exis
 - Before spawning, the executor writes `.project-run/evidence/<exec>/runs/<runId>.json` `{ runId, validatorId, pgid, startedAt, snapshotId }`, and removes the record when the process group has exited. Recovery of T3 lists run records: a live process group (pid probe on the group leader) ⇒ `STALE_VALIDATOR_PROCESS` suspension (never a second concurrent run); a dead one ⇒ the record is closed with an `INTERRUPTED` event and the validators are re-run.
 - Validators run **inside** the execution lock. A human operation arriving meanwhile waits up to the lock wait (default 30 s) and then returns the existing non-terminal `EXECUTION_LOCKED`; effect of a revocation is therefore at the next boundary, bounded by the validator timeout. Pass-1 reads (`next` without mutation) are unaffected.
 
-## 10. Scope boundary of the MVP loop (OD-14, open)
+## 10. Phase boundary: suspension at `PHASE_END` (OD-14 — **approved 2026-10-15** as a specification decision)
 
-The Harness governs `IMPLEMENT … RE_REVIEW` only. After all authorised tasks are accepted the execution **stays suspended** with `PHASE_END`; the Harness does not transition to `CONVERGE`/`READY_FOR_PR`, because those stages would run under the engine's own remediation loop, outside the Harness budget. Handing off to the engine's later stages is a separate decision (OD-14); until then the engine's `CONVERGE` is not reachable from a Harness execution.
+The Harness governs `IMPLEMENT … RE_REVIEW` only. `PHASE_END` is a **mandatory stop point of every envelope** (it cannot be removed by policy or envelope, FR-115).
+
+1. **Reaching it**: when every authorised task is `ACCEPTED`, or no authorised task remains eligible, W11 suspends with `PHASE_END` (row T9, no cycle; `suspension.restoreRow = T0`). Nothing is dispatched; no `CONVERGE`/`READY_FOR_PR` stage is evaluated or entered (no preset edge exists).
+2. **While suspended**: `next` and `/loop` return the suspension; `humanAnswers` are audit-only (§7a).
+3. **Explicit authorisation to continue** — a human-only `recordGateDecision{gate:"PHASE_END", decisionId, actor, decision}`:
+   - `CLOSE_PHASE`: envelope → `COMPLETED`; the execution stays suspended; no further Harness activity.
+   - `CONTINUE`: valid only together with a **new or amended ACTIVE envelope** that authorises further tasks (`issueEnvelope`/`amendEnvelope` rules, including pins and baseline), named by `authorizationId`; then `resumeSuspension` restores row T0 and the normal cycle runs under the usual authorisation checks.
+   `actor.kind` must be `HUMAN`; the engine still cannot authenticate the actor (NG-8).
+4. **No per-task human approval is introduced**: inside an authorised phase tasks are accepted and the next eligible task is started automatically whenever I1 and FR-007/FR-014 hold. The only human checkpoints are `PHASE_END`, the `stopPoints` the authorising human listed in the envelope, and explicit gate markers on tasks (FR-018).
+5. **OD-17 (approved 2026-10-15 as a specification decision)**: continuation requires an explicit action by an authorised **human actor** (`Actor.kind = HUMAN`) through the existing authorisation path (the `GateDecision` plus a new/amended ACTIVE envelope above); the software `Coordinator` may validate and enforce the authorisation but its own decision never substitutes for it; there is no automatic transition to `CONVERGE`, `READY_FOR_PR` or any legacy remediation path, and no such hand-off is authorised or specified. The engine's `CONVERGE` is not reachable from a Harness execution in the MVP, because it would run the engine's own remediation loop outside the Harness budget.
 
 ## 11. Idempotency and `/loop`
 
-Correlation = `(executionId, cycleId, step_id)`. A repeated `next` with a pending action is a pure read. A repeated `submit` with a consumed `step_id` is `STALE_STEP`. `/loop` is an external caller: each iteration is a fresh `next()` and re-runs §2; there is no loop state in the engine. External effects of validators or agents are *at-least-once*; the spec does not claim exactly-once. Validators are required to be idempotent by policy review (R-5). Timestamps used for audit come from Harness events, never from checkpoint `created_at` (rewritten on every save, `coordinator.ts:244`).
+Correlation = `(executionId, cycleId, step_id)`. A repeated `next` with a pending action is a pure read. A repeated `submit` with a consumed `step_id` is rejected without effect: `STALE_STEP` when a different action is pending, `NO_PENDING_ACTION` when none is (for example in the `IN_PROGRESS` window after the result was applied, row T3). `/loop` is an external caller: each iteration is a fresh `next()` and re-runs §2; there is no loop state in the engine. External effects of validators or agents are *at-least-once*; the spec does not claim exactly-once. Validators are required to be idempotent by policy review (R-5). Timestamps used for audit come from Harness events, never from checkpoint `created_at` (rewritten on every save, `coordinator.ts:244`).
 
 ## 12. Test list (H7)
 

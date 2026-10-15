@@ -1,6 +1,6 @@
 # Implementation Plan: Autonomous Engineering Harness MVP
 
-**Branch/Location**: `specs/harness-mvp/` · **Status**: Gate A APPROVED 2026-10-15 (specification phase concluded, revision 2) · **Gate B: BLOCKED** (needs T049 technical review and a new explicit authorisation) · **Spec**: `spec.md`
+**Branch/Location**: `specs/harness-mvp/` · **Status**: Gate A APPROVED 2026-10-15 (specification phase concluded, revision 2) · **Gate B: AUTHORISED 2026-10-15** for the isolated vertical slice only (T049 closed, `t049-technical-review.md` §13); Gates C and D blocked · **Spec**: `spec.md`
 **Input**: `spec.md`, `research.md`, `data-model.md`, `contracts/*`, `acceptance-scenarios.md`
 > This plan describes *future* work. Nothing here authorises implementation.
 
@@ -51,7 +51,8 @@ src/harness/
   preset.ts                 spec-kit-harness-v1 preset: validStates/allowedTransitions/stateToRole only (no decide/resolveTransition use)
   commit.ts                 Harness-side builder of the Coordinator.commit change object
   guards.ts                 entry guards (HARNESS_REQUIRES_PULL_API)
-  recovery.ts               projection table rows T0-T9, write sequences W1-W13, recovery actions
+  recovery.ts               projection table rows T0-T9, write sequences W0-W13, recovery actions
+  result-validation.ts      (OD-15) closed schema harness-result/v1, bounded counting serializer, limits, evidence-reference verification
   node/                     ONLY place allowed node:child_process (OD-1); internal, not exported
   path-matching.ts          closed glob subset, scope decision, symlink checks (contracts/path-matching.md)
     validator-executor.ts   ValidatorExecutor implementation
@@ -110,7 +111,7 @@ H0–H7 traceability to artifacts:
 - **Unit**: envelope, graph/scheduler, allowlist/executor argv rules, findings/fingerprints, budget arithmetic, hash chain.
 - **Contract**: host adapter shape unchanged; reviewer binds to snapshot; `ValidatorResult` only from executor; additive persistence; public API surface; skills still resolved per role.
 - **Integration/recovery**: positive and negative cycles; R1–R19; restart with pending action; CAS/lock/write faults; `/loop`; push entry points refusing Harness executions; non-Harness regression (4-dispatch behaviour retained).
-- **Property**: counter monotonic and invariant across every resume point; I1–I8; projection-table coherence; path-matching vectors (30).
+- **Property**: counter monotonic and invariant across every resume point; I1–I8; projection-table coherence; path-matching vectors (32).
 - **Golden**: v0.4.0/v0.5.0 checkpoints load/resume identically.
 - Real subprocesses (not mocks) for the Node executor and the lock tests, consistent with the existing multi-process tests.
 
@@ -128,7 +129,7 @@ H0–H7 traceability to artifacts:
 
 ### Owner decisions: all nine (OD-1…OD-9) approved on 2026-10-15
 
-Approval covers the decisions as written in this plan. OD-1 approves the boundary amendment in principle; the test change itself (T003) stays blocked until Gate B.
+Approval covers the decisions as written in this plan. OD-1 approves the boundary amendment in principle; the test change itself (T003) is part of the Gate B isolated slice (authorised 2026-10-15) and is not yet done.
 
 - **OD-1 (blocks Gate B)** **[APPROVED 2026-10-15]** Approve the boundary amendment: `node:crypto` allowed in core; `node:child_process` and `node:os` (env/tmp only if needed) allowed solely in `src/harness/node/`; updated `package-boundary.test.ts`.
 - **OD-2** **[APPROVED 2026-10-15]** Confirm the Harness preset's extra transitions (D-10) as the mechanism for the per-task loop (vs. any alternative the owner prefers).
@@ -138,12 +139,15 @@ Approval covers the decisions as written in this plan. OD-1 approves the boundar
 - **OD-6** **[APPROVED 2026-10-15]** Confirm the cumulative cap on `RemediationBudgetGrant`s (`maxGrantedAttemptsPerTask`, default 3, i.e. at most 6 attempts per task in total).
 - **OD-7** **[APPROVED 2026-10-15]** Confirm that consumption is tracked per `(executionId, taskId)` across envelope lineages (each attempt still records its envelope), a conservative reading of "per task and authorization envelope" so that re-issuing an envelope cannot reset the budget.
 - **OD-8 (blocks Gate B)** **[APPROVED 2026-10-15]** Confirm the path-matching dialect and POSIX-only platform scope (`contracts/path-matching.md`, FR-093/094) and the `CLEAN_REQUIRED` default baseline (FR-082).
-- **OD-10** **[APPROVED FOR SPECIFICATION 2026-10-15; re-confirm in the Gate B request]** Exported delta limited to `PersistedExecutionState.harness?: unknown` (optional) and one `@internal Coordinator.commit` (FR-105).
-- **OD-11** **[APPROVED FOR SPECIFICATION]** Harness executions are pull-only; legacy and push entry points refuse them (FR-097).
-- **OD-12** **[APPROVED FOR SPECIFICATION]** Additive, behaviour-preserving Coordinator extension (`commit` + guards) is in Gate B scope (FR-099).
-- **OD-13** **[APPROVED FOR SPECIFICATION]** The dispatch↔applied-step pairing may not hold for Harness executions after abandonment/timeout (FR-108).
-- **OD-15 (OPEN)** Host-supplied results: the engine persists the full `last_result` (`evidence: unknown[]`, findings text) and findings in `step_log`; FR-102 limits Harness-built requests and events only. Accept the existing behaviour, or add a size/content check on submitted results to FR-102 (analysis §5).
-- **OD-14 (OPEN)** Hand-off after `PHASE_END`: default is that a Harness execution **stays suspended** and never enters the engine's `CONVERGE`/`READY_FOR_PR` (no preset edge); alternatives are a later, separately approved hand-off design.
+- **OD-10** **[APPROVED FOR SPECIFICATION 2026-10-15; RECONFIRMED 2026-10-15 in the Gate B authorisation]** Exported delta limited to `PersistedExecutionState.harness?: unknown` (optional) and one `@internal Coordinator.commit` (FR-105).
+- **OD-11** **[APPROVED FOR SPECIFICATION; RECONFIRMED 2026-10-15 in the Gate B authorisation]** Harness executions are pull-only; legacy and push entry points refuse them (FR-097).
+- **OD-12** **[APPROVED FOR SPECIFICATION; RECONFIRMED 2026-10-15 in the Gate B authorisation]** Additive, behaviour-preserving Coordinator extension (`commit` + guards) is in Gate B scope (FR-099).
+- **OD-13** **[APPROVED FOR SPECIFICATION; RECONFIRMED 2026-10-15 in the Gate B authorisation]** The dispatch↔applied-step pairing may not hold for Harness executions after abandonment/timeout (FR-108).
+- **OD-15 [APPROVED 2026-10-15 as specification decision; numeric limits PROVISIONAL]** Host-supplied results: validation architecture approved — closed schema `harness-result/v1`, bounded serialization, read-only evidence-reference validation, rejection before `commit`, non-Harness behaviour unchanged (`contracts/result-validation.md`, FR-109…FR-114). The numeric limits (e.g. 64 KiB per result, 1 KiB per string, 32 findings, 16 evidence references, 1 MiB per file, 4 MiB aggregate) are **provisional initial specification limits**, explicit and testable but **not empirically validated**; they stay distinct from the 8 KiB request-context and 4 KiB event limits and are to be confirmed or amended after measurement (T065, R-27).
+- **OD-14 [APPROVED 2026-10-15 as specification decision]** Suspension at `PHASE_END`: the Harness suspends at the phase boundary and continuing requires an explicit human authorisation (FR-115); no per-task human approval is introduced inside an already authorised phase; no hand-off to `CONVERGE`/`READY_FOR_PR` is authorised or specified (OD-17, approved).
+- **OD-16 [APPROVED 2026-10-15 as specification decision — Option A]** Structural (class A) validation failures are rejected before any durable mutation: no durable rejection counter or event, no `applyExternalResult`, bounded non-echoing diagnostics; semantic (class B) rejections keep FR-068 with durable events and counters. The observability trade-off and the existing retry/TTL recovery are documented in `contracts/result-validation.md` §3 and R-29. Options B and C were not chosen (CF-1 resolved).
+- **OD-17 [APPROVED 2026-10-15 as specification decision]** Left open by OD-14; resolved as: (a) continuation after `PHASE_END` requires an explicit action by an authorised **human actor** (`Actor.kind = HUMAN`) through the existing authorisation path (`GateDecision` + new/amended ACTIVE envelope); the software `Coordinator` may validate and enforce it, but its own internal decision is not a substitute for human authorisation; (b) there is **no** automatic transition to `CONVERGE`, `READY_FOR_PR` or any legacy remediation path, and any such hand-off is **not authorised and out of scope** of this specification.
+- **OD-18 [APPROVED 2026-10-15 as specification decision; applied to the contracts]** `.agents/skills/**` and `.project-run/skills/**` (skill search paths, `project-config.ts:292`; `project-run init` writes and, with `--force`, overwrites `.agents/skills/*`, `bootstrap.ts` ≈ 200–357) join the **mandatory protected set** (FR-090; detection only, E2; path-matching vectors 31–32).
 - **OD-9** **[APPROVED 2026-10-15]** Defer host/CLI exposure of human-only operations and status to Gate C (FR-095); at Gate B they are internal functions only.
 
 ### Risk register
@@ -167,7 +171,7 @@ Approval covers the decisions as written in this plan. OD-1 approves the boundar
 | R-15 | Prohibited operations are denied by policy, not prevented | enforcement classes E1/E2/E3 in policy, status and docs (FR-079); `OPERATION_NOT_PERMITTED` only on visible evidence | network, git push, deploy, migrations, DB, secrets reads are unobserved unless the host reports them |
 | R-16 | Credentials/secrets reachable by agent or validator processes | fixture hygiene + canary test (FR-081, SC-008); minimal env; `HOME` redirect | no sandbox: in real use the OS user's files and network remain reachable |
 | R-17 | Dirty or ignored files influence validator output outside the reviewed diff | clean-tree default, chain of custody, dirty-baseline approval, ignored files hashed and surfaced (FR-082..084) | contents of ignored files are never shown to the reviewer; excluded paths (`ignoredExclusions`) are not examined |
-| R-18 | Path matching ambiguity (case-insensitive FS, Unicode, symlinks, hard links) | closed dialect, validate-not-normalise, collision detection, symlink rules, 30 vectors | hard links and bind mounts undetected; Windows unsupported |
+| R-18 | Path matching ambiguity (case-insensitive FS, Unicode, symlinks, hard links) | closed dialect, validate-not-normalise, collision detection, symlink rules, 32 vectors | hard links and bind mounts undetected; Windows unsupported |
 | R-19 | `STATE_INCOHERENT` after manual edits, old engines or faulty resume | projection table, fail closed, `reconcileCycle` | recovery is manual |
 | R-20 | Structural `tasks.md` digest depends on parser fidelity | `parserVersion` pin, `PARSER_VERSION_CHANGED`, vectors | prose not following Spec Kit task format is invisible to the graph |
 | R-21 | Validators hold the execution lock; revocation waits | validator timeouts; revocation effective at next boundary (FR-107) | `EXECUTION_LOCKED` for ≤ validator timeout |
@@ -175,4 +179,9 @@ Approval covers the decisions as written in this plan. OD-1 approves the boundar
 | R-23 | Agent `timeout_ms` not enforced by the engine in pull mode | `dispatchTtlMs` suspension; documented E3 (FR-023) | a host may ignore the option |
 | R-24 | Exported-type delta (one field, one method) is still a public change | complete list, type-surface test, OD-10 | consumers with exhaustive record types unaffected (optional field) |
 | R-26 | A hand-built `Coordinator` (public API) can still run on a Harness execution and drop the block | entry guards on every loading entry point; manifest tripwire detects it afterwards | detection after the fact, not prevention (E2) |
-| R-25 | A Harness execution stays suspended at `PHASE_END` (OD-14) | explicit scope boundary | no automatic path to PR in the MVP |
+| R-27 | Result limits are provisional initial specification limits (OD-15), not measured on a real workload | explicit, testable, policy fields with hard ceilings; observed maxima recorded on the Gate B fixture (T065); amended only by an explicit specification change | a legitimate host may exceed a default and must use evidence references |
+| R-28 | Secret-pattern scanning of submitted strings is best-effort (false negatives and positives) | policy patterns, 1 KiB string cap, evidence redaction pipeline | a secret in a short string can still be persisted; no sandbox |
+| R-29 | Class A rejections leave no durable audit record (OD-16 Option A, approved trade-off) | bounded non-echoing host response; `dispatchTtlMs` bound; read-only bounded validation cost | repeated invalid submissions are visible only in host logs; a digest-only event would be a separate future decision |
+| R-30 | A legacy push start with the id of an existing execution restarts it and overwrites its checkpoint without a revision check (E-19; documented in `ARCHITECTURE.md` §4.17.2 and pinned by `state-store-contract.test.ts:542`); for a Harness execution that would destroy counters and events, which live only in the block | entry guard loads the record under the lock before the first save (FR-097); manifest tripwire detects an overwrite that bypassed the guard (hand-built Coordinator, direct store use) | counters are not recoverable from the evidence directory; recovery is a restored checkpoint backup (operational control, not specified) |
+| R-31 | The existing host skill (`templates/host-integrations/claude-code/project-engine-run/SKILL.md`, steps 4–5) resumes by `humanAnswers` and treats an unchanged suspension as "ask the user to clarify"; for a Harness suspension, where answers are audit-only, a host following it would loop | `HARNESS_SUSPENSION:` reason prefix; skill text update is part of the Gate C exposure task (T048) | until T048 no real host can drive a Harness execution (by design, FR-095) |
+| R-25 | A Harness execution is suspended at `PHASE_END` and continues only on explicit human authorisation (OD-14, approved) | mandatory stop point (FR-115); `CLOSE_PHASE`/`CONTINUE` decisions | no automatic path to PR in the MVP; hand-off not authorised (OD-17 approved) |
