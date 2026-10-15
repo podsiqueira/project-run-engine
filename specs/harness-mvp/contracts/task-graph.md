@@ -79,7 +79,7 @@ Cycle states per task: `NOT_STARTED → IN_CYCLE → ACCEPTED | SUSPENDED`; `SUS
 
 ## 7. Phase end
 
-When no authorised task remains eligible: if all authorised tasks are `ACCEPTED` → `PHASE_END` stop point (suspend for human decision; envelope → `COMPLETED` only on human confirmation); if some are blocked → suspend listing reasons. The Harness never advances to `CONVERGE`/`READY_FOR_PR` unless **all feature tasks** are satisfied and a human has confirmed `PHASE_END`.
+When no authorised task remains eligible: if all authorised tasks are `ACCEPTED` → `PHASE_END` stop point (suspend for human decision; envelope → `COMPLETED` only on human confirmation); if some are blocked → suspend listing reasons. In the MVP the Harness **never** advances to `CONVERGE`/`READY_FOR_PR`: after `PHASE_END` the execution stays suspended (OD-14, harness-controller §10).
 
 ## 8. Test list (H2)
 

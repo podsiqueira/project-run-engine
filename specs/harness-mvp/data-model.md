@@ -17,7 +17,7 @@ Index of entities, ownership, and cross-entity invariants. Field-level definitio
 | `RemediationBudget`, `RemediationAttemptRecord`, `RemediationBudgetGrant` | `harness.budgets` (+ events) | counters monotonic | `contracts/remediation-budget.md` |
 | `DirtyBaselineApproval` | `harness.dirtyBaselineApproval` + `BASELINE_APPROVED` event (human-only; absent by default) | immutable | `contracts/verification-pipeline.md` §6.1 |
 | `PathPattern` / scope decision | policy and envelope fields; pure function | validated, never rewritten | `contracts/path-matching.md` |
-| `StateProjection` (allowed combinations) | specification table, enforced at evaluation step 4 | fixed | `contracts/harness-controller.md` §3a |
+| `StateProjection` (table rows T0–T9 and write sequences W1–W13) | specification table, enforced at evaluation step 4; completeness proved by enumerating W-sequences | fixed | `contracts/harness-controller.md` §3a/§3b |
 | `HarnessEvent` | `harness.events[]` | append-only, hash-chained | `contracts/evidence-ledger.md` §3 |
 | `EvidenceReference` | inside events | immutable | same §5 |
 | `HarnessSuspension` | existing `human_intervention` (+ `SUSPENDED` event) | replaced per suspension (as today); history in events | `contracts/harness-controller.md` §4 |
@@ -34,9 +34,13 @@ Index of entities, ownership, and cross-entity invariants. Field-level definitio
 7. No event `data` contains payload (enforced by a schema allowing only ids, digests, numbers, enums, ISO times, `EvidenceReference`).
 8. The engine's own fields (`remediation_iteration`, `iteration`, `history`, `step_log`) keep their v0.5.0 meaning; Harness code writes them only through the existing coordinator paths.
 9. `cycle.baselineTreeDigest` equals the previous accepted subject's `treeDigest` (or `envelope.baseline.startTreeDigest` for the first task) unless an approved dirty baseline applies; otherwise `BASELINE_DRIFT`.
-10. The tuple (`state`, `lifecycle_status`, `pending_action`, `cycle.step`) is in the projection table (controller §3a); `cycle.heldAction` exists only in step `SUSPENDED`.
+10. After every `commit` the tuple (`state`, `lifecycle_status`, `pending_action`, `cycle.step`) is one of the rows T0–T9 (controller §3a); `cycle.heldAction` exists only in T9; a tuple outside the rows is `STATE_INCOHERENT`, never a tuple that has a recovery action.
 11. `Σ grants.additionalAttempts ≤ policy.remediation.maxGrantedAttemptsPerTask`; `baseLimit` never changes after first authorisation of the task.
 
 ## State diagram (per task)
 
 `NOT_STARTED → IN_CYCLE → ACCEPTED` · `IN_CYCLE → SUSPENDED → IN_CYCLE` (human) · `SUSPENDED → EXCLUDED` (via envelope amendment removing the task) · `ACCEPTED → ACCEPTED+UPSTREAM_CHANGED` (flag only).
+
+12. Every `commit` is one CAS save built from the persisted record; the engine's `remediation_iteration`, `iteration` and `last_result` are changed only where the write sequence says so (never by a human answer); `history`/`step_log`/`human_answers` are append-only.
+13. `request.context` of any persisted `pending_action` ≤ 8 KiB and each event `data` ≤ 4 KiB, references and digests only (FR-102).
+14. A record is a Harness execution iff its `harness` block validates; `preset` and configuration labels never decide it (FR-096).

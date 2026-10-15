@@ -12,6 +12,7 @@ interface ValidatorExecutor {
 interface SnapshotProvider {
   capture(workspaceRoot: string, opts: { excludeGlobs: string[]; maxFileBytes: number }): Promise<SnapshotIdentity>;
   diff(baseline: SnapshotIdentity, subject: SnapshotIdentity): Promise<DiffArtifact>;  // content-addressed
+  isIgnored(workspaceRoot: string, paths: string[]): Promise<Record<string, boolean>>;  // `git check-ignore` (FR-058, harnessDoctor)
 }
 ```
 The controller MUST refuse to run without both ports (`HARNESS_PORTS_MISSING`, fail closed).
@@ -44,6 +45,12 @@ The allowlist (`policy.validators`) is protected: not editable by agents during 
 5. Timeout ⇒ kill the process group, record `timedOut: true`, outcome `ERROR(TIMEOUT)`.
 6. Cancellation via `AbortSignal` ⇒ `ERROR(CANCELLED)`.
 7. Validators run **sequentially** in policy order (deterministic logs), each on the same subject snapshot; the snapshot is re-captured after the last validator and its **non-ignored** entries must equal the subject's (ignored-file side effects are recorded, §6.2), otherwise all results are `INVALIDATED(SNAPSHOT_DRIFT)` and the cycle suspends (`WORKSPACE_MUTATED_DURING_VERIFICATION`).
+
+### 3a. Run records, lock and timeouts (FR-106, FR-107, FR-023)
+
+- **Run record**: before spawning, write `.project-run/evidence/<exec>/runs/<runId>.json` `{runId, validatorId, pgid, snapshotId, startedAt}`; remove it when the group has exited. Recovery of the verification window (row T3) lists run records: a live process group ⇒ `STALE_VALIDATOR_PROCESS` suspension; a dead one ⇒ `VALIDATOR_RUN_INTERRUPTED` event and a full re-run. A second concurrent run on the same workspace never starts.
+- **Lock**: validators run inside the execution lock; concurrent human operations wait up to the lock wait (default 30 s) and may get the existing non-terminal `EXECUTION_LOCKED`; a revocation therefore takes effect at the next boundary, bounded by the validator timeout.
+- **Agent timeouts**: not here; `request.options.timeout_ms` for agent dispatches is set by the Harness and is **host-enforced (E3)**.
 
 ## 4. `ValidatorResult`
 
@@ -107,4 +114,4 @@ Logical enforcement only (see authorization-envelope §0). No network isolation 
 
 ## 9. Test list (H3)
 
-allowed command passes · exit≠0 ⇒ FAILED + finding · spawn error ⇒ ERROR · timeout ⇒ ERROR + process group killed · missing binary · cwd symlink escape · env var not allowlisted absent · secret value in output masked · output cap truncation recorded · validator definition edited ⇒ `PIN_MISMATCH` · agent-claimed pass ignored · result for old snapshot not reusable · snapshot drift during run ⇒ invalidated · dirty tree at issuance refused · chain of custody between tasks · BASELINE_DRIFT after out-of-band edit · approved dirty baseline reaches reviewer · ignored file hashed but content absent from patch · ignored change ⇒ IGNORED_FILE_CHANGED · exclusion visible as EXCLUDED_BY_POLICY · required validator missing ⇒ no review · protected-path diff ⇒ suspension before validators.
+orphan validator after SIGKILL ⇒ STALE_VALIDATOR_PROCESS · revoke during a validator run ⇒ EXECUTION_LOCKED then success · allowed command passes · exit≠0 ⇒ FAILED + finding · spawn error ⇒ ERROR · timeout ⇒ ERROR + process group killed · missing binary · cwd symlink escape · env var not allowlisted absent · secret value in output masked · output cap truncation recorded · validator definition edited ⇒ `PIN_MISMATCH` · agent-claimed pass ignored · result for old snapshot not reusable · snapshot drift during run ⇒ invalidated · dirty tree at issuance refused · chain of custody between tasks · BASELINE_DRIFT after out-of-band edit · approved dirty baseline reaches reviewer · ignored file hashed but content absent from patch · ignored change ⇒ IGNORED_FILE_CHANGED · exclusion visible as EXCLUDED_BY_POLICY · required validator missing ⇒ no review · protected-path diff ⇒ suspension before validators.

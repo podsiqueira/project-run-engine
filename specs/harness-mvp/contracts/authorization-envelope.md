@@ -10,8 +10,8 @@ Nothing in this contract makes an operation *impossible*. Each rule has an **enf
 | Class | Meaning | What the Harness actually does | Examples |
 |---|---|---|---|
 | **E1** engine-refused | The engine itself will not perform or accept it | refuses to dispatch / run / accept; typed denial | dispatching an unauthorised or ineligible task; accepting without validators; running a non-allowlisted validator; accepting an unreviewed snapshot |
-| **E2** detected after the fact | The change can happen; the engine sees it in the workspace and reacts | diff inspection ⇒ `OUT_OF_SCOPE_CHANGE`, acceptance refused, suspension; the change stays on disk; **no rollback** | edits to protected paths, edits outside `allowedPaths`, new symlinks, edits to policy/allowlist/envelope files, `tasks.md` changes beyond the own checkbox |
-| **E3** host/environment-enforced, otherwise not enforced | The engine cannot observe or stop it | nothing, unless the host reports it; `OPERATION_NOT_PERMITTED` only on visible evidence (FR-080) | network egress, `git commit/push`, deployment, migrations, database access, reading secrets, any process the agent starts, validator network/file access |
+| **E2** detected after the fact | The change can happen; the engine sees it in the workspace and reacts | diff inspection ⇒ `OUT_OF_SCOPE_CHANGE`, acceptance refused, suspension; the change stays on disk; **no rollback** | edits to protected paths (including an `init --force` overwrite of `.project-run/config.json`), edits outside `allowedPaths`, new symlinks, edits to policy/allowlist/envelope files, `tasks.md` changes beyond the own checkbox |
+| **E3** host/environment-enforced, otherwise not enforced | The engine cannot observe or stop it | nothing, unless the host reports it; `OPERATION_NOT_PERMITTED` only on visible evidence (FR-080) | network egress, `git commit/push`, deployment, migrations, database access, reading secrets, any process the agent starts, validator network/file access, **the agent's dispatch timeout (`timeout_ms` is advisory to the host in pull mode)** |
 
 Consequences that MUST appear in `status` output, docs and tests:
 - "Prohibited" in this document means *denied by policy* (E1 for engine actions, E2 where the workspace shows it, E3 otherwise). It never means technically blocked unless the host or environment demonstrably enforces it.
@@ -21,9 +21,9 @@ Consequences that MUST appear in `status` output, docs and tests:
 
 ## 1. `HarnessPolicy` (tracked configuration)
 
-Location: **`.project-run/harness/policy.json`** (resolved OD-5). Rationale and verification: tracked configuration alongside the already-tracked
+Location: **`.project-run/harness/policy.json`** (resolved OD-5; no policy discovery or validation exists today in `bootstrap.ts`/`doctor.ts`, so a loader `loadHarnessPolicy` is new **internal** code; `.project-run/harness/` collides with no existing reader: config loading reads only `config.json`/`workflow.json`, skills only `.project-run/skills` and `.agents/skills`). Rationale and verification: tracked configuration alongside the already-tracked
 `.project-run/config.json`; separate from mutable state (`.project-run/runs/`, ignored by convention per `CONSUMER-GUIDE.md`; and
-`.project-run/evidence/`, which `doctor` requires to be ignored, FR-058). Issuance requires the file to be tracked and unmodified relative to `HEAD` (`POLICY_NOT_COMMITTED` otherwise), so a policy change always has a review trail.
+`.project-run/evidence/`, which the internal `harnessDoctor` requires to be ignored, FR-058). Issuance requires the file to be tracked and unmodified relative to `HEAD` (`POLICY_NOT_COMMITTED` otherwise), so a policy change always has a review trail.
 
 ```ts
 interface HarnessPolicy {
@@ -151,7 +151,7 @@ A `submit` for a pending action while the envelope is not `ACTIVE` is processed 
 
 ## 8. Status exposure
 
-`status` returns: envelope digest/revision/status, policy digest and path, per-task state, remaining budget per task (initial + grants), cycle step, last decision, and the **enforcement table** (E1/E2/E3 per rule), `actor.authenticated:false`, `network:"not-enforced"`, `filesystem:"cwd-confinement-only"`, "operations outside the workspace are unobserved unless reported by the host".
+`harnessStatus` (an **internal** function; the public `statusProjectRun`/`ProjectRunHostResponse` are unchanged, FR-060/FR-105) returns: envelope digest/revision/status, policy digest and path, per-task state, remaining budget per task (initial + grants), cycle step, last decision, and the **enforcement table** (E1/E2/E3 per rule), `actor.authenticated:false`, `network:"not-enforced"`, `filesystem:"cwd-confinement-only"`, "operations outside the workspace are unobserved unless reported by the host".
 
 ## 9. Rejection cases (test list for H1)
 

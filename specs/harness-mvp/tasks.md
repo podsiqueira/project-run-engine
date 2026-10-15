@@ -26,7 +26,7 @@ Gate B in writing; no box in this file may be ticked by an agent during Phase 2 
 - [ ] T003 DEPENDS ON T001, T049, Gate B authorisation: amend `tests/package-boundary.test.ts` to the enumerated allowlist and make it fail on any other import (FR-024)
 
 - [x] T045 OWNER GATE: OD-8 confirm path-matching dialect, POSIX-only scope and `CLEAN_REQUIRED` default baseline; OD-6, OD-7, OD-9 recorded (FR-082, FR-091, FR-093, FR-094, FR-095) — **DECIDED: OD-8, OD-6, OD-7, OD-9 approved 2026-10-15**
-- [ ] T049 OWNER GATE, read-only: pre-Gate-B technical review. Re-verify against the code `coordinator.ts`, `host-dispatch-adapter.ts`, `bootstrap.ts`, `doctor.ts`, the engine `resume` reconstruction (`suspended_from`) and the human-answer revalidation (commit `cdd4d41`); confirm the projection table, the carry-forward of the `harness` block and the delegation points (analysis X7, R-13, R-14). Report findings; no code changes. **Required before any Gate B request.**
+- [ ] T049 OWNER GATE, read-only: pre-Gate-B technical review. Re-verify against the code `coordinator.ts`, `host-dispatch-adapter.ts`, `bootstrap.ts`, `doctor.ts`, the engine `resume` reconstruction (`suspended_from`) and the human-answer revalidation (commit `cdd4d41`); confirm the projection table, the carry-forward of the `harness` block and the delegation points (analysis X7, R-13, R-14). Report findings; no code changes. **Required before any Gate B request.** **Status 2026-10-15: a report exists (`t049-technical-review.md`) and its findings were incorporated into specification revision 3; T049 stays OPEN (unticked) until the owner has reviewed the report and the corrected artifacts and decides explicitly.**
 
 ## Phase 2 — Foundations (shared, blocking)
 
@@ -34,7 +34,7 @@ Gate B in writing; no box in this file may be ticked by an agent during Phase 2 
 - [ ] T005 DEPENDS ON T004: canonical JSON + sha-256 + hash-chain utilities (`ledger.ts`) with property tests (FR-052, AS-46)
 - [ ] T006 DEPENDS ON T004: `EvidenceStore` content-addressed write-once store, size cap, redaction/quarantine, digest verification (`evidence-store.ts`) (FR-054, FR-055, FR-056, FR-057, AS-17, AS-47, AS-63, AS-64)
 - [ ] T007 DEPENDS ON T005: `HarnessEvent` schema (payload-free) and `reconstructTask` reader (FR-051, FR-053, FR-059, AS-50, AS-62)
-- [ ] T046 DEPENDS ON T004, T045: `path-matching.ts` pure matcher, pattern validator, candidate validator, scope decision, symlink/`lstat` step, collision detection; all 30 normative vectors as table tests plus an adversarial-input timing test (FR-093, FR-094, AS-94, AS-95, AS-96, SC-009)
+- [ ] T046 DEPENDS ON T004, T045: `path-matching.ts` pure matcher, pattern validator, candidate validator, scope decision, symlink/`lstat` step, collision detection; all 30 normative vectors as table tests plus an adversarial-input timing test (FR-093, FR-094, AS-94, AS-95, AS-96, AS-114, SC-009)
 - [ ] T047 DEPENDS ON T004: enforcement-class table (E1/E2/E3) in policy types, `status` text, doc-lint test that forbids "prevented/blocked" for E2/E3 rules, and the platform guard (`HARNESS_PLATFORM_UNSUPPORTED`) (FR-079, FR-080, FR-094, AS-69, AS-70, AS-72)
 
 ## Phase 3 — US1/US6/US8: Authorisation, graph, eligibility
@@ -67,13 +67,26 @@ Gate B in writing; no box in this file may be ticked by an agent during Phase 2 
 
 ## Phase 6 — US5/US7: Persistence, preset, controller
 
-- [ ] T027 DEPENDS ON T007: optional `harness` field on `PersistedExecutionState`, carry-forward on `CoordinatorExecutionContext`, MANIFEST tripwire, `HARNESS_SCHEMA_UNSUPPORTED` (`src/project/state-store.ts`, `src/decision/types.ts`, coordinator checkpoint path) (FR-073, FR-076, AS-45, AS-48)
-- [ ] T028 DEPENDS ON T027: golden v0.4.0/v0.5.0 checkpoint fixtures; read paths write nothing; `adoptExecution` (FR-001, FR-074, FR-075, AS-36, AS-44, AS-56)
-- [ ] T029 DEPENDS ON T027: `spec-kit-harness-v1` preset with the four additive edges; regression that the default preset/matrix is byte-identical and that non-Harness runs still do 4 remediation dispatches (FR-050, FR-078, AS-35, FR-087, FR-088, FR-089, AS-85, AS-86, AS-88, AS-89)
-- [ ] T030 DEPENDS ON T013, T015, T021, T024, T025, T027, T029: `HarnessController` evaluation order and step machine (`controller.ts`) (FR-065, FR-066, FR-067, FR-068, FR-071, FR-072, AS-38, AS-40, AS-41, AS-43, AS-66, AS-67)
+- [ ] T027 DEPENDS ON T007: optional `PersistedExecutionState.harness?: unknown` (the only exported-type change besides `Coordinator.commit`, FR-105), block validation (`schema_version`, chain, MANIFEST tripwire), `HARNESS_SCHEMA_UNSUPPORTED`; **no** field on `CoordinatorExecutionContext`/`CoordinatorOptions` (`src/project/state-store.ts`) (FR-073, FR-076, FR-105, AS-45, AS-48, AS-112)
+- [ ] T028 DEPENDS ON T027: golden v0.4.0/v0.5.0 checkpoint fixtures; read paths write nothing; `adoptExecution` (three quiescent source tuples, W0) (FR-001, FR-074, FR-075, AS-118, AS-36, AS-44, AS-56)
+- [ ] T029 DEPENDS ON T027: `spec-kit-harness-v1` preset used only to validate/label the Harness' own writes (`validStates`, `allowedTransitions`, `stateToRole`) with the four additive edges and no edge to `CONVERGE` (OD-14); regression that the default preset/matrix is byte-identical and that non-Harness runs still do 4 remediation dispatches (FR-050, FR-078, AS-117, AS-35, FR-087, FR-088, FR-089, AS-85, AS-86, AS-88, AS-89)
+- [ ] T030 DEPENDS ON T013, T015, T021, T024, T025, T027, T029, T050, T053, T056: `HarnessController` evaluation order and step machine (`controller.ts`) (FR-065, FR-066, FR-067, FR-068, FR-071, FR-072, AS-38, AS-40, AS-41, AS-43, AS-66, AS-67)
 - [ ] T031 DEPENDS ON T030: human-only operations (internal functions, logically separated, unauthenticated): `reconcileCycle`, `approveDirtyBaseline`, `resumeSuspension`, `recordGateDecision`, `attestDependency`, `acknowledgeUpstreamChange`, `abandonPendingAction`, `extendPendingAction` with idempotency and wrong-suspension refusal (FR-003, FR-017, FR-018, FR-064, FR-067, FR-083, FR-088, AS-68, AS-72, AS-75, AS-86)
-- [ ] T032 DEPENDS ON T030: delegation from `nextProjectRunStep`/`submitProjectRunStep` when a Harness block exists (behaviour change for Harness executions only; no signature, type or export change); fault mapping for CAS/lock/write failures (FR-001, FR-066, FR-069, AS-39, AS-56)
-- [ ] T033 DEPENDS ON T030: `status` projection as an **internal function** (no CLI, host or package exposure at Gate B, FR-095) incl. the enforcement table and limitation text; `doctor` evidence-dir check (FR-010, FR-058, FR-060, AS-07, AS-65)
+- [ ] T032 DEPENDS ON T030, T051, T052, T059: delegation from `nextProjectRunStep`/`submitProjectRunStep` when a Harness block exists (behaviour change for Harness executions only; no signature, type or export change); fault mapping for CAS/lock/write failures (FR-001, FR-066, FR-069, AS-39, AS-56)
+- [ ] T033 DEPENDS ON T030: `harnessStatus` as an **internal function** (no CLI, host or package exposure at Gate B, FR-095) incl. the enforcement table and limitation text; internal `harnessDoctor` evidence-dir check via `git check-ignore` on the `SnapshotProvider` port (public doctor unchanged) (FR-010, FR-058, FR-060, AS-07, AS-65)
+
+## Phase 6a — Revision 3 tasks (from T049; all blocked until Gate B)
+
+- [ ] T050 DEPENDS ON T027: `Coordinator.commit` (`@internal`, additive): builds the record from the persisted record, validates transitions with the Harness preset, appends `step_log`/`history`/`human_answers`, `questions` override, literal pending action, one CAS save; regression that non-Harness behaviour is byte-identical (FR-097, FR-099, AS-45, AS-97, AS-98, AS-100, AS-101, AS-108)
+- [ ] T051 DEPENDS ON T050: entry guards (`HARNESS_REQUIRES_PULL_API`, no write) in `executeProjectRun`, `executeProjectResume`, `ProjectRunHost.start/resume`, `reconstructResumeContext` (FR-097, AS-42, AS-102)
+- [ ] T052 DEPENDS ON T050: audit-only human-answer path for Harness executions (`validateHumanAnswers`, `ANSWER_RECORDED`, same suspension returned, no dispatch/counter/`last_result`/`remediation_iteration` change) and `resumeSuspension` restoring the pre-suspension row (FR-098, SC-012, AS-103, AS-106)
+- [ ] T053 DEPENDS ON T050: `recovery.ts`: projection rows T0–T9, write sequences W1–W13, per-row recovery actions, completeness enumeration and crash-injection harness (FR-087, FR-101, SC-013, AS-85, AS-99, AS-115)
+- [ ] T054 DEPENDS ON T006, T023: request/reference discipline: references-and-digests-only builders with size limits (8 KiB / 4 KiB), `AgentResult.metadata.harness` transport and validation, evidence reading by hosts from files (FR-102, FR-103, SC-014, AS-107, AS-108, AS-113)
+- [ ] T055 DEPENDS ON T019: validator run records, `STALE_VALIDATOR_PROCESS`, lock-wait behaviour tests (FR-106, FR-107, AS-110, AS-111)
+- [ ] T056 DEPENDS ON T050: identification by validated `harness` block (never `preset`), Harness preset wiring for validation, `buildStepCoordinator` untouched for non-Harness (FR-096, AS-104)
+- [ ] T057 DEPENDS ON T050: exported type-surface test limited to the FR-105 delta; consumer-type fixtures unchanged (FR-105, FR-077, FR-108, SC-011, AS-112, AS-116)
+- [ ] T058 DEPENDS ON T030: dispatch sets `request.options.timeout_ms` from the envelope; documented host-enforced (FR-023, AS-109)
+- [ ] T059 DEPENDS ON T050: delegation ordering in `nextProjectRunStep`/`submitProjectRunStep`: read-only pass returns "needs lock" when a write is required; Harness validation before any `commit`; held-action move and restore (FR-100, FR-089, FR-104, AS-105, AS-106)
 
 ## Phase 7 — Gate B vertical-slice fixture and recovery proof (H8)
 
@@ -81,16 +94,16 @@ Gate B in writing; no box in this file may be ticked by an agent during Phase 2 
 - [ ] T035 DEPENDS ON T034: positive and negative end-to-end cycles (AS-53, AS-54, SC-001, SC-003)
 - [ ] T036 DEPENDS ON T034: recovery suite R1–R19 incl. SIGKILL and multi-process (FR-070, AS-37, SC-004)
 - [ ] T037 DEPENDS ON T034: counter property test over every resume point and host change (FR-043, AS-29, SC-003)
-- [ ] T038 DEPENDS ON T034: push/pull equivalence and `/loop` simulation (AS-41, AS-42)
+- [ ] T038 DEPENDS ON T034: `/loop` simulation and refusal of Harness executions by every push/legacy entry point (AS-41, AS-42, AS-102)
 - [ ] T039 DEPENDS ON T034: ledger reconstruction, chain tamper, divergence, evidence-missing suites (AS-46, AS-47, AS-48, AS-50)
-- [ ] T040 DEPENDS ON T035, T036, T037, T038, T039: full existing suite + typecheck + build green; baseline byte-regression for non-Harness executions (SC-005)
+- [ ] T040 DEPENDS ON T035, T036, T037, T038, T039, T054, T055, T057, T058: full existing suite + typecheck + build green; baseline byte-regression for non-Harness executions (SC-005)
 - [ ] T041 DEPENDS ON T040: `docs/` (incl. `state-machine.md`, `transition-contract.md` for the preset edges) and `ARCHITECTURE.md` section for the Harness; `CONSUMER-GUIDE.md` operator guide; update `docs/backlog.md` E-1/E-2 notes · STOP: Gate B review (owner)
 
 ## Phase 8 — Gate C: host and continuity (H9) — not started
 
 - [ ] T042 DEPENDS ON T041 AND owner authorisation: host-adapter validation with a real host, no permission bypass, no unauthorised global change (FR-072)
 - [ ] T043 DEPENDS ON T042: `/loop` continuity test against the real host (FR-071)
-- [ ] T048 DEPENDS ON T041 AND separate owner approval: expose human-only operations and `status` to hosts/CLI (new subcommands, host skill text); public-API impact review (`public-api-surface`, consumer type fixtures) (FR-095, D-15)
+- [ ] T048 DEPENDS ON T041 AND separate owner approval: expose human-only operations (including `resumeSuspension`) and `harnessStatus` to hosts/CLI, and update the host skill text that resumes by `humanAnswers` (new subcommands, host skill text); public-API impact review (`public-api-surface`, consumer type fixtures) (FR-095, D-15)
 
 ## Phase 9 — Gate D: consumer pilot preparation (H10) — not started
 

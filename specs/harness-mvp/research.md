@@ -79,13 +79,12 @@ Per-boundary table in `contracts/harness-controller.md` §5. Principles: (1) the
 **Choice**: one new optional `harness` block **inside the existing checkpoint** (counters, cycle position, envelope reference, append-only `events[]` of scalars/references, chain head). Large artifacts live as content-addressed files; the checkpoint is authoritative for state and decisions, the files are authoritative only for *content whose digest the checkpoint records*. A manifest file in the evidence directory is a tripwire for engines that drop unknown fields (E-8).
 **Rejected**: a separate sidecar ledger as source of record (two authorities, ordering hazards); inlining diffs/logs in the checkpoint (size: the Feature 009 checkpoint is already 169 KB without any payloads).
 **Cost acknowledged**: `events[]` growth. Mitigation: events store only digests/ids; a compaction policy is **out of scope** and listed as a risk.
-**Implementation pitfall to design for**: the coordinator re-persists only what is on the in-memory context (see `humanAnswers`/`stepLog` comments in `src/decision/types.ts`); the Harness block must be carried the same way or it will be silently dropped on the next checkpoint.
+**Implementation pitfall (resolved in revision 3, D-30)**: the Coordinator re-persists only what it builds field by field, and probe 1 showed an injected `harness` key disappearing after one submit. The block is therefore written only by `Coordinator.commit`, built from the persisted record; it is not carried on the context.
 
-### D-10 A Harness workflow preset; no new states
-**Choice**: a new preset id (working name `spec-kit-harness-v1`) that overrides `allowedTransitions`/`resolveTransition` for Harness executions only. Added edges (new, additive, preset-local):
-`INDEPENDENT_REVIEW|RE_REVIEW → IMPLEMENT` (task accepted, next task), `IMPLEMENT → REMEDIATION` and `REMEDIATION → REMEDIATION` (validator failure routes to remediation without a review), plus Harness-level `HUMAN_INTERVENTION_REQUIRED` entries as today. No `CoordinatorState` is added. The default preset and `MAX_REMEDIATION_ITERATIONS` are untouched.
-**Why demonstrated need**: the matrix has no edge back to `IMPLEMENT`, so a per-task loop is impossible without it (E-3).
-**Rejected**: new states (public type change, breaks consumer exhaustiveness fixtures such as `must-not-compile-switch.ts`); a controller-owned parallel loop (a second state machine).
+### D-10 A Harness workflow preset; no new states (revised in revision 3)
+**Choice**: a Harness preset (working name `spec-kit-harness-v1`, extending the Spec Kit preset so skills and expected outputs are inherited) used **only to validate and label the Harness' own writes**: `validStates`, `allowedTransitions`, `stateToRole`. Added edges (preset-local, additive): `INDEPENDENT_REVIEW|RE_REVIEW → IMPLEMENT` (task accepted, next task), `IMPLEMENT → REMEDIATION` and `REMEDIATION → REMEDIATION` (validator failure routes to remediation without a review). **No edge to `CONVERGE`** (OD-14). The engine's `decide`/`resolveTransition`, `MAX_REMEDIATION_ITERATIONS` and the push loop are never executed for a Harness execution, so there is no second remediation counter to reconcile and no way for the engine's own 4-dispatch loop to run.
+**Why demonstrated need**: the matrix has no edge back to `IMPLEMENT` (E-3).
+**Rejected**: new states (public type change, breaks consumer exhaustiveness fixtures such as `must-not-compile-switch.ts`); letting the engine's `resolveTransition` drive the cycle (it would need verification outcomes on the context, would run engine remediation logic, and `buildStepCoordinator` hard-wires the default engine).
 
 ### D-11 Validator and snapshot execution port; boundary amendment — **needs owner approval (OD-1)**
 **Problem**: executing validators and computing snapshots needs `node:child_process`, and hashing (snapshot ids, digests, event chain) needs `node:crypto`; `package-boundary.test.ts` allows only `node:fs`/`node:path` in `src/`.
@@ -101,8 +100,8 @@ Defined exactly in `contracts/remediation-budget.md` §6: versioned fingerprint 
 ### D-14 Reviewer independence claim
 Guaranteed: separate step, separate `reviewInvocationId`, no implementer narrative, own contract, bound to exact diff, `isolationEvidence` recorded. Not guaranteed: process/model isolation or absence of shared hidden state. Host that cannot supply a distinct invocation identity ⇒ policy `requireDistinctInvocationId` (default true) rejects its reviews.
 
-### D-15 Public API compatibility — *resolves open decision 9 (tightened in revision 2)*
-Contracts remain **internal** (`src/harness/`). The **Gate B slice adds no exports at all**: no root export, no new `exports` subpath, no new `bin`/CLI subcommand, no new public types; `package.json` `exports`/`bin`/`files` stay byte-identical (tested, SC-011). Human-only operations are internal functions at Gate B. Exposure to hosts or the CLI is a separate approval at Gate C; a public/subpath API, if ever wanted, is a separate approval after Gate D with `public-api-surface` and consumer-type fixtures extended first.
+### D-15 Public API compatibility (revision 3)
+Contracts remain **internal** (`src/harness/`). The Gate B slice adds no exports, subpaths, `bin`/CLI or exported names. The **complete** exported delta is: `PersistedExecutionState.harness?: unknown` and one `@internal Coordinator.commit` (FR-105, OD-10, OD-12). `CoordinatorExecutionContext`, `CoordinatorOptions`, `ProjectRunHostResponse`, `ProjectDoctorReport`, `ExecutionStepKind` and `ExecutionFailureCode` do not change; Harness status and diagnostics are internal functions; failure codes travel in `failureReason` text. Exposure to hosts/CLI is a Gate C approval (FR-095, OD-9).
 
 ### D-16 Time / cost limits
 Enforceable now: `timeout_ms` per dispatch (existing option), validator timeouts, `dispatchTtlMs`, `maxTaskElapsedMs` (checked at boundaries, not preemptive). Not enforceable: tokens/cost — declared `unsupported` (FR-009).
@@ -156,3 +155,26 @@ Policy at `.project-run/harness/policy.json`: tracked, next to the already-track
 
 ### D-29 Path matching
 Closed glob subset, anchored, case-sensitive, POSIX only, validated-not-normalised candidates, deny-wins, symlink and traversal rules, 30 normative vectors (`contracts/path-matching.md`, FR-093, FR-094).
+
+## E. Decisions added in revision 3 (from the T049 technical review)
+
+### D-30 Single write path: `Coordinator.commit`
+All Harness writes go through one additive `@internal` method that starts from the persisted record, validates state changes with the Harness preset, appends logs, supports a questions override and a literal pending action, and saves once with `expectedRevision` (FR-099). **Why**: one place preserves unknown fields (fixes the E-11 carry-forward hazard), makes every boundary one CAS (write-ahead counter + pending action, acceptance + advance), and needs no change to `CoordinatorExecutionContext`/`CoordinatorOptions`. **Rejected**: carrying the block on the context and patching `checkpoint()`, the submit builder and the resume builder (four touch points, each a silent-drop risk, plus a public type change); writing checkpoints from the Harness module directly (duplicates history/step_log/human-answer semantics, the drift the engine's refactors avoid).
+
+### D-31 Harness executions are pull-only and bypass the legacy resume path
+Because `reconstructResumeContext` clears results, resets counters and re-dispatches (E-13, probe 2) and push mode has no durable pending action (E-14), Harness executions are refused by every entry point that loads the record (FR-097); the public legacy Coordinator methods cannot see the record, so a hand-built Coordinator is covered only by the tripwire (R-26). Human answers are audit-only (FR-098); resumption is a typed operation or `resumeSuspension` re-entering the machine. **Consequence**: real hosts cannot resume a Harness execution by `humanAnswers` until Gate C exposes the operations (FR-095).
+
+### D-32 Identification by validated block
+`harness` block present and valid ⇒ Harness execution; `preset` is a label and is never consulted (FR-096, E-15).
+
+### D-33 Projection table covers crash windows
+Rows T0–T9 and write sequences W1–W13; `STATE_INCOHERENT` only for tuples that are not rows (FR-087, FR-101). **Reasoning**: probe 1 showed the engine itself writes `IN_PROGRESS`/no-pending tuples between transitions and dispatches; a table that rejects them would deadlock a valid run.
+
+### D-34 Requests carry references, not content
+Persisted pending actions are unscrubbed (E-16); therefore requests, events and the checkpoint carry references and digests only, with hard size limits; agents read evidence files; host payloads travel in `AgentResult.metadata.harness` (FR-102, FR-103).
+
+### D-35 Timeouts are host-enforced; validators hold the lock
+`timeout_ms` for agents is advisory to the host in pull mode (E-16, E3); validators run inside the lock with run records to detect orphans after `SIGKILL` (FR-023, FR-106, FR-107).
+
+### D-36 Scope boundary at `PHASE_END` (OD-14 open)
+The Harness governs `IMPLEMENT … RE_REVIEW`; after all authorised tasks are accepted the execution stays suspended. Handing off to the engine's `CONVERGE`/`READY_FOR_PR` stages would run the engine's own remediation loop outside the Harness budget and is not part of the MVP unless OD-14 decides otherwise.

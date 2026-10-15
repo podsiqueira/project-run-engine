@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/harness-mvp/`
 **Target repository**: `project-run-engine` (baseline `v0.5.0`, SHA `c1e4054`)
-**Status**: **Gate A approved 2026-10-15 (revision 2); specification phase H0–H7 concluded.** **Specification only. No implementation is authorized; Gate B is blocked** pending the pre-Gate-B technical review (`tasks.md` T049) and a new explicit authorisation.
+**Status**: **Gate A approved 2026-10-15 (revision 2); specification phase H0–H7 concluded. Revision 3 (2026-10-15) incorporates the T049 technical review into the specification only.** **Specification only. No implementation is authorized; Gate B is blocked** pending the owner's review of the T049 report and a new explicit authorisation. T049 is **not** closed by this revision.
 **Created**: 2026-10-15
 **Source plan**: "Autonomous Engineering Harness MVP, Specification Plan" (2026-10-14)
 **Audit baseline**: H0 read-only audit (2026-10-15), summarised in `research.md` §A.
@@ -35,9 +35,16 @@ explicitly *different*, never *accidentally* different.
 | E-5 | `AgentResult` is validated for shape/identity only; the engine cannot verify that work occurred (`ARCHITECTURE.md` §4.15). | Harness evidence is computed by the engine, not asserted by agents (FR-019, FR-024). |
 | E-6 | `history`/`step_log` keep no payloads or evidence (only `evidence_count`). | Harness adds evidence references and an append-only event list (FR-051..). |
 | E-7 | `package-boundary.test.ts` permits only `node:fs`/`node:path` in `src/`. Nothing in the core spawns a process or hashes. | Hashing needs `node:crypto` in the core and spawning needs `node:child_process` in an isolated module: an explicit, approved boundary amendment (D-11, OD-1). |
-| E-8 | The engine overwrites the whole checkpoint on save; fields not carried on the in-memory context are dropped. Older engines drop `revision`/`history`. | New persisted fields must be carried explicitly; mixed-version use must be detected (FR-073, FR-075). |
+| E-8 | The engine overwrites the whole checkpoint on save; fields not built by the Coordinator are dropped (confirmed by T049 probe 1, E-11). Older engines also drop `revision`/`history`. | Harness executions are written only by `Coordinator.commit`, which preserves every field of the persisted record (FR-099); mixed-version use is detected (FR-076). |
 | E-9 | The file store lock and CAS are single-machine only. | MVP stays single machine (NG-1). |
 | E-10 | `.project-run/config.json` is tracked configuration; `.project-run/runs/` is mutable state that consumers are told to VCS-ignore (`CONSUMER-GUIDE.md`). | Policy goes under a new tracked `.project-run/harness/`; evidence under an ignored `.project-run/evidence/` (FR-090). |
+| E-11 | `Coordinator.checkpoint()` builds the record field by field; contexts are rebuilt field by field on submit and resume; an injected unknown field did not survive one submit (T049 probe 1). | Harness executions are written only by one additive `Coordinator.commit` that starts from the persisted record (FR-099). |
+| E-12 | One `submitProjectRunStep` writes **three** checkpoints (`(IMPLEMENT, IN_PROGRESS, result)` → `(INDEPENDENT_REVIEW, IN_PROGRESS, none)` → `(INDEPENDENT_REVIEW, AWAITING, pending)`); transitions are checkpointed `IN_PROGRESS` with no pending action. | Every at-rest tuple of the Harness' own write sequences is a defined row with a recovery action (FR-101). |
+| E-13 | `reconstructResumeContext` sets `state = suspended_from`, clears the saved result and resets `remediation_iteration` for most stages, so a human answer **re-dispatches** the agent with a new `step_id` (T049 probe 2; `cdd4d41`). | Harness executions never use it; human answers are audit-only (FR-097, FR-098). |
+| E-14 | Push mode (`Coordinator.step/run`, `executeProjectRun/Resume`, `ProjectRunHost`) has no durable pending action while an agent runs. | Harness executions are pull-only (FR-097). |
+| E-15 | The pull API always builds `new CoordinatorDecisionEngine()`; the persisted `preset` is a free label (`"v1"` in a consumer). | Identification is by the validated `harness` block only (FR-096). |
+| E-16 | `pending_action.request` (including `context`) is persisted unscrubbed; `scrubSecrets` covers only `state.context`. `NextProjectRunStepRequest.executionOptions` is declared but never forwarded in pull mode. | Requests carry references and digests only (FR-102); `timeout_ms` is host-enforced (FR-023). |
+| E-17 | Checkpoint `created_at` is rewritten on every save; `tests/phase5-history.test.ts:124` asserts one applied step per dispatch. | Harness audit time comes from events; the pairing exception for abandoned/timed-out actions is documented (FR-105, FR-108). |
 
 ## 3. User Scenarios & Testing
 
@@ -86,6 +93,9 @@ has it independently reviewed against the exact diff, and, only if everything ho
 1. **Given** a pending action exists, **When** `next-step` is called again (any host), **Then** the same `step_id` is returned and no new dispatch or count occurs.
 2. **Given** a stop point or `HUMAN_INTERVENTION_REQUIRED`, **When** a loop iteration runs, **Then** it returns the suspension and does nothing else.
 3. **Given** `CHECKPOINT_CONFLICT`, lock failure or write failure, **Then** the controller does not progress, does not count a dispatch, and reports a non-terminal failure code.
+4. **Given** a Harness execution is suspended, **When** `humanAnswers` are supplied, **Then** they are validated and recorded, the same suspension is returned, and **no agent is dispatched** and no counter, `remediation_iteration` or `last_result` changes; only a typed human operation or `resumeSuspension` leaves the suspension, and the next dispatch (if any) goes through authorisation, pins, baseline and budget.
+5. **Given** a crash between any two commits, **When** the controller is called again, **Then** it finds a documented table row and completes the cycle without a duplicate dispatch or a double count.
+6. **Given** a Harness execution is passed to a push entry point or to `reconstructResumeContext`, **Then** it is refused with no write.
 
 ### User Story 6: Escalate with structured reasons (P2)
 
@@ -112,6 +122,10 @@ approvals instead of being silently accepted.
 - A validator is satisfied by editing the validator's own configuration/tests → `sensitivePaths` rule forces explicit reviewer disposition (FR-031).
 - Log output contains a secret → redaction / quarantine rules (FR-054..FR-056).
 - Host reports success after the pending action was abandoned → `STALE_STEP`, result discarded.
+- Host crashes between the transition commit and the dispatch commit (`(REMEDIATION, IN_PROGRESS, none)`): the counter has **not** been incremented yet; recovery dispatches with counter+1 in one commit (row T7).
+- A human answers a blocked remediation stage: the answer is recorded only; the existing engine behaviour (new `step_id`, `remediation_iteration` reset) does **not** apply to Harness executions (FR-098).
+- `NextProjectRunStepRequest.executionOptions` is ignored by the existing pull API: the Harness sets `timeout_ms` itself (FR-023).
+- A request or pending action would exceed 8 KiB or contain diff text: rejected at construction (FR-102).
 
 ## 4. Requirements
 
@@ -145,7 +159,7 @@ approvals instead of being silently accepted.
 - **FR-020** The agent MUST receive no authority (by contract) to change policy, allowlist, envelope, checkpoints, ledger or other tasks. Protected paths (FR-029) are **detected after the fact** by diff inspection; the Harness does not prevent the agent from writing them, it refuses acceptance and suspends (enforcement class E2, FR-079).
 - **FR-021** The agent's structured result (summary, files changed, evidence refs) MUST be treated as a claim; the engine computes the real delta (FR-026) and any mismatch is a `RESULT_MISMATCH` finding.
 - **FR-022** A task baseline snapshot MUST be recorded before the first dispatch of the task cycle and never moved during that cycle.
-- **FR-023** Dispatch options MUST carry `timeout_ms` from the envelope.
+- **FR-023** Harness dispatches MUST set `request.options.timeout_ms` from the envelope. The timeout is **host-enforced (E3)**: the engine neither runs nor interrupts the agent in pull mode, and `NextProjectRunStepRequest.executionOptions` is not forwarded today (E-16), so the Harness supplies the option itself; the only engine-side bound is `dispatchTtlMs` (FR-067).
 
 ### 4.4 Verification pipeline (FR-024 … FR-032)
 
@@ -184,20 +198,20 @@ approvals instead of being silently accepted.
 - **FR-047** After every attempt: all affected required validators re-run, then a **new separate review invocation** runs against the new subject snapshot.
 - **FR-048** `CRITICAL` findings, unauthorised operations, business ambiguity and out-of-scope changes MUST suspend immediately and MUST NOT cause a new remediation dispatch (so they never consume an attempt of their own; attempts already counted stay counted).
 - **FR-049** `NO_PROGRESS` is evaluated exactly as defined in `contracts/remediation-budget.md` §6 (fingerprint normalisation, set comparison, streak). Default: suspend when the streak reaches 2. A policy-defined floor MUST NOT be weakened by an envelope (FR-092).
-- **FR-050** The Harness remediation policy MUST be selected by the Harness workflow preset only; the engine's `MAX_REMEDIATION_ITERATIONS` behaviour for non-Harness executions MUST remain bit-for-bit unchanged.
+- **FR-050** The Harness remediation policy applies to Harness executions only. The engine's `decide`/`resolveTransition` and its `MAX_REMEDIATION_ITERATIONS` logic are **never executed** for them (the Harness drives its own writes, FR-099); for non-Harness executions the v0.5.0 behaviour (4 dispatches, human answers replenishing the budget) MUST remain bit-for-bit unchanged.
 
 ### 4.8 Evidence ledger and retention (FR-051 … FR-058)
 
 - **FR-051** Historical events MUST be **append-only** in the checkpoint's Harness block; derived fields ("latest result") MAY be updated but MUST NOT remove prior events. The specification MUST NOT call this *immutable*: append-only is enforced by code and hash-chaining, not by storage.
 - **FR-052** Events carry a sequence number and `prevHash`; the chain head (`seq`, `hash`) is stored with the counters so truncation or reordering is detectable.
 - **FR-053** From the ledger one MUST be able to reconstruct: execution, phase, task, envelope and policy revision, step ids and attempts, snapshot ids, validators and logs, reviewer and findings, remediations, and the final advance/suspend decision.
-- **FR-054** Heavy artifacts (diffs, logs) MUST be content-addressed files under `.project-run/evidence/<executionId>/…`; the checkpoint holds only `EvidenceReference` records (path, sha-256, bytes, media type, `redactionStatus`).
+- **FR-054** Heavy artifacts (diffs, logs) MUST be content-addressed files under `.project-run/evidence/<executionId>/…`; the checkpoint holds only `EvidenceReference` records (path, sha-256, bytes, media type, `redactionStatus`) and **dispatch requests and pending actions carry the same references, never the content** (FR-102).
 - **FR-055** Captured output MUST be size-capped (truncation recorded), passed through a redaction pass (policy patterns + values of environment variables named in the validator allowlist), and labelled `REDACTED`, `CLEAN_SCANNED`, or `QUARANTINED`. `QUARANTINED` output MUST NOT be sent to a reviewer or host; the cycle suspends with `EVIDENCE_QUARANTINED`.
 - **FR-056** Redaction is best effort and MUST be documented as such; the executor MUST NOT pass secrets to validators unless the policy names the variable.
 - **FR-057** Evidence is retained until a human removes it; the Harness never auto-deletes. A reference whose file is missing or whose digest mismatches is `EVIDENCE_MISSING` and cannot support acceptance.
-- **FR-058** `.project-run/evidence/` MUST be reported by `doctor` when not VCS-ignored.
+- **FR-058** The Harness MUST verify that `.project-run/evidence/` and `.project-run/runs/` are VCS-ignored, using `git check-ignore` through the `SnapshotProvider` port, as an **internal** diagnostic (`harnessDoctor`) that reports `EVIDENCE_NOT_IGNORED`. The public `runProjectDoctor` and `ProjectDoctorReport` are unchanged (the existing doctor is fs-only and non-spawning, FR-105).
 - **FR-059** Invalidation of a validator or review result MUST be recorded as a new `INVALIDATED` event naming the cause (new snapshot, pin mismatch, missing evidence); the original event stays.
-- **FR-060** `status` MUST expose Harness state (enabled, envelope digest/status, cycle step, task states, budgets, chain head, last suspension, `diverged`) without writing.
+- **FR-060** `harnessStatus` (an **internal** read-only function) MUST expose Harness state (enabled, envelope digest/status, cycle step and table row, task states, budgets, chain head, last suspension, `diverged`) without writing; the public `statusProjectRun`/`ProjectRunHostResponse` are unchanged until a Gate C approval (FR-095).
 
 ### 4.9 Invalidation (FR-061 … FR-064)
 
@@ -208,22 +222,22 @@ approvals instead of being silently accepted.
 
 ### 4.10 Controller, recovery and continuity (FR-065 … FR-072)
 
-- **FR-065** Every controller call MUST begin by loading the persisted state and evaluating, in order: persistence health → lock → envelope validity → pending action → suspension → eligibility.
-- **FR-066** If a pending action exists it MUST be resumed through the existing protocol (same `step_id`); an equivalent new action MUST NOT be created.
+- **FR-065** Every controller call MUST follow the evaluation order of `contracts/harness-controller.md` §2: identify/guard → load → lock → platform/schema/chain → **state classification (row or `STATE_INCOHERENT`)** → ports → envelope/pins/baseline → pending action → suspension → the row's recovery action or the cycle machine.
+- **FR-066** If a pending action exists it MUST be resumed through the existing protocol (same `step_id`); an equivalent new action MUST NOT be created. The Harness serves it from the persisted record without invoking the engine's decision logic.
 - **FR-067** Absence of a host response MUST NOT be treated as success. A pending action older than the envelope's `dispatchTtlMs` MUST cause a `DISPATCH_TIMEOUT` suspension; it MUST NOT be auto-closed or auto-retried.
 - **FR-068** A result failing Harness-level validation is rejected without applying it; the pending action stays; **the second rejected submission for the same step** (`maxSubmissionRejections` = 2) closes the step unsuccessful and the cycle suspends `RESULT_INVALID`. The first rejection does not suspend.
 - **FR-069** `CHECKPOINT_CONFLICT`, `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`, `CHECKPOINT_WRITE_FAILED` MUST each prevent progression, return the existing non-terminal failure code, and leave counters untouched. The controller MUST NOT retry a conflicting call blindly.
 - **FR-070** Recovery MUST be defined and tested for every boundary listed in `contracts/harness-controller.md` §5.
 - **FR-071** `/loop` MAY request another iteration, but each iteration MUST re-enter the controller (FR-065). Correlation uses `(executionId, cycleId, step_id)`; the spec MUST NOT claim exactly-once external effects.
-- **FR-072** The controller MUST honour `HUMAN_INTERVENTION_REQUIRED`, stop points and exhausted limits identically in push and pull modes.
+- **FR-072** The controller MUST honour `HUMAN_INTERVENTION_REQUIRED`, stop points and exhausted limits for every pull-mode caller and host. **Push entry points are not supported for Harness executions and refuse them** (FR-097); push/pull equivalence is therefore not a requirement.
 
 ### 4.11 Compatibility and evolution (FR-073 … FR-078)
 
 - **FR-073** The checkpoint MUST gain only **optional** fields (`harness` block); `version` stays `1`; the Harness block carries its own `schema_version`.
 - **FR-074** Legacy checkpoints MUST load, display status and resume with no write unless the user performs a mutating turn; no silent migration; absent fields are read as empty and never reconstructed.
-- **FR-075** Adopting an existing execution MUST be an explicit human operation (`adoptExecution`) recording the revision at adoption; earlier history is not back-filled.
+- **FR-075** Adopting an existing execution MUST be an explicit human operation (`adoptExecution`) recording the revision at adoption; earlier history is not back-filled. Adoption is accepted **only** from three quiescent tuples at `IMPLEMENT`: `(IMPLEMENT, AWAITING_AGENT_ACTION, engine-created pending IMPLEMENT)` (the engine's pending action is closed by the adoption commit with a digest-only event; a late result for it is `STALE_STEP`), `(IMPLEMENT, IN_PROGRESS, none)`, or `(HUMAN_INTERVENTION_REQUIRED, suspended_from = IMPLEMENT)`; every other tuple is refused (`ADOPTION_STATE_UNSUPPORTED`) and the result is row T0. Starting a brand-new execution directly under the Harness from `INTAKE` is not supported in the MVP.
 - **FR-076** A Harness-enabled execution MUST record `min_engine_version`; a tripwire manifest in the evidence directory detects a checkpoint rewritten by an engine that dropped the block (`HARNESS_STATE_DIVERGED`, fail closed).
-- **FR-077** Harness contracts MUST stay **internal** (`src/harness/`). The Gate B vertical slice MUST NOT add exports to the package root, new `exports` subpaths, new `bin`/CLI subcommands, or new public type exports; `package.json` `exports` MUST be byte-identical, proven by test. Any public or subpath exposure requires a separate, explicit owner approval and is not part of Gate B (FR-095).
+- **FR-077** Harness contracts MUST stay **internal** (`src/harness/`). The Gate B slice MUST NOT add exports to the package root, new `exports` subpaths, new `bin`/CLI subcommands or new exported names; `package.json` `exports`/`bin`/`files` MUST be byte-identical. The **only** permitted change to existing exported types/classes is the complete list in FR-105 (one optional field and one `@internal` method), proven by a type-surface test. Any other exposure requires a separate, explicit owner approval.
 - **FR-078** The decision engine, existing presets and existing public types MUST remain source- and behaviour-compatible; the Harness preset is a new, separate preset id.
 
 ### 4.12 Correction-pass requirements (revision 2)
@@ -247,7 +261,7 @@ approvals instead of being silently accepted.
 
 **State coherence and recovery**
 
-- **FR-087** The embedded `harness.cycle.step` is a *refinement* of the engine's `state`/`lifecycle_status`/`pending_action`, not a second orchestrator. The permitted combinations are the **projection table** in `contracts/harness-controller.md` §3a. Any combination outside it ⇒ `FAIL_CLOSED(STATE_INCOHERENT)`, no repair, no counter or event write.
+- **FR-087** The embedded `harness.cycle.step` is a *refinement* of the engine's `state`/`lifecycle_status`/`pending_action`, not a second orchestrator. The permitted tuples are the **rows T0–T9** of `contracts/harness-controller.md` §3a, each with a recovery action; they cover every at-rest tuple the Harness' own write sequences can leave, **including crash windows between commits** (FR-101). A tuple that is **not a row** ⇒ `FAIL_CLOSED(STATE_INCOHERENT)`, no repair, no counter or event write. `STATE_INCOHERENT` MUST NOT be returned for a tuple that has a defined recovery.
 - **FR-088** The only recovery from `STATE_INCOHERENT` is the human-only `reconcileCycle` operation, which can only move the cycle to `SUSPENDED` (never forward) and records both views as evidence; counters are untouched.
 - **FR-089** A submission for an action that was pending when the envelope became `EXPIRED`, `REVOKED` or `SUSPENDED_STALE` MUST be **refused without being applied** at evaluation step 5 (`ENVELOPE_NOT_ACTIVE` / `PIN_MISMATCH`); the pending action is preserved (`HOLD`) or closed by the human at revocation time (`ABANDON`); only a digest of the refused result is recorded. After a new ACTIVE envelope that still authorises the task with matching pins is issued, the same `step_id` may be submitted again and is validated normally against the actual workspace.
 
@@ -258,7 +272,35 @@ approvals instead of being silently accepted.
 - **FR-092** The policy's recurrence setting is a **floor**: an envelope may choose the same or a stricter setting, never a weaker one.
 - **FR-093** Path patterns and candidate paths follow `contracts/path-matching.md` (dialect, normalisation, traversal, symlinks, separators, boundaries, test vectors) for `allowedPaths`, `protectedPaths`, `sensitivePaths`, `ignoredExclusions` and diff inspection.
 - **FR-094** On `win32` the Harness MUST refuse to start (`HARNESS_PLATFORM_UNSUPPORTED`).
-- **FR-095** Exposure of human-only operations, status or any Harness API to hosts or the CLI is **not** part of Gate B (internal functions only); it requires a separate approval at Gate C.
+- **FR-095** Exposure of human-only operations, `harnessStatus` or any Harness API to hosts or the CLI is **not** part of Gate B (internal functions only); it requires a separate approval at Gate C. Until then the existing host skill (which resumes by `humanAnswers`) cannot resume a Harness execution, by design.
+
+### 4.14 Technical-review requirements (revision 3, from T049)
+
+**Identification, recovery and answers**
+
+- **FR-096** An execution is a **Harness execution only if its persisted record carries a `harness` block that passes validation** (supported `schema_version`, hash chain, manifest). Identification MUST NOT use the `preset` field, configuration labels (`workflow_version`), file names or any caller-supplied flag. A record with a Harness manifest but no valid block is `HARNESS_STATE_DIVERGED`.
+- **FR-097** Harness executions are **pull-only**. Every public entry point that loads the persisted record — `nextProjectRunStep`/`submitProjectRunStep` (via the controller), `executeProjectRun`, `executeProjectResume`, `ProjectRunHost.start/resume`, `reconstructResumeContext` — MUST refuse a Harness execution that is not routed to the controller (`HARNESS_REQUIRES_PULL_API`) **without writing**. The legacy `Coordinator.step/run/prepareNextAction/applyExternalResult` methods are public API that do not know the persisted record and are **not** individually guarded; a caller that builds a Coordinator by hand and runs it on a Harness execution bypasses the guards and is detected afterwards by the tripwire (`HARNESS_STATE_DIVERGED`, FR-076). Non-Harness executions are unaffected.
+- **FR-098** A human answer MUST NOT dispatch an agent, clear or replace `last_result`, reset or read `remediation_iteration`, or touch the remediation budget. Answers are validated with the existing `validateHumanAnswers`, recorded in `human_answers` and as an `ANSWER_RECORDED` event, and the same suspension is returned. Resumption is only by typed operations or `resumeSuspension`, which restore the pre-suspension row and re-enter the state machine, authorisation, pins, baseline, budget and the row's recovery; a dispatch can follow only through the controller's own dispatch steps (FR-007, FR-042).
+
+**Persistence and atomic boundaries**
+
+- **FR-099** The Harness MUST write checkpoints only through **one additive `@internal` method, `Coordinator.commit`**, which builds the new record from the **persisted record** (preserving every existing and unknown field), validates state changes with the Harness preset's `isTransitionAllowed`, appends (never replaces) `step_log`/`history`/`human_answers`, supports an explicit `questions` override for suspensions and a literal `PersistedPendingAction`, writes with `expectedRevision`, performs exactly one save, and runs no decision engine, dispatcher or adapter. Every durable boundary (write-ahead counter + pending action, result application, acceptance + advance, suspension, resume, answers) is **one** `commit` (one CAS). No field is added to `CoordinatorExecutionContext` or `CoordinatorOptions`.
+- **FR-100** For a Harness execution every Harness-level validation (identity, envelope validity, pins, baseline, result schema, reviewer independence, diff inspection, rejection counting) MUST complete **before** the `commit` that applies the result; a rejected result is never applied and the engine's `applyExternalResult` is never called. The unlocked read-only pass MUST return "needs lock" whenever answering would require a write (move to `heldAction`, record answers, recover a window).
+- **FR-101** Every at-rest tuple that the Harness' write sequences (`contracts/harness-controller.md` §3b) can leave — including `(INDEPENDENT_REVIEW|RE_REVIEW|REMEDIATION, IN_PROGRESS, none)` windows and `(IMPLEMENT|REMEDIATION, IN_PROGRESS, none, result applied)` — MUST be a documented row with a recovery action that continues safely without duplicate dispatch or double count; the table's completeness is tested by enumerating the write sequences and injecting a crash before and after each commit.
+
+**Evidence and security of requests**
+
+- **FR-102** Dispatch requests, pending actions, events and the checkpoint MUST carry **references and digests only** (`EvidenceReference`: path, sha-256, bytes, media type, redaction status), never diffs, logs, patches, environment values or secrets; `pending_action.request.context` is limited to 8 KiB and each event `data` to 4 KiB. The engine does **not** sanitise `pending_action` (`scrubSecrets` covers only `state.context`), so the guarantee is by construction and by test, not by scrubbing. Agents read content from the evidence files. The `harness` block MUST stay outside `context` (key names such as `authorizationId`/`authenticated` would be redacted there).
+- **FR-103** Harness payloads from the host travel in `AgentResult.metadata.harness` (`HostExecutionMetadata` already allows arbitrary keys) and `evidence` references; the engine validates only `execution_id`, so the controller validates everything else (schema, snapshot echo, invocation ids).
+- **FR-104** Pending actions are handled explicitly: **served** (same `step_id`), **held** in `heldAction` when the envelope is invalid, **abandoned** by a human (attempt closed `UNSUCCESSFUL`), **refused** on submission with a digest-only event, or **expired** into a `DISPATCH_TIMEOUT` suspension; none is auto-closed, auto-retried or fabricated into a result.
+
+**Compatibility**
+
+- **FR-105** For non-Harness executions every existing contract is preserved byte-for-byte (checkpoints, responses, remediation behaviour, `human_answers` flow). The **complete** exported-type/API delta of this feature is: (1) `PersistedExecutionState.harness?: unknown` (optional); (2) `Coordinator.commit` (`@internal`). Nothing else changes: not `CoordinatorExecutionContext`, `CoordinatorOptions`, `ProjectRunHostResponse`, `ProjectDoctorReport`, `ExecutionStepKind`, `ExecutionFailureCode`, `CoordinatorState`, or any barrel. Harness failure codes travel in the existing `failureReason` text.
+- **FR-106** Before running validators the executor MUST write a run record (`runId`, `pgid`, snapshot id) under the evidence directory; recovery of a verification window finding a live process group MUST suspend `STALE_VALIDATOR_PROCESS` and never start a concurrent run.
+- **FR-107** Validators run inside the execution lock; the specification MUST state that a concurrent human operation waits up to the lock wait and may return `EXECUTION_LOCKED`, and that revocation takes effect at the next boundary bounded by the validator timeout.
+- **FR-108** Audit time MUST come from Harness events, never from checkpoint `created_at`. For Harness executions the dispatch↔applied-step pairing asserted for non-Harness runs (`tests/phase5-history.test.ts:124`) may not hold after an abandoned, timed-out or adoption-closed action; those are recorded only as Harness events (no new `step_log` kind). Non-Harness runs keep the pairing.
+
 
 ### 4.13 Out of scope / Non-goals
 
@@ -272,6 +314,7 @@ approvals instead of being silently accepted.
 - **NG-8** Authenticating human actors.
 - **NG-9** Windows hosts (the Harness fails closed on `win32`, FR-094).
 - **NG-10** Technical prevention of prohibited operations; the MVP only refuses to perform them and detects the subset visible in the workspace (FR-079).
+- **NG-11** Push-mode execution of Harness executions; handing a Harness execution to the engine's `CONVERGE`/`READY_FOR_PR` stages (OD-14).
 
 ## 5. Key entities
 
@@ -293,7 +336,10 @@ approvals instead of being silently accepted.
 - **SC-008** In the fixture, canary secrets planted in the test runner's environment and home directory are absent from every agent-mock and validator process environment and from every evidence file (FR-081).
 - **SC-009** 100 % of the path-matching test vectors in `contracts/path-matching.md` §7 pass, including traversal, symlink, separator and boundary cases.
 - **SC-010** Property test: every (`CoordinatorState`, `lifecycle_status`, `pending_action`, `HarnessStep`) combination outside the projection table fails closed with `STATE_INCOHERENT` and writes nothing (FR-087).
-- **SC-011** Package surface unchanged: `package.json` `exports`/`bin`/`files` byte-identical and `src/index.ts` exports unchanged (FR-077).
+- **SC-011** Package surface: `package.json` `exports`/`bin`/`files` byte-identical, `src/index.ts` exports unchanged, and the exported-type delta equals exactly the FR-105 list (one optional `PersistedExecutionState.harness?: unknown`, one `@internal Coordinator.commit`).
+- **SC-012** No call other than the controller's own dispatch step ever dispatches an agent for a Harness execution: a test drives answers, reads, refused submissions and every human operation except `resumeSuspension`/`extendPendingAction` and asserts zero new dispatches and unchanged counters, `remediation_iteration` and `last_result` (FR-098, I9).
+- **SC-013** For every write sequence `W1…W13` and every crash point before and after each `commit`, the tuple found is a row of §3a and its recovery completes with no duplicate dispatch and no double count; the enumerated non-rows are the only `STATE_INCOHERENT` cases (FR-101).
+- **SC-014** In the fixture, the largest persisted `pending_action.request` and the largest `harness.events[]` entry stay under fixed size limits (8 KiB and 4 KiB), contain no diff/log/secret text, and every `EvidenceReference` resolves to a file whose digest matches (FR-102).
 
 ## 7. Feature 009 exclusion (unresolved H0 findings, treated as risks)
 
@@ -313,4 +359,4 @@ tree is dirty (including `tasks.md`), so the committed state of Feature 009's T0
 
 ## 9. Open decisions requiring owner input
 
-`plan.md` §8: OD-1…OD-9 were all **approved on 2026-10-15**. None remains open.
+`plan.md` §8: OD-1…OD-9 were **approved on 2026-10-15**. Revision 3 adds OD-10…OD-13 (from T049), which the owner's authorisation to update the artifacts accepts **for specification purposes** (recorded as approved-for-specification; they are re-confirmed in the Gate B request), **OD-15 (open)** (whether host-supplied results need a size/content check, since the engine persists them in full), and **OD-14 (open)**: whether a Harness execution may hand off to the engine's `CONVERGE`/`READY_FOR_PR` stages (default: no, it stays suspended at `PHASE_END`).

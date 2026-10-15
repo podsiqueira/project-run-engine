@@ -48,16 +48,23 @@ src/harness/
   ledger.ts                 events, hash chain, reconstruct, evidence references
   evidence-store.ts         content-addressed store, redaction, caps (fs/path/crypto only)
   controller.ts             evaluation order, step machine, human operations
-  preset.ts                 spec-kit-harness-v1 preset (transition overrides)
+  preset.ts                 spec-kit-harness-v1 preset: validStates/allowedTransitions/stateToRole only (no decide/resolveTransition use)
+  commit.ts                 Harness-side builder of the Coordinator.commit change object
+  guards.ts                 entry guards (HARNESS_REQUIRES_PULL_API)
+  recovery.ts               projection table rows T0-T9, write sequences W1-W13, recovery actions
   node/                     ONLY place allowed node:child_process (OD-1); internal, not exported
   path-matching.ts          closed glob subset, scope decision, symlink checks (contracts/path-matching.md)
     validator-executor.ts   ValidatorExecutor implementation
     snapshot-provider.ts    SnapshotProvider implementation (git plumbing via argv)
 tests/harness/…             unit/contract/integration/recovery + fixtures (isolated temp repos)
 ```
-Touch points in existing code (minimal, additive): `PersistedExecutionState.harness?` and carry-forward in the coordinator
-checkpoint path; delegation in `nextProjectRunStep`/`submitProjectRunStep` when the block exists; status projection;
-`doctor` check; boundary test amendment. No change to `CoordinatorState`, `DEFAULT_ALLOWED_TRANSITIONS` or the default preset.
+Touch points in existing code (revision 3; minimal, additive, regression-tested; nothing else may change, FR-105):
+1. `PersistedExecutionState.harness?: unknown` (optional field);
+2. `Coordinator.commit` (one `@internal` method); the legacy Coordinator methods are left unguarded (they cannot see the persisted record) and covered by the tripwire;
+3. delegation points in `nextProjectRunStep`/`submitProjectRunStep` (every branch; before `applyExternalResult`), guards in `executeProjectRun`, `executeProjectResume`, `ProjectRunHost`, `reconstructResumeContext` (refuse Harness executions, no write);
+4. internal `harnessStatus` and `harnessDoctor` (no change to `ProjectRunHostResponse` or `ProjectDoctorReport`);
+5. `package-boundary.test.ts` amendment (OD-1).
+No change to `CoordinatorState`, `DEFAULT_ALLOWED_TRANSITIONS`, the default preset, `CoordinatorExecutionContext`, `CoordinatorOptions`, `ExecutionStepKind`, `ExecutionFailureCode` or any barrel.
 
 ## 4. Phases and gates
 
@@ -102,7 +109,7 @@ H0–H7 traceability to artifacts:
 
 - **Unit**: envelope, graph/scheduler, allowlist/executor argv rules, findings/fingerprints, budget arithmetic, hash chain.
 - **Contract**: host adapter shape unchanged; reviewer binds to snapshot; `ValidatorResult` only from executor; additive persistence; public API surface; skills still resolved per role.
-- **Integration/recovery**: positive and negative cycles; R1–R19; restart with pending action; CAS/lock/write faults; `/loop`; push/pull equivalence; non-Harness regression (4-dispatch behaviour retained).
+- **Integration/recovery**: positive and negative cycles; R1–R19; restart with pending action; CAS/lock/write faults; `/loop`; push entry points refusing Harness executions; non-Harness regression (4-dispatch behaviour retained).
 - **Property**: counter monotonic and invariant across every resume point; I1–I8; projection-table coherence; path-matching vectors (30).
 - **Golden**: v0.4.0/v0.5.0 checkpoints load/resume identically.
 - Real subprocesses (not mocks) for the Node executor and the lock tests, consistent with the existing multi-process tests.
@@ -131,6 +138,12 @@ Approval covers the decisions as written in this plan. OD-1 approves the boundar
 - **OD-6** **[APPROVED 2026-10-15]** Confirm the cumulative cap on `RemediationBudgetGrant`s (`maxGrantedAttemptsPerTask`, default 3, i.e. at most 6 attempts per task in total).
 - **OD-7** **[APPROVED 2026-10-15]** Confirm that consumption is tracked per `(executionId, taskId)` across envelope lineages (each attempt still records its envelope), a conservative reading of "per task and authorization envelope" so that re-issuing an envelope cannot reset the budget.
 - **OD-8 (blocks Gate B)** **[APPROVED 2026-10-15]** Confirm the path-matching dialect and POSIX-only platform scope (`contracts/path-matching.md`, FR-093/094) and the `CLEAN_REQUIRED` default baseline (FR-082).
+- **OD-10** **[APPROVED FOR SPECIFICATION 2026-10-15; re-confirm in the Gate B request]** Exported delta limited to `PersistedExecutionState.harness?: unknown` (optional) and one `@internal Coordinator.commit` (FR-105).
+- **OD-11** **[APPROVED FOR SPECIFICATION]** Harness executions are pull-only; legacy and push entry points refuse them (FR-097).
+- **OD-12** **[APPROVED FOR SPECIFICATION]** Additive, behaviour-preserving Coordinator extension (`commit` + guards) is in Gate B scope (FR-099).
+- **OD-13** **[APPROVED FOR SPECIFICATION]** The dispatch↔applied-step pairing may not hold for Harness executions after abandonment/timeout (FR-108).
+- **OD-15 (OPEN)** Host-supplied results: the engine persists the full `last_result` (`evidence: unknown[]`, findings text) and findings in `step_log`; FR-102 limits Harness-built requests and events only. Accept the existing behaviour, or add a size/content check on submitted results to FR-102 (analysis §5).
+- **OD-14 (OPEN)** Hand-off after `PHASE_END`: default is that a Harness execution **stays suspended** and never enters the engine's `CONVERGE`/`READY_FOR_PR` (no preset edge); alternatives are a later, separately approved hand-off design.
 - **OD-9** **[APPROVED 2026-10-15]** Defer host/CLI exposure of human-only operations and status to Gate C (FR-095); at Gate B they are internal functions only.
 
 ### Risk register
@@ -149,11 +162,17 @@ Approval covers the decisions as written in this plan. OD-1 approves the boundar
 | R-10 | Redaction misses a secret | caps, patterns, allowlisted env, quarantine path | best effort only |
 | R-11 | Large/binary/symlink files in snapshots | `OPAQUE` entries and flags | reviewer cannot read opaque content |
 | R-12 | Preset edges diverge from default-preset docs | docs + regression tests | maintenance cost |
-| R-13 | Engine `resume` reconstruction (`suspended_from`) and `harness.cycle.step` could disagree | consistency check ⇒ `FAIL_CLOSED`; recovery tests | verified only at implementation time |
-| R-14 | Existing human-answer revalidation (commit `cdd4d41`) interacts with Harness suspensions | free-text answers never change Harness state; typed ops only | interaction not exercised until Gate B |
+| R-13 | Engine `resume` reconstruction and `harness.cycle.step` could disagree | **mitigated by design (revision 3)**: Harness executions never use `reconstructResumeContext`; `resumeSuspension` restores the pre-suspension row; table rows and `STATE_INCOHERENT` | engine code paths for non-Harness executions were not re-read beyond T049 |
+| R-14 | Existing human-answer revalidation (commit `cdd4d41`) re-dispatches and resets engine counters | **confirmed (T049 probe 2) and closed by design**: Harness executions never reach it; answers are audit-only (FR-097, FR-098) | real hosts cannot resume by answers until Gate C exposure (FR-095) |
 | R-15 | Prohibited operations are denied by policy, not prevented | enforcement classes E1/E2/E3 in policy, status and docs (FR-079); `OPERATION_NOT_PERMITTED` only on visible evidence | network, git push, deploy, migrations, DB, secrets reads are unobserved unless the host reports them |
 | R-16 | Credentials/secrets reachable by agent or validator processes | fixture hygiene + canary test (FR-081, SC-008); minimal env; `HOME` redirect | no sandbox: in real use the OS user's files and network remain reachable |
 | R-17 | Dirty or ignored files influence validator output outside the reviewed diff | clean-tree default, chain of custody, dirty-baseline approval, ignored files hashed and surfaced (FR-082..084) | contents of ignored files are never shown to the reviewer; excluded paths (`ignoredExclusions`) are not examined |
 | R-18 | Path matching ambiguity (case-insensitive FS, Unicode, symlinks, hard links) | closed dialect, validate-not-normalise, collision detection, symlink rules, 30 vectors | hard links and bind mounts undetected; Windows unsupported |
 | R-19 | `STATE_INCOHERENT` after manual edits, old engines or faulty resume | projection table, fail closed, `reconcileCycle` | recovery is manual |
 | R-20 | Structural `tasks.md` digest depends on parser fidelity | `parserVersion` pin, `PARSER_VERSION_CHANGED`, vectors | prose not following Spec Kit task format is invisible to the graph |
+| R-21 | Validators hold the execution lock; revocation waits | validator timeouts; revocation effective at next boundary (FR-107) | `EXECUTION_LOCKED` for ≤ validator timeout |
+| R-22 | Orphan validator process after `SIGKILL` | run records + `STALE_VALIDATOR_PROCESS` (FR-106) | pid probing is best effort |
+| R-23 | Agent `timeout_ms` not enforced by the engine in pull mode | `dispatchTtlMs` suspension; documented E3 (FR-023) | a host may ignore the option |
+| R-24 | Exported-type delta (one field, one method) is still a public change | complete list, type-surface test, OD-10 | consumers with exhaustive record types unaffected (optional field) |
+| R-26 | A hand-built `Coordinator` (public API) can still run on a Harness execution and drop the block | entry guards on every loading entry point; manifest tripwire detects it afterwards | detection after the fact, not prevention (E2) |
+| R-25 | A Harness execution stays suspended at `PHASE_END` (OD-14) | explicit scope boundary | no automatic path to PR in the MVP |
