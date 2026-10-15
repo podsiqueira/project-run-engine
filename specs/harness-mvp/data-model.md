@@ -4,9 +4,9 @@ Index of entities, ownership, and cross-entity invariants. Field-level definitio
 
 | Entity | Persisted where | Mutability | Defined in |
 |---|---|---|---|
-| `HarnessPolicy` | repository file (trusted config); digest pinned in envelope | edited by humans via normal code review; any change ⇒ envelope stale | `contracts/authorization-envelope.md` §1 |
+| `HarnessPolicy` | tracked file `.project-run/harness/policy.json`; digest pinned in envelope | edited by humans via normal code review; any change ⇒ envelope stale | `contracts/authorization-envelope.md` §1 |
 | `PhaseAuthorizationEnvelope` | `harness.envelope` + `ENVELOPE_*` events | immutable per revision; amend = new revision | same §2 |
-| `TaskGraph` / `TaskNode` | derived from `tasks.md` (not persisted; digest + `GRAPH_BUILT` event) | recomputed each boundary | `contracts/task-graph.md` |
+| `TaskGraph` / `TaskNode` | derived from `tasks.md` (not persisted; **structural** digests + `GRAPH_BUILT` event; never raw bytes) | recomputed each boundary | `contracts/task-graph.md` |
 | `TaskEligibilityDecision` | `ELIGIBILITY_DECIDED` event | append-only | same §2 |
 | `GateDecision`, `DependencyAttestation`, `UpstreamAcknowledgement`, `FindingDisposition` | events (human-only) | append-only | `contracts/harness-controller.md` §7, `evidence-ledger.md` §3 |
 | `ValidatorDefinition` | policy | protected | `contracts/verification-pipeline.md` §2 |
@@ -15,6 +15,9 @@ Index of entities, ownership, and cross-entity invariants. Field-level definitio
 | `ReviewRequest` / `ReviewResult` | evidence files + `REVIEW_*` events | write-once | `contracts/review-contract.md` |
 | `HarnessFinding` | inside review/validator evidence; open set in `harness.latest` | status transitions by new events only | same §4 |
 | `RemediationBudget`, `RemediationAttemptRecord`, `RemediationBudgetGrant` | `harness.budgets` (+ events) | counters monotonic | `contracts/remediation-budget.md` |
+| `DirtyBaselineApproval` | `harness.dirtyBaselineApproval` + `BASELINE_APPROVED` event (human-only; absent by default) | immutable | `contracts/verification-pipeline.md` §6.1 |
+| `PathPattern` / scope decision | policy and envelope fields; pure function | validated, never rewritten | `contracts/path-matching.md` |
+| `StateProjection` (allowed combinations) | specification table, enforced at evaluation step 4 | fixed | `contracts/harness-controller.md` §3a |
 | `HarnessEvent` | `harness.events[]` | append-only, hash-chained | `contracts/evidence-ledger.md` §3 |
 | `EvidenceReference` | inside events | immutable | same §5 |
 | `HarnessSuspension` | existing `human_intervention` (+ `SUSPENDED` event) | replaced per suspension (as today); history in events | `contracts/harness-controller.md` §4 |
@@ -22,7 +25,7 @@ Index of entities, ownership, and cross-entity invariants. Field-level definitio
 
 ## Cross-entity invariants
 
-1. `budgets[k].consumed == count(events kind=REMEDIATION_ATTEMPT_OPENED for k)` and equals `attempts.length`.
+1. `budgets[taskId].consumed == count(events kind=REMEDIATION_ATTEMPT_OPENED for the task)` and equals `attempts.length`.
 2. Every `DISPATCHED{kind:"REMEDIATE"}` event shares its checkpoint revision with a `REMEDIATION_ATTEMPT_OPENED` event and a `pending_action`.
 3. Every `TASK_ACCEPTED` event references: one implementation result event, the validator results for snapshot S, a `REVIEW_RECEIVED` with `snapshotId == S`, and carries `checkpointRevision`.
 4. `harness.cycle` exists iff exactly one task is `IN_CYCLE` or `SUSPENDED` (a suspended task keeps the slot).
@@ -30,6 +33,9 @@ Index of entities, ownership, and cross-entity invariants. Field-level definitio
 6. For every envelope revision *r > 1*: `supersedes` points at revision `r−1` which is `SUPERSEDED`.
 7. No event `data` contains payload (enforced by a schema allowing only ids, digests, numbers, enums, ISO times, `EvidenceReference`).
 8. The engine's own fields (`remediation_iteration`, `iteration`, `history`, `step_log`) keep their v0.5.0 meaning; Harness code writes them only through the existing coordinator paths.
+9. `cycle.baselineTreeDigest` equals the previous accepted subject's `treeDigest` (or `envelope.baseline.startTreeDigest` for the first task) unless an approved dirty baseline applies; otherwise `BASELINE_DRIFT`.
+10. The tuple (`state`, `lifecycle_status`, `pending_action`, `cycle.step`) is in the projection table (controller §3a); `cycle.heldAction` exists only in step `SUSPENDED`.
+11. `Σ grants.additionalAttempts ≤ policy.remediation.maxGrantedAttemptsPerTask`; `baseLimit` never changes after first authorisation of the task.
 
 ## State diagram (per task)
 

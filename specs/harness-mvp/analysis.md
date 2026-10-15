@@ -1,80 +1,98 @@
-# Specification Analysis Report: Harness MVP
+# Specification Analysis Report: Harness MVP, revision 2 (correction pass)
 
-**Method**: the procedure of `templates/skills/speckit-analyze/SKILL.md`, applied manually. The `.specify/` scripts and
-`constitution.md` do not exist in this repository, so the scripts could not run and the constitution check used
-`ARCHITECTURE.md` §2 plus the package-boundary test instead. Coverage numbers come from a script (regex over FR/AS/SC/T ids);
-the findings table is a manual read of spec, plan, contracts, scenarios and tasks. **Deviation**: the skill says "no file writes";
-this report is saved so Gate A reviewers can read it. No other artifact is modified by it.
-**Run**: 2026-10-15, two passes (the first pass found gaps, which were fixed and re-measured; both are reported).
+**Method**: the procedure of `templates/skills/speckit-analyze/SKILL.md`, applied manually (no `.specify/` scripts and no
+`constitution.md` in this repository; `ARCHITECTURE.md` §2 and the package-boundary test stand in for the constitution).
+Traceability numbers come from a script (regex over FR/AS/SC/T/D/OD ids and file references); the findings are a manual read.
+**Deviation**: the skill says "no file writes"; this report is saved for Gate A review. Nothing else was modified by running it.
+**Scope of this pass**: specification only. No code, checkpoint, runtime behaviour, Incito or Feature 009 content was touched. H1–H7 are **not** ticked.
 
-## 1. Pass 1 (before fixes): mechanical coverage
+## 1. Mechanical results
 
-| Measure | Result |
-|---|---|
-| FRs defined | 78 (FR-001…FR-078, no gaps after adding FR-059/060) |
-| FRs with no task | **4**: FR-001, FR-009, FR-019, FR-023 |
-| FRs with no acceptance scenario | **20**: FR-001, 002, 003, 008, 009, 013, 019, 022, 023, 026, 033, 034, 036, 051, 054, 056, 058, 059, 065, 068 |
-| Tasks without any FR/AS/SC reference | only owner-gate and Phase-0 rows (by design) |
+| Measure | Revision 1 (after its own fixes) | **Revision 2** |
+|---|---|---|
+| Functional requirements | 78 | **95** (FR-079…FR-095 added; 15 existing FRs reworded) |
+| FRs with ≥ 1 task / ≥ 1 scenario | 78 / 78 | **95 / 95** |
+| Acceptance scenarios | 68 | **96**, no gaps, no duplicates, all referenced by a task |
+| Success criteria | 7 | **11** (SC-008…SC-011), all referenced |
+| Tasks | 44 | **48** (T045–T048 added; T001–T044 unchanged ids), no duplicates, no unknown dependencies, no cycles |
+| Undefined FR / D- / OD- references | 0 | 0 |
+| Contracts | 7 | **8** (`path-matching.md` added) |
+| Path-matching vectors | n/a | 30 (23 pure-matcher vectors plus 4 invalid-pattern cases cross-checked with a throw-away reference matcher kept outside the repository: 0 mismatches) |
 
-## 2. Pass 2 (after fixes): mechanical coverage
+Traceability means an id is cited, **not** that the scenario is adequate; adequacy is judged in §4.
 
-| Measure | Result |
-|---|---|
-| FRs defined / with ≥1 task / with ≥1 scenario | 78 / 78 / 78 (**100 %**) |
-| Scenarios (AS) / referenced by a task | 68 / 68 |
-| Success criteria SC-001…007 referenced by a task or scenario | 7 / 7 |
-| Tasks / duplicate ids / dependencies on a later or unknown id / cycles | 44 / 0 / 0 / 0 |
-| Fixes applied | new task T021 (dispatch builder); scenarios AS-56…AS-68; FR refs added to T009, T027, T032 |
+## 2. Issues corrected in this pass (mapped to your six items)
 
-Coverage is a *traceability* measure (an id is mentioned), **not** proof that a scenario is adequate. See §3 for adequacy.
-
-## 3. Findings
-
-| ID | Category | Severity | Location | Summary | Status |
-|---|---|---|---|---|---|
-| C1 | Coverage | HIGH | spec FR-001/009/019/023 | requirements with no task | **Fixed** (T009, T021, T027, T032) |
-| C2 | Coverage | HIGH | spec vs scenarios | 20 requirements with no acceptance scenario | **Fixed** (AS-10, 14, 16, 56–68) |
-| I1 | Inconsistency | HIGH | spec FR-048 vs remediation §4 | "CRITICAL consumes no attempt" is ambiguous when the CRITICAL finding arrives after an already-counted attempt | **Fixed**: reworded (new dispatch is prevented; counted attempts stay counted); AS-26 aligned |
-| I2 | Inconsistency | MEDIUM | spec US2.2 vs remediation §4 | `VALIDATOR_ERROR` after a remediation: "no attempt consumed" contradicts the already-counted attempt | **Fixed**: wording "no *additional* attempt" |
-| I3 | Inconsistency | MEDIUM | spec FR-031 vs review contract | `VERIFIER_TAMPERING_RISK` vs `verifierTampering` (terminology drift) | **Fixed** |
-| I4 | Inconsistency | MEDIUM | spec edge cases | `PRE_EXISTING` flag had no field | **Fixed**: `preExisting?` on `HarnessFinding` |
-| I5 | Inconsistency | MEDIUM | controller §4 | `LIMIT_REACHED` used by the authorisation check but absent from `SuspensionReason` | **Fixed** |
-| U1 | Underspecification | HIGH | controller / D-22 | no operation to clear causes fixed outside the Harness (e.g. validator env), and the interplay with existing `humanAnswers` was unspecified | **Fixed**: `resumeSuspension`, §7a, AS-68; interplay left as risk R-14 |
-| U2 | Underspecification | MEDIUM | task-graph §6 / data-model | does a `SUSPENDED` task keep the single cycle slot? | **Fixed**: yes; only amendment/`EXCLUDED` frees it |
-| U3 | Underspecification | MEDIUM | tasks | docs for the preset edges (`state-machine.md`, `transition-contract.md`) not in the task list | **Fixed** (T041) |
-| A1 | Ambiguity | MEDIUM | FR-049, D-13 | "strict reduction" of fingerprint sets and fingerprint normalisation rules are heuristic | **Open**: parameterised at Gate B; OD-3 |
-| A2 | Ambiguity | MEDIUM | FR-029/FR-031 | glob dialect for `allowedPaths`/`protectedPaths` (gitignore-style vs minimatch) not fixed; no glob library may be added (zero runtime deps) | **Open**: decide at Gate B (implement a small anchored-glob subset, specify it first) |
-| A3 | Ambiguity | LOW | FR-009 | `maxTaskElapsedMs` is checked only at boundaries, not preemptive | Accepted (documented in D-16) |
-| X1 | Constitution/boundary | CRITICAL-if-unresolved | plan §2, D-11 | the package-boundary test forbids `node:crypto` and `node:child_process` in `src/`; the design needs both | **Open, blocks Gate B**: OD-1 |
-| X2 | Compatibility | HIGH | D-10, T028 | the Harness preset adds four transition edges; consumers with exhaustive state switches are unaffected (no new states) but preset docs must change | **Open (OD-2)**; regression tests specified |
-| X3 | Compatibility | HIGH | evidence-ledger §7 | old engines drop the `harness` block; mitigation is detect-only | **Open risk R-7** |
-| X4 | Security honesty | HIGH | FR-003, D-01 | human actors are host-asserted, not authenticated; a local agent with shell access could call human-only CLI operations | **Open risk R-9** (stated in spec, contract and status) |
-| X5 | Feasibility | MEDIUM | D-04 | snapshotting large trees by hashing every changed file may be slow; size cap and `OPAQUE` rule exist but no performance budget | **Open**: add budget to the Gate B fixture |
-| X6 | Scope | MEDIUM | Feature 009 | its H0 findings are unresolved; consumer's `tasks.md` uses prose `DEPENDS ON`, which is what the parser targets (no real-file validation done by design) | **Open (R-8)**: excluded until separate authorisation |
-| X7 | Verification gap | MEDIUM | research §A | `coordinator.ts`, `host-dispatch-adapter.ts`, `bootstrap.ts`, `doctor.ts` and Feature 009's `execution-protocol.md` were not read line by line in H0; the claims about carry-forward and resume reconstruction rest on code comments and tests | **Open**: first task of Gate B should re-verify (R-13) |
-
-No duplication findings. No placeholders (`TODO`, `TKTK`, `???`) remain in the artifacts (checked by script).
-
-## 4. Adequacy review of the highest-risk acceptance criteria
-
-| Requirement | Scenario | Adequate? | Gap |
+| # | Your item | What was wrong | Correction (where) |
 |---|---|---|---|
-| Exactly 3 attempts (FR-041..046) | AS-27..33, AS-54 | Yes: one test per counting-table row, property test over resume points | needs a real multi-process restart (T036/T037) |
-| Counter survives host change (FR-043) | AS-29 | Partly | "host change" is simulated by a second client with the same store; a different *runtime* is not exercised until Gate C |
-| Reviewer independence (FR-037..039) | AS-21..24 | Contract-level only | by design cannot prove isolation (NG-6) |
-| No fabricated success after crash (FR-070) | AS-37 | Yes, 18 rows | R12 (acceptance CAS conflict) needs a deterministic fault injector in the fixture |
-| Legacy checkpoints (FR-074) | AS-44 | Yes | golden files for v0.4.0 must be produced from the tagged release, not hand-written |
-| Secrets in logs (FR-055/056) | AS-17, AS-64 | Partly | best-effort; only known patterns and allowlisted env values are verifiable |
-| Feature 009 exclusion (SC-006) | AS-55 | Yes (lint) | does not stop a human from pointing the Harness at 009; process control only |
+| 1 | Security boundary | Text implied the allowlist, protected paths and human-only operations *prevented* things | Enforcement classes **E1 engine-refused / E2 detected after the fact / E3 not enforced unless host or environment does** (FR-079, envelope contract §0). FR-003, 005, 020, 029, 030 reworded; `OPERATION_NOT_PERMITTED` only on visible evidence (FR-080); NG-10; risks R-9 rewritten, R-15, R-16 added; status must print the limitations; AS-04 rewritten, AS-69…AS-72; doc-lint test (T047). **Fixture hygiene** FR-081, SC-008, AS-71 (sanitised env, redirected `HOME`, canary secrets, no credential files) |
+| 2 | Baseline integrity | "Absorb all pre-existing dirt into the baseline" and "exclude all VCS-ignored" could hide influence from the reviewer | Default **`CLEAN_REQUIRED`** at issuance; **chain of custody** on `treeDigest` between tasks, else `BASELINE_DRIFT` (FR-082); **evidence-backed `DirtyBaselineApproval`**, off by default, reviewer must answer `baselineInfluence` (FR-083); ignored files **hashed, never copied**, only policy-listed `ignoredExclusions` excluded and visible as `EXCLUDED_BY_POLICY`, ignored changes need a reviewer disposition (FR-084); validator side effects on ignored files recorded, not drift. D-04 revised, D-24, R-17, AS-73…AS-79 (AS-79: Feature 009 never used) |
+| 3 | Pinning consistency | Whole-file `tasks.md` digest vs per-task digest vs checkbox tolerance | **No whole-file digest.** Canonical structural records per task (text, acceptance text, sorted deps/gates/markers), `parserVersion`, dependency-closure digests; checkbox, headings, order, prose excluded (FR-085). Diff rule: unchanged structural digests and only the **own** checkbox toggled (FR-086). FR-008/061/063 reworded; invalidation matrix rebuilt (envelope §7); D-25; AS-80…AS-84; R-20 |
+| 4a | State vocabulary | `HarnessStep` looked like a second orchestrator | `HarnessStep` is an **embedded refinement**; closed **projection table** over (`state`, `lifecycle_status`, `pending_action`, step); anything else ⇒ `FAIL_CLOSED(STATE_INCOHERENT)` with zero writes; only human `reconcileCycle` (to `SUSPENDED`, never forward) (FR-087/088, controller §3a, invariant I8); `TASK_ACCEPTED` is transient, not at rest; held actions live in `heldAction` because the engine clears `pending_action` outside `AWAITING_AGENT_ACTION`; D-26; SC-010; AS-85/86; R-19 |
+| 4b | Revocation recovery | R16 let a result be "received" although evaluation step 5 rejects the envelope first | Evaluation order now: …coherence (4) → ports (5) → **envelope validity (6)** → **pending action (7)**; §2a defines refusal without application, `SUBMISSION_REFUSED` (digest only), `HOLD`/`ABANDON` at revocation, restoration of the same `step_id` after re-authorisation (FR-089, D-27, R16 row rewritten, AS-87…AS-89) |
+| 5a | OD-5 | Policy location undecided | **`.project-run/harness/policy.json`** (tracked, beside the tracked `.project-run/config.json`, distinct from the ignored `runs/` and `evidence/`; must be committed and unmodified at issuance; mandatory protected set built in) (FR-090, D-28, AS-90). Checked against `project-config.ts`, `bootstrap.ts`, `CONSUMER-GUIDE.md` |
+| 5b | Limit relations | Policy ceiling, envelope limit, grants and amendment `GRANT` carry-over blurred "exactly three" | Ceiling 3 ≥ envelope limit = **initial attempts**; grants are **separate, additional, capped** authorisations; the amendment `budgetCarryOver: GRANT` option was **removed**; consumption shared per `(executionId, taskId)` across lineages so re-issuing never resets it (FR-041/045/091, envelope §5, remediation §2–3, AS-91). OD-6, OD-7 |
+| 5c | `NO_PROGRESS` | Vague "strict reduction", no normalisation | Exact fingerprint (`fp1|category|file|criterion|ruleKey`, no lines/severity/wording), blocking *set*, progress ⇔ **proper subset**, streak counter, default 2, dispatch-failed attempts leave the set unchanged; **policy value is a floor** an envelope cannot weaken (`RECURRENCE_WEAKER_THAN_POLICY`) (FR-049/092, remediation §6, envelope §4a, AS-92/93, D-13) |
+| 6a | AS-67 | Said suspension on the "third outcome" | Rewritten: the **second** rejected submission suspends; the first does not; FR-068, controller R5 and remediation table aligned |
+| 6b | Glob/path semantics | Dialect undefined | New `contracts/path-matching.md`: POSIX only, anchored, case-sensitive, closed dialect (`*`, `?`, whole-segment `**`, trailing `/`), patterns rejected not rewritten, candidates validated not normalised, traversal/absolute/backslash/empty-segment/control-char rules, NFC and case-collision handling, deny-wins, symlink rules, 30 normative vectors (FR-093/094, SC-009, AS-94…AS-96, T046) |
+| 6c | Exports | A subpath export was implied for the Node module | **No new exports, subpaths, `bin` or public types at Gate B**; `package.json` byte-identical (FR-077, FR-095, SC-011, AS-49 now P1, D-15, D-11 text); host/CLI exposure moved to Gate C (T048, OD-9) |
 
-## 5. Metrics
+Also corrected for consistency while editing: `HarnessStep` type (no `TASK_ACCEPTED`), `SuspensionReason` catalogue (+ `BASELINE_*`, `IGNORED_FILE_CHANGED`, `PATH_AMBIGUOUS`, `SUBMISSION_REFUSED`, `LIMIT_REACHED`), data-model invariants 9–11, review contract (`ruleKey`, `baselineInfluence`, `ignoredFileDispositions`, `excludedByPolicy`), recovery table R1–R19, plan risk register R-9, R-15…R-20, scenario references AS-34/AS-61.
 
-Requirements 78 · Success criteria 7 · Scenarios 68 · Tasks 44 (T001–T044, all future) plus 8 specification rows (H0–H7) · Traceability coverage
-100 % (pass 2; 94.9 % FR→task and 74.4 % FR→scenario in pass 1) · Ambiguity items 3 (1 open, 1 open, 1 accepted) ·
-Duplication 0 · Critical issues **1 open (X1, owner decision OD-1)**.
+## 3. Unresolved items (separate from the corrections above)
 
-## 6. Next actions
+### Owner decisions
+| ID | Item | Blocks |
+|---|---|---|
+| **OD-1** | Boundary amendment: `node:crypto` in core, `node:child_process` only in `src/harness/node/` (internal, unexported) | **Gate B** |
+| **OD-8** | Confirm the path-matching dialect, POSIX-only scope and the `CLEAN_REQUIRED` default baseline | **Gate B** |
+| OD-2 | Preset-local transition edges (`INDEPENDENT_REVIEW|RE_REVIEW → IMPLEMENT`, `IMPLEMENT → REMEDIATION`, `REMEDIATION → REMEDIATION`) as the per-task loop | Gate B |
+| OD-3 | Default `NO_PROGRESS` streak 2 | no (parameter) |
+| OD-4 | No ledger compaction in the MVP | no |
+| OD-6 | Cumulative grant cap (`maxGrantedAttemptsPerTask`, default 3 ⇒ at most 6 attempts per task) | no |
+| OD-7 | Consumption shared across envelope lineages (a conservative reading of "per task and per envelope"; each attempt still records its envelope) | no |
+| OD-9 | Host/CLI exposure of human-only operations deferred to Gate C | no |
 
-1. Owner resolves OD-1 (blocks Gate B), and decides OD-2…OD-5.
-2. Re-run this analysis after any owner-requested edit to the spec.
-3. Do not start `T001+` until Gate A and Gate B are granted in writing.
+### Verification gaps and risks that remain open
+| ID | Item | Why it stays open |
+|---|---|---|
+| X7/R-13 | `coordinator.ts`, `host-dispatch-adapter.ts`, `bootstrap.ts`, `doctor.ts` and the engine's `resume` reconstruction (`suspended_from`) were not read line by line; the projection table and the carry-forward design rest on code comments, types and tests | needs the first Gate B task |
+| R-14 | Interaction with the existing human-answer revalidation (commit `cdd4d41`): Harness suspensions are cleared only by typed operations, but the coexistence is unproven | exercised only at Gate B |
+| R-7 | An older engine rewriting a Harness checkpoint drops the block; the tripwire only **detects** | inherent |
+| R-9/R-15/R-16 | Human actors are unauthenticated; prohibited operations are denied by policy, not prevented; validators have no network/filesystem isolation | inherent to the MVP; documented as limits, not defects |
+| R-17 | Contents of ignored files are never shown to the reviewer (only path + hash); `ignoredExclusions` are not examined | deliberate trade-off against secret leakage |
+| R-18 | Hard links, bind mounts, Windows | not detected / unsupported |
+| R-20 | Prose not following the Spec Kit task format is invisible to the parser | by design (no guessing) |
+| A1 | `ruleKey` stability depends on reviewer discipline; fingerprints stay heuristic | mitigated, not eliminable |
+| X5 | No performance budget for hashing large trees | add to the Gate B fixture |
+| R-8 | Feature 009 H0 inconsistencies; excluded from every fixture, pilot and test, including its dirty working tree | separate review and authorisation |
+
+## 4. Adequacy review of the highest-risk criteria (revision 2)
+
+| Requirement | Scenarios | Adequate? | Remaining gap |
+|---|---|---|---|
+| Exactly 3 initial attempts, grants separate | AS-27…33, AS-91, AS-54 | Yes | multi-process restart proof needs T037 |
+| `NO_PROGRESS` definition | AS-92, AS-93 | Yes (table tests) | fingerprint stability is heuristic (A1) |
+| Honest enforcement boundary | AS-69…AS-72, AS-04 | Partly | doc-lint can only check wording, not that hosts behave |
+| Clean baseline / chain of custody | AS-73…AS-79 | Yes | real-git edge cases (rename, submodule, large files) rely on T017 |
+| Structural pinning | AS-80…AS-84, SC-007 | Yes | parser fidelity on real consumer files untested by design (no Feature 009) |
+| State coherence | AS-85, AS-86, SC-010 | Yes (exhaustive property test) | resume reconstruction still unverified against engine code (X7) |
+| Revocation with pending action | AS-87…AS-89 | Yes | host behaviour when a held `step_id` is never resubmitted is a policy question for Gate C |
+| Path matching | AS-94…AS-96, SC-009 | Yes (30 vectors, adversarial timing) | hard links and bind mounts undetected |
+| Package surface unchanged | AS-49, SC-011 | Yes | none |
+
+## 5. Metrics (revision 2)
+
+Requirements 95 · Success criteria 11 · Scenarios 96 · Tasks 48 (all future; H0 approved, H1–H7 unticked) · Traceability 100 % ·
+Open owner decisions 8 (2 block Gate B) · Open risks listed above · Critical items open: **OD-1** (blocks Gate B).
+
+## 6. Status after owner approval (2026-10-15)
+
+The owner approved OD-1…OD-9 and formally concluded the H0–H7 specification phase (H1–H7 ticked). **Gate B remains blocked** until the pre-Gate-B technical review (T049, covering X7/R-13/R-14) and a new explicit authorisation. The owner noted the approval rests on this report, not on direct reading of the revision-2 files.
+
+## 7. Next actions (superseded by §6 where they conflict)
+
+1. Owner review of revision 2. If approved, tick H1–H7 (that is the Gate A act).
+2. Owner decides OD-1 and OD-8 (block Gate B), and confirms OD-2, OD-6, OD-7.
+3. Re-run this analysis after any further edit.
+4. Do not start T003+ (or T049-dependent work) until Gate B is authorised in writing; Feature 009 stays excluded.

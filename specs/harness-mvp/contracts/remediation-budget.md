@@ -7,15 +7,15 @@ Implements owner **Decision 1**. Drives FR-041..FR-050, D-07, D-19. Existing v0.
 
 - **Attempt**: a remediation dispatch that was *durably recorded* — the pending action and the incremented counter are written in **one CAS checkpoint** — in response to a blocking finding. The first such dispatch is **attempt 1**. (Not "iteration", not the engine's `remediation_iteration`.)
 - **Unsuccessful attempt**: an attempt after which any of: required validator `FAILED`; review not `PASS` or open blocking findings; dispatch failed / timed out / abandoned; result invalid; `BLOCKED`.
-- **Budget key**: `(lineageId, taskId)`.
+- **Budget key**: `(executionId, taskId)`. Each attempt records the `authorizationId`/`lineageId` of the envelope that dispatched it, so consumption is reportable **per task and per envelope**, but is **shared across all envelope lineages of the execution** so that re-issuing or superseding an envelope can never reset it (FR-091).
 
 ## 2. State
 
 ```ts
 interface RemediationBudget {
-  lineageId: string; taskId: string;
-  limit: number;              // = envelope.remediation.limit (0..3) + Σ grants
-  baseLimit: 0 | 1 | 2 | 3;
+  executionId: string; taskId: string;
+  limit: number;              // = baseLimit + Σ grants.additionalAttempts
+  baseLimit: 0 | 1 | 2 | 3;   // initial automatic attempts = envelope.remediation.limit at first authorisation of the task; never raised by amendment
   consumed: number;           // monotonic; = number of durable remediation dispatches; never decremented
   grants: RemediationBudgetGrant[];   // append-only
   attempts: RemediationAttemptRecord[];   // append-only
@@ -23,6 +23,7 @@ interface RemediationBudget {
 }
 interface RemediationAttemptRecord {
   attempt: number;            // 1-based
+  authorizationId: string; lineageId: string;
   stepId: string; dispatchedAt: string; revisionAtDispatch: number;
   triggeringFindingFingerprints: string[];
   outcome: "OPEN" | "SUCCEEDED" | "UNSUCCESSFUL";
@@ -37,7 +38,7 @@ interface RemediationBudgetGrant {
   actor: Actor; grantedAt: string;
 }
 ```
-Invariants: `consumed ≤ limit` at dispatch time; `consumed == attempts.length`; at most one attempt `OPEN`; `limit` only increases via a grant.
+Invariants: `consumed ≤ limit` at dispatch time; `consumed == attempts.length`; at most one attempt `OPEN`; `limit` only increases via a grant; `Σ grants.additionalAttempts ≤ policy.remediation.maxGrantedAttemptsPerTask` (default 3, so at most 6 attempts in total per task); `baseLimit` is fixed when the task is first authorised and an amendment that lists the task again cannot change it.
 
 ## 3. Rules
 
@@ -45,7 +46,7 @@ Invariants: `consumed ≤ limit` at dispatch time; `consumed == attempts.length`
 2. **Pre-check**: dispatch allowed iff `consumed < limit` **and** authorisation (FR-007) passes **and** no `CRITICAL`/out-of-scope condition exists. Otherwise `SUSPEND`.
 3. **After 3 unsuccessful attempts** (limit reached) the controller sets `exhaustedAt`, suspends with `REMEDIATION_BUDGET_EXHAUSTED`, and will not dispatch again for that task until a grant is recorded.
 4. **Human answers never touch the counter**: `humanAnswers` processing and `resume` MUST NOT read or write `RemediationBudget`. A human may (a) abandon the pending action, (b) record a finding disposition, (c) record a `RemediationBudgetGrant`, (d) revoke the envelope. Only (c) increases `limit`.
-5. **Grants**: human-only (`grantRemediationBudget`), bound to the *current* suspension id, `additionalAttempts ≤ 3` per grant, idempotent on `decisionId`; grants carry the same rules (validators + new review after each).
+5. **Grants**: human-only (`grantRemediationBudget`), a **separate recorded authorisation** bound to the *current* `REMEDIATION_BUDGET_EXHAUSTED` or `NO_PROGRESS` suspension id, `additionalAttempts ∈ {1,2,3}` per grant, idempotent on `decisionId`, refused beyond `policy.remediation.maxGrantedAttemptsPerTask`. Grants carry the same rules (validators + new review after each). **The initial three attempts are never created, raised or replaced by a grant, a policy edit, an envelope, an amendment, or a human answer**; an amendment may neither contain nor imply a grant (FR-091). The relation is: `policy.initialLimit (3) ≥ envelope.remediation.limit (initial attempts) ` and `grants` are strictly additional.
 6. **Independence from the engine counter**: the Harness preset's `resolveTransition` does not read `remediation_iteration`/`MAX_REMEDIATION_ITERATIONS`; it reads `RemediationBudget`. The engine's own counter is still updated for display compatibility only.
 7. **Preset-scoped**: only executions with a persisted Harness block use this policy (FR-050).
 
@@ -56,7 +57,7 @@ Invariants: `consumed ≤ limit` at dispatch time; `consumed == attempts.length`
 | Pending action + counter saved, host never picks it up, process restarts | Yes (already counted, **once**); re-presenting the same `step_id` never counts again | attempt stays `OPEN` |
 | Host reports failure / crash (`FAIL`, `lifecycle_status: FAILED`) | Yes | attempt `UNSUCCESSFUL(DISPATCH_FAILED)`; next dispatch consumes the next attempt |
 | Host reports timeout (`TIMED_OUT`) or `dispatchTtlMs` elapsed with no result | Yes | attempt stays `OPEN`; cycle **suspends** `DISPATCH_TIMEOUT` (no auto-retry); human chooses `abandonPendingAction` (⇒ `UNSUCCESSFUL(ABANDONED_BY_HUMAN)`) or `extendPendingAction` (same attempt, no recount) |
-| Result fails Harness validation (malformed, wrong ids) | Yes (dispatch already counted); rejections are not recounted | pending action stays; after `maxSubmissionRejections` (2) ⇒ `UNSUCCESSFUL(RESULT_INVALID)` and suspend |
+| Result fails Harness validation (malformed, wrong ids) | Yes (dispatch already counted); rejections are not recounted | **1st rejected submission**: pending action stays, no suspension. **2nd rejected submission** (`maxSubmissionRejections` = 2): `UNSUCCESSFUL(RESULT_INVALID)` and suspend |
 | Result accepted, validators `FAILED` | Yes | `UNSUCCESSFUL(VALIDATOR_FAILED)` |
 | Result accepted, validators `ERROR` | Yes (the dispatch happened) | attempt closed `UNSUCCESSFUL` **but** cycle suspends `VALIDATOR_ERROR`; environment fix + resume continue with no extra count until the next dispatch |
 | Result accepted, review has blocking findings | Yes | `UNSUCCESSFUL(REVIEW_FINDINGS)` |
@@ -71,10 +72,25 @@ Invariants: `consumed ≤ limit` at dispatch time; `consumed == attempts.length`
 validators (engine-executed, new subject snapshot) ⇒ **new** review invocation ⇒ findings evaluation. The attempt record is
 closed only when this chain ends or a suspension interrupts it.
 
-## 6. Early escalation (`NO_PROGRESS`)
+## 6. `NO_PROGRESS` (precise definition; FR-049, FR-092)
 
-Default policy `ESCALATE_ON_NO_PROGRESS`: if after attempt *n* and *n−1* the blocking fingerprint set is not a strict reduction
-of the previous one, suspend `NO_PROGRESS` (attempt *n* stays counted). `EXHAUST_BUDGET` disables this. Never lets a 4th dispatch happen.
+**Finding fingerprint** (`fingerprint`, engine-computed, version-prefixed so it can evolve): `fp = sha256("fp1|" + category + "|" + file + "|" + criterion + "|" + rule)` where
+- `category` = lower-cased, trimmed `finding.category` (`""` if absent);
+- `file` = the finding's `location.file` after path validation (`path-matching.md` §2), or `""` (line/column are **never** part of the fingerprint);
+- `criterion` = `violatedCriterion` id, else `violatedContract` id, else `""` (ids, never free text);
+- `rule` = the reviewer-supplied stable `ruleKey` (required on blocking findings); if absent, a derived key: the finding title lower-cased, NFC-normalised, digits and quotes removed, whitespace collapsed;
+- for `source: "VALIDATOR"`: `category = "validator"`, `file = ""`, `criterion = validatorId`, `rule = "exit:" + exitCode`; log text is never part of it.
+Severity and wording of description/impact/recommendation are not part of the fingerprint.
+
+**Blocking set** `B_k` = the set of fingerprints of open blocking findings (review and validator) after attempt *k*; `B_0` = the set after the first review/verification that triggered remediation. Duplicates collapse (it is a set). An attempt that yields no review (dispatch failed/timed out/abandoned/invalid result) leaves the set unchanged: `B_k = B_{k−1}`.
+
+**Progress**: attempt *k ≥ 1* made progress **iff `B_k ⊊ B_{k−1}`** (a *proper subset*: at least one previously blocking fingerprint is gone **and no new blocking fingerprint appeared**). `B_k = ∅` is success, not a no-progress case. Otherwise (equal, superset, or any new fingerprint) it made **no progress**.
+
+**Streak**: `streak_k = 0` if progress, else `streak_{k−1} + 1` (`streak_0 = 0`). When `streak_k ≥ E.streak` (envelope) the Harness suspends `NO_PROGRESS` immediately after attempt *k* is evaluated (the attempt stays counted). Default `E.streak = 2` ⇒ earliest at attempt 2, so a third attempt never starts after two non-reducing attempts.
+
+**Policy floor** (FR-092): the envelope's `recurrence` must not be weaker than the policy's (authorization-envelope §4a): a policy `ESCALATE_ON_NO_PROGRESS, streak 2` forbids an envelope from choosing `EXHAUST_BUDGET` or a larger streak. `NO_PROGRESS` never allows a 4th dispatch; it can only shorten the sequence. A grant after `NO_PROGRESS` resets `streak` to 0 only if the grant states `resetStreak: true` (default false) and is recorded in the event.
+
+Known limitation: fingerprints are heuristic (reviewer rewording of `ruleKey` can split or merge sets); the reviewer contract therefore requires stable `ruleKey`s and the re-review receives `priorFindings` with their keys.
 
 ## 7. Migration/compatibility
 
@@ -84,4 +100,4 @@ Documented consequence: an adopted execution that already used engine remediatio
 
 ## 8. Test list (H5)
 
-attempt numbering (first = 1) · counter in same checkpoint as pending action · CAS failure ⇒ no count · restart/resume/host change preserve · human answer no-op on counter · 4th dispatch refused · grant of 1/2/3 · grant without suspension link rejected · grant idempotency · each table row in §4 · NO_PROGRESS · counter property test across all resume points · engine default behaviour (4 dispatches) unchanged for non-Harness runs · re-review uses new invocation · adopted run starts at 0.
+attempt numbering (first = 1) · counter in same checkpoint as pending action · CAS failure ⇒ no count · restart/resume/host change preserve · human answer no-op on counter · 4th dispatch refused · grant of 1/2/3 · grants beyond the cap rejected · grant without suspension link rejected · grant idempotency · amendment with grant fields rejected · re-issue does not reset consumption · each table row in §4 · NO_PROGRESS table tests (equal set, superset, new fingerprint with smaller size, proper subset, empty, dispatch-failed attempt, streak 1/2/3, policy-floor refusal) · counter property test across all resume points · engine default behaviour (4 dispatches) unchanged for non-Harness runs · re-review uses new invocation · adopted run starts at 0.

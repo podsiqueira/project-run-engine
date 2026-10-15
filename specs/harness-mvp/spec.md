@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/harness-mvp/`
 **Target repository**: `project-run-engine` (baseline `v0.5.0`, SHA `c1e4054`)
-**Status**: DRAFT for Gate A review. **Specification only. No implementation is authorized.**
+**Status**: **Gate A approved 2026-10-15 (revision 2); specification phase H0–H7 concluded.** **Specification only. No implementation is authorized; Gate B is blocked** pending the pre-Gate-B technical review (`tasks.md` T049) and a new explicit authorisation.
 **Created**: 2026-10-15
 **Source plan**: "Autonomous Engineering Harness MVP, Specification Plan" (2026-10-14)
 **Audit baseline**: H0 read-only audit (2026-10-15), summarised in `research.md` §A.
@@ -37,6 +37,7 @@ explicitly *different*, never *accidentally* different.
 | E-7 | `package-boundary.test.ts` permits only `node:fs`/`node:path` in `src/`. Nothing in the core spawns a process or hashes. | Hashing needs `node:crypto` in the core and spawning needs `node:child_process` in an isolated module: an explicit, approved boundary amendment (D-11, OD-1). |
 | E-8 | The engine overwrites the whole checkpoint on save; fields not carried on the in-memory context are dropped. Older engines drop `revision`/`history`. | New persisted fields must be carried explicitly; mixed-version use must be detected (FR-073, FR-075). |
 | E-9 | The file store lock and CAS are single-machine only. | MVP stays single machine (NG-1). |
+| E-10 | `.project-run/config.json` is tracked configuration; `.project-run/runs/` is mutable state that consumers are told to VCS-ignore (`CONSUMER-GUIDE.md`). | Policy goes under a new tracked `.project-run/harness/`; evidence under an ignored `.project-run/evidence/` (FR-090). |
 
 ## 3. User Scenarios & Testing
 
@@ -103,7 +104,7 @@ approvals instead of being silently accepted.
 
 ### Edge cases
 
-- Working tree already dirty before the first task (as in the Feature 009 consumer): baseline snapshot absorbs pre-existing changes; only the delta is reviewed; unrelated drift during a cycle is surfaced, never ignored.
+- Working tree already dirty at authorization: **refused by default** (`BASELINE_NOT_CLEAN`); a dirty baseline needs an evidence-backed `DirtyBaselineApproval` (FR-083). Drift between tasks, or any change not produced by an accepted task of this envelope, ⇒ `BASELINE_DRIFT` (FR-082). Feature 009's working tree is never used as a baseline or fixture.
 - Task diff touches a protected path (policy files, allowlist, checkpoints, `tasks.md` beyond the task's own checkbox) → `OUT_OF_SCOPE_CHANGE`, no remediation attempt consumed until a human decides.
 - Diff changes between validation and acceptance (TOCTOU) → acceptance refused, results marked stale.
 - `tasks.md` checkbox says done but the ledger has no acceptance (or the reverse) → `RECONCILIATION_REQUIRED`.
@@ -118,12 +119,12 @@ approvals instead of being silently accepted.
 
 - **FR-001** The Harness MUST be opt-in per execution. An execution without a persisted Harness block MUST behave exactly as in v0.5.0.
 - **FR-002** A `PhaseAuthorizationEnvelope` MUST be a versioned, immutable-once-issued record (fields in `contracts/authorization-envelope.md`). Any change MUST create a new envelope revision that `supersedes` the previous one.
-- **FR-003** Envelopes MUST be created, amended, revoked only through **human-only operations** (D-22) that are not reachable through `submitProjectRunStep`. Each records `actor` (kind `HUMAN`, identifier asserted by the host), time and the envelope digest. The engine cannot authenticate the actor; this limitation MUST be stated in the contract and in status output.
+- **FR-003** Envelopes MUST be created, amended, revoked only through **human-only operations** (D-22) that are not reachable through `submitProjectRunStep`. Each records `actor` (kind `HUMAN`, identifier asserted by the host), time and the envelope digest. This is **logical separation, not technical prevention**: the engine cannot authenticate the actor, and any local process with the same filesystem and shell access (including an agent) can call the same internal functions or edit files directly. The contract, status output and risk register MUST say so (FR-079).
 - **FR-004** Every envelope MUST be a subset of a project `HarnessPolicy` (repository configuration, digest-pinned). An envelope MUST NOT widen the policy ceiling (permitted operations, validators, limits).
-- **FR-005** Permitted operations MUST be an explicit closed enumeration; anything unlisted is denied. The following MUST be un-grantable in the MVP: destructive operations, data migrations, deployments, infrastructure changes, business decisions, scope expansion, policy/allowlist/envelope changes, `git push`/merge/PR/release/publish, network egress.
+- **FR-005** Permitted operations MUST be an explicit closed enumeration; anything unlisted is **denied by policy**. The following MUST NOT be authorisable in the MVP: destructive operations, data migrations, deployments, infrastructure changes, business decisions, scope expansion, policy/allowlist/envelope changes, `git commit`/`push`/merge/PR/release/publish, network egress. "Denied by policy" means the Harness will not dispatch, accept or run them itself and will suspend when it **sees** one; it does **not** mean they are technically prevented (FR-079, FR-080).
 - **FR-006** The envelope MUST support `expiresAt`, status (`ACTIVE`, `SUSPENDED_STALE`, `EXPIRED`, `REVOKED`, `SUPERSEDED`, `COMPLETED`), and immediate revocation effective at the next controller boundary.
 - **FR-007** Authorisation MUST be evaluated before **every** dispatch (implementation, remediation, review) and again before acceptance; failure returns a typed denial and dispatches nothing.
-- **FR-008** The envelope MUST pin digests of: policy, validator allowlist, authorised task definitions, and listed contract/spec artifacts (see FR-061..064 for invalidation).
+- **FR-008** The envelope MUST pin: the policy digest, the validator-allowlist digest, **structural** digests of the authorised tasks and of their transitive dependencies (FR-085), and digests of listed spec/contract artifacts. `tasks.md` MUST NOT be pinned by raw file bytes.
 - **FR-009** Time limits MUST use measurable quantities (`timeout_ms` per dispatch and validator, maximum elapsed time per task). Token/cost limits MUST be declared **unsupported** unless a host reports them; the Harness MUST NOT fabricate cost figures.
 - **FR-010** The effective envelope and policy revision MUST be queryable through status output.
 
@@ -141,7 +142,7 @@ approvals instead of being silently accepted.
 ### 4.3 Implementation dispatch (FR-019 … FR-023)
 
 - **FR-019** The implementation dispatch MUST carry exactly one task, its acceptance criteria, relevant contract references, the allowed/protected path sets, and an envelope summary, through the existing dispatch contract with required skills resolved and validated as today.
-- **FR-020** The agent MUST receive no authority to change policy, allowlist, envelope, checkpoints, ledger or other tasks; protected paths (FR-029) are enforced by diff inspection, not by instruction.
+- **FR-020** The agent MUST receive no authority (by contract) to change policy, allowlist, envelope, checkpoints, ledger or other tasks. Protected paths (FR-029) are **detected after the fact** by diff inspection; the Harness does not prevent the agent from writing them, it refuses acceptance and suspends (enforcement class E2, FR-079).
 - **FR-021** The agent's structured result (summary, files changed, evidence refs) MUST be treated as a claim; the engine computes the real delta (FR-026) and any mismatch is a `RESULT_MISMATCH` finding.
 - **FR-022** A task baseline snapshot MUST be recorded before the first dispatch of the task cycle and never moved during that cycle.
 - **FR-023** Dispatch options MUST carry `timeout_ms` from the envelope.
@@ -153,8 +154,8 @@ approvals instead of being silently accepted.
 - **FR-026** Snapshots (FR-033..) and validator runs MUST be bound together: a result records the subject `snapshotId`, exit code, signal, timeout/cancellation flags, duration and log references.
 - **FR-027** Outcomes are `PASSED`, `FAILED` (ran, non-zero/assertion failure → remediable), `ERROR` (could not run or timed out → suspend). A missing result for a required validator is `ERROR`.
 - **FR-028** Any required validator not `PASSED` MUST block acceptance and review dispatch.
-- **FR-029** The allowlist, policy, envelope, ledger, checkpoints and evidence store are **protected paths**; a diff touching them is `OUT_OF_SCOPE_CHANGE`.
-- **FR-030** Validators MUST run with cwd confined to the workspace (resolved real path), a minimal environment, and no additional permission grants; network isolation is **not enforceable** by the MVP executor and MUST be reported as `network: "not-enforced"`.
+- **FR-029** The allowlist, policy, envelope, ledger, checkpoints and evidence store are **protected paths** (the mandatory set in FR-090 cannot be removed by policy); a diff touching them is `OUT_OF_SCOPE_CHANGE`. Detection only (E2): the changes remain in the working tree and the Harness never rolls back.
+- **FR-030** Validators MUST run with cwd confined to the workspace (resolved real path), a minimal environment, and no additional permission grants. The MVP executor provides **no network isolation and no filesystem sandbox** (E3): a validator can read any file the OS user can read and reach any network the host allows. Status MUST report `network: "not-enforced"` and `filesystem: "cwd-confinement-only"`.
 - **FR-031** Changes to `sensitivePaths` (files that define validator behaviour: test configs, build scripts, `package.json` scripts, test files named by the policy) MUST force the reviewer to give an explicit `verifierTampering` disposition and MAY require a gate, per policy.
 - **FR-032** Validators MUST be re-run for every new subject snapshot; results for an older snapshot MUST NOT satisfy a newer one.
 
@@ -163,7 +164,7 @@ approvals instead of being silently accepted.
 - **FR-033** A `SnapshotIdentity` MUST contain `baseCommit`, a sorted list of per-path entries (`path`, change kind, mode, content sha-256, or tombstone), and `snapshotId = sha256(canonical form)`. It MUST work on an uncommitted working tree.
 - **FR-034** A task's reviewed diff is the delta `taskBaseline → subject`, materialised as a content-addressed artifact whose digest is part of the `ReviewRequest`.
 - **FR-035** Acceptance MUST recompute the snapshot and require equality with the snapshot that was validated **and** reviewed.
-- **FR-036** Snapshot computation MUST exclude Harness-owned paths and VCS-ignored paths, and MUST report (not hide) untracked files.
+- **FR-036** Snapshot computation MUST exclude only Harness-owned paths and the explicitly listed `ignoredExclusions` of the policy; every other VCS-ignored file that exists is **hashed** and tracked (content never copied into patches) per FR-084; untracked files MUST be reported, not hidden.
 
 ### 4.6 Independent review (FR-037 … FR-040)
 
@@ -174,7 +175,7 @@ approvals instead of being silently accepted.
 
 ### 4.7 Remediation (FR-041 … FR-050) — owner Decision 1
 
-- **FR-041** The Harness allows **exactly three** automatic remediation attempts per `(authorizationLineage, taskId)`. The envelope may lower but never raise this ceiling.
+- **FR-041** The Harness allows **exactly three** initial automatic remediation attempts per task (the counter is keyed by `(executionId, taskId)` and each attempt records the envelope lineage that dispatched it, FR-091). The envelope may lower but never raise this number; extra attempts exist only through FR-045 grants.
 - **FR-042** An **attempt** is a remediation dispatch that was durably recorded (pending action + incremented counter in one CAS checkpoint) in response to a blocking finding. The first such dispatch is attempt 1.
 - **FR-043** The counter is persisted in the checkpoint, survives resume, restart and host change, and never decrements.
 - **FR-044** Counting rules for abnormal outcomes are fixed (`contracts/remediation-budget.md` §4): a durably recorded dispatch counts even if the host fails, times out, returns an invalid result, or is abandoned; a dispatch that never became durable (CAS/lock/write failure, authorisation denial, pre-dispatch rejection) does not count; re-presenting the same pending action never counts twice.
@@ -182,7 +183,7 @@ approvals instead of being silently accepted.
 - **FR-046** After attempt 3 is unsuccessful the Harness MUST suspend with `REMEDIATION_BUDGET_EXHAUSTED`; it MUST NOT accept the task and MUST NOT dispatch a fourth attempt without a grant.
 - **FR-047** After every attempt: all affected required validators re-run, then a **new separate review invocation** runs against the new subject snapshot.
 - **FR-048** `CRITICAL` findings, unauthorised operations, business ambiguity and out-of-scope changes MUST suspend immediately and MUST NOT cause a new remediation dispatch (so they never consume an attempt of their own; attempts already counted stay counted).
-- **FR-049** If the set of blocking finding fingerprints after attempt *n* is not a strict reduction of attempt *n−1*'s for two consecutive attempts, the policy `ESCALATE_ON_NO_PROGRESS` (default) suspends early with `NO_PROGRESS`.
+- **FR-049** `NO_PROGRESS` is evaluated exactly as defined in `contracts/remediation-budget.md` §6 (fingerprint normalisation, set comparison, streak). Default: suspend when the streak reaches 2. A policy-defined floor MUST NOT be weakened by an envelope (FR-092).
 - **FR-050** The Harness remediation policy MUST be selected by the Harness workflow preset only; the engine's `MAX_REMEDIATION_ITERATIONS` behaviour for non-Harness executions MUST remain bit-for-bit unchanged.
 
 ### 4.8 Evidence ledger and retention (FR-051 … FR-058)
@@ -200,9 +201,9 @@ approvals instead of being silently accepted.
 
 ### 4.9 Invalidation (FR-061 … FR-064)
 
-- **FR-061** Before every dispatch and before acceptance the controller MUST recompute pinned digests; any mismatch sets the envelope `SUSPENDED_STALE` and returns `PIN_MISMATCH` with the changed artifact names.
+- **FR-061** Before every dispatch and before acceptance the controller MUST recompute every pin **with its artifact-specific canonical digest** (FR-085: structural digests for `tasks.md`, never raw bytes); any mismatch sets the envelope `SUSPENDED_STALE` and returns `PIN_MISMATCH` with the changed artifact names.
 - **FR-062** Policy, allowlist or permitted-operation change ⇒ the whole envelope is invalid; a new revision is required.
-- **FR-063** A changed definition of a task that is not yet accepted ⇒ that task ineligible until the envelope is amended.
+- **FR-063** A changed **structural definition** (text, acceptance criteria, dependencies, gates, markers) of an authorised task that is not yet accepted, or of any task in its dependency closure ⇒ that task is ineligible until the envelope is amended. A checkbox-only change is never a definition change.
 - **FR-064** A changed definition or contract of an **accepted** task ⇒ it stays `ACCEPTED` but flagged `UPSTREAM_CHANGED`; dependents are blocked until a human `UpstreamAcknowledgement` is recorded. Validation and review results are logically invalidated whenever the subject snapshot changes.
 
 ### 4.10 Controller, recovery and continuity (FR-065 … FR-072)
@@ -210,7 +211,7 @@ approvals instead of being silently accepted.
 - **FR-065** Every controller call MUST begin by loading the persisted state and evaluating, in order: persistence health → lock → envelope validity → pending action → suspension → eligibility.
 - **FR-066** If a pending action exists it MUST be resumed through the existing protocol (same `step_id`); an equivalent new action MUST NOT be created.
 - **FR-067** Absence of a host response MUST NOT be treated as success. A pending action older than the envelope's `dispatchTtlMs` MUST cause a `DISPATCH_TIMEOUT` suspension; it MUST NOT be auto-closed or auto-retried.
-- **FR-068** A result failing Harness-level validation is rejected without applying it; the pending action stays; after `maxSubmissionRejections` (default 2) the step is closed unsuccessful and the cycle suspends `RESULT_INVALID`.
+- **FR-068** A result failing Harness-level validation is rejected without applying it; the pending action stays; **the second rejected submission for the same step** (`maxSubmissionRejections` = 2) closes the step unsuccessful and the cycle suspends `RESULT_INVALID`. The first rejection does not suspend.
 - **FR-069** `CHECKPOINT_CONFLICT`, `EXECUTION_LOCKED`, `EXECUTION_LOCK_UNAVAILABLE`, `CHECKPOINT_WRITE_FAILED` MUST each prevent progression, return the existing non-terminal failure code, and leave counters untouched. The controller MUST NOT retry a conflicting call blindly.
 - **FR-070** Recovery MUST be defined and tested for every boundary listed in `contracts/harness-controller.md` §5.
 - **FR-071** `/loop` MAY request another iteration, but each iteration MUST re-enter the controller (FR-065). Correlation uses `(executionId, cycleId, step_id)`; the spec MUST NOT claim exactly-once external effects.
@@ -222,10 +223,44 @@ approvals instead of being silently accepted.
 - **FR-074** Legacy checkpoints MUST load, display status and resume with no write unless the user performs a mutating turn; no silent migration; absent fields are read as empty and never reconstructed.
 - **FR-075** Adopting an existing execution MUST be an explicit human operation (`adoptExecution`) recording the revision at adoption; earlier history is not back-filled.
 - **FR-076** A Harness-enabled execution MUST record `min_engine_version`; a tripwire manifest in the evidence directory detects a checkpoint rewritten by an engine that dropped the block (`HARNESS_STATE_DIVERGED`, fail closed).
-- **FR-077** New contracts MUST stay internal (`src/harness/`, not re-exported from the package root) until Gate D; any subpath export is marked experimental and covered by `public-api-surface` tests.
+- **FR-077** Harness contracts MUST stay **internal** (`src/harness/`). The Gate B vertical slice MUST NOT add exports to the package root, new `exports` subpaths, new `bin`/CLI subcommands, or new public type exports; `package.json` `exports` MUST be byte-identical, proven by test. Any public or subpath exposure requires a separate, explicit owner approval and is not part of Gate B (FR-095).
 - **FR-078** The decision engine, existing presets and existing public types MUST remain source- and behaviour-compatible; the Harness preset is a new, separate preset id.
 
-### 4.12 Out of scope / Non-goals
+### 4.12 Correction-pass requirements (revision 2)
+
+**Enforcement honesty**
+
+- **FR-079** Every rule in the policy and envelope MUST declare an **enforcement class**: **E1** *engine-refused* (the engine will not dispatch/accept/run it: e.g. dispatching an unauthorised task, accepting without validators, running a non-allowlisted validator); **E2** *detected after the fact* (workspace changes outside allowed paths, protected-path edits, new symlinks: detected by diff inspection, acceptance refused, changes stay on disk); **E3** *host- or environment-enforced, otherwise not enforced* (network egress, `git push`/commit, deployment, migrations, database access, reading secrets, any process the agent starts). Specification text, contracts, `status` output and the risk register MUST NOT say an E2 or E3 operation is "prevented" or "blocked"; they say "denied by policy", "detected" or "not enforced by the engine".
+- **FR-080** `OPERATION_NOT_PERMITTED` is raised only from **visible evidence**: an operation declared in the agent result, reported by the host, or detected in the workspace diff. Absence of such evidence is **not** evidence of absence; the status output MUST say operations outside the workspace are unobserved unless the host reports them.
+- **FR-081** The isolated fixture MUST NOT make unnecessary secrets or credentials available to the agent mock or to validator processes: sanitised environment (only allowlisted names), `HOME` and config directories redirected to an empty temporary directory, no credential files (`.npmrc` tokens, SSH keys, cloud credentials) in or reachable by design from the fixture, no real tokens in CI for the fixture job. The fixture MUST plant canary secrets in the runner's environment and assert their absence in every child process and evidence file (SC-008).
+
+**Baseline and snapshot integrity**
+
+- **FR-082** Default baseline policy is `CLEAN_REQUIRED`: at `issueEnvelope` the working tree MUST have no uncommitted changes, tracked or untracked, other than Harness-owned paths; the committed `HarnessPolicy` file MUST be tracked and unmodified (FR-090). Between tasks the baseline of task *n+1* MUST have the same **`treeDigest`** (digest of the whole non-excluded tree, independent of commit) as the accepted subject snapshot of task *n* (chain of custody), or, after a human commit, as the new clean `HEAD` tree with identical content; anything else is `BASELINE_DRIFT` (suspension; no dispatch).
+- **FR-083** A dirty baseline is allowed only if the policy sets `allowDirtyBaseline: true` **and** a human records a `DirtyBaselineApproval` listing every dirty path with its sha-256, change kind, reason and risk class, referencing evidence (the patch against `HEAD` stored as evidence). The approval is part of the envelope pins; the reviewer receives the dirty-baseline file list and patch as context and MUST give a `baselineInfluence` disposition; any change to an approved dirty file, or any new dirty file, is `BASELINE_DRIFT`. No default policy allows it.
+- **FR-084** Ignored files are **not** excluded wholesale. Excluded: Harness-owned paths and the policy's explicit `ignoredExclusions` (for example `node_modules/**`, `dist/**`, cache directories). Every other ignored file that exists is included in `treeDigest` by path + mode + sha-256, its **content is never copied** into patches or evidence (secret risk), and a change to one during a cycle is reported as `IGNORED_FILE_CHANGED` and given to the reviewer as a path+hash change that needs a disposition. Ignored files matching `sensitivePaths` force a gate. Excluded directories are listed in the snapshot as `EXCLUDED_BY_POLICY` with the matching rule, so the exclusion is visible to the reviewer.
+
+**Pinning**
+
+- **FR-085** `tasks.md` is pinned only by **structural digests** computed from the canonical task form defined in `contracts/task-graph.md` §2: per task (id, normalised description and acceptance text, sorted dependencies, sorted gates, sorted markers), excluding checkbox state, line numbers, phase headings and unrelated prose, and including the parser version. The envelope pins `taskDefinitionDigests` (authorised tasks), `dependencyClosureDigests` (transitive dependencies) and `parserVersion`. A parser-version change is `PARSER_VERSION_CHANGED` (re-pin required), never a silent re-digest.
+- **FR-086** Checkbox reconciliation is permitted without invalidation: a diff touching `tasks.md` is allowed **only** if (a) the structural digest of every task is unchanged and (b) the set of toggled checkboxes is a subset of the dispatched task's own checkbox. Anything else is `OUT_OF_SCOPE_CHANGE`. Human checkbox edits outside a cycle never invalidate pins but are still subject to FR-017 reconciliation.
+
+**State coherence and recovery**
+
+- **FR-087** The embedded `harness.cycle.step` is a *refinement* of the engine's `state`/`lifecycle_status`/`pending_action`, not a second orchestrator. The permitted combinations are the **projection table** in `contracts/harness-controller.md` §3a. Any combination outside it ⇒ `FAIL_CLOSED(STATE_INCOHERENT)`, no repair, no counter or event write.
+- **FR-088** The only recovery from `STATE_INCOHERENT` is the human-only `reconcileCycle` operation, which can only move the cycle to `SUSPENDED` (never forward) and records both views as evidence; counters are untouched.
+- **FR-089** A submission for an action that was pending when the envelope became `EXPIRED`, `REVOKED` or `SUSPENDED_STALE` MUST be **refused without being applied** at evaluation step 5 (`ENVELOPE_NOT_ACTIVE` / `PIN_MISMATCH`); the pending action is preserved (`HOLD`) or closed by the human at revocation time (`ABANDON`); only a digest of the refused result is recorded. After a new ACTIVE envelope that still authorises the task with matching pins is issued, the same `step_id` may be submitted again and is validated normally against the actual workspace.
+
+**Policy, limits, matching**
+
+- **FR-090** The `HarnessPolicy` lives at **`.project-run/harness/policy.json`** (tracked configuration, distinct from mutable state in `.project-run/runs/` and `.project-run/evidence/`, which MUST be VCS-ignored). A mandatory protected set (`.project-run/harness/**`, `.project-run/config.json`, `.project-run/workflow.json`, `.project-run/runs/**`, `.project-run/evidence/**`, `.git/**`) is built into the engine and cannot be removed by policy or envelope. Issuance requires the policy file to be tracked and unmodified relative to `HEAD`.
+- **FR-091** Relation of limits: **policy ceiling** (fixed at 3 in the MVP) ≥ **envelope `limit`** (0…ceiling, only lowers) = **initial automatic attempts**; **`RemediationBudgetGrant`** attempts are *additional*, separately recorded human authorisations, never part of policy or envelope, never created by envelope amendment (amendments carry consumption only). Consumption is tracked per `(executionId, taskId)` across all envelope lineages (re-issuing an envelope cannot reset it). A policy cap `maxGrantedAttemptsPerTask` (default 3) bounds cumulative grants.
+- **FR-092** The policy's recurrence setting is a **floor**: an envelope may choose the same or a stricter setting, never a weaker one.
+- **FR-093** Path patterns and candidate paths follow `contracts/path-matching.md` (dialect, normalisation, traversal, symlinks, separators, boundaries, test vectors) for `allowedPaths`, `protectedPaths`, `sensitivePaths`, `ignoredExclusions` and diff inspection.
+- **FR-094** On `win32` the Harness MUST refuse to start (`HARNESS_PLATFORM_UNSUPPORTED`).
+- **FR-095** Exposure of human-only operations, status or any Harness API to hosts or the CLI is **not** part of Gate B (internal functions only); it requires a separate approval at Gate C.
+
+### 4.13 Out of scope / Non-goals
 
 - **NG-1** Parallelism, distributed coordination, cross-machine locks.
 - **NG-2** Worktree/branch management; merge, push, PR, release, publish, deploy, migration.
@@ -235,6 +270,8 @@ approvals instead of being silently accepted.
 - **NG-6** Strong process/model isolation of the reviewer.
 - **NG-7** Network sandboxing of validators.
 - **NG-8** Authenticating human actors.
+- **NG-9** Windows hosts (the Harness fails closed on `win32`, FR-094).
+- **NG-10** Technical prevention of prohibited operations; the MVP only refuses to perform them and detects the subset visible in the workspace (FR-079).
 
 ## 5. Key entities
 
@@ -242,7 +279,7 @@ approvals instead of being silently accepted.
 `DependencyAttestation`, `VerificationProfile`/`ValidatorDefinition`/`ValidatorResult`, `SnapshotIdentity`,
 `ReviewRequest`/`ReviewResult`/`HarnessFinding`, `RemediationBudget`/`RemediationBudgetGrant`,
 `EvidenceReference`/`HarnessEvent`, `HarnessDecision` (`CONTINUE | REMEDIATE | ADVANCE_TASK | SUSPEND | FAIL_CLOSED`),
-`HarnessSuspension`. Fields and invariants: `data-model.md` and `contracts/`.
+`HarnessSuspension`, `DirtyBaselineApproval`, `PathPattern`, `StateProjection`. Fields and invariants: `data-model.md` and `contracts/`.
 
 ## 6. Success criteria (verifiable on the Gate B fixture)
 
@@ -252,7 +289,11 @@ approvals instead of being silently accepted.
 - **SC-004** For every crash point in `contracts/harness-controller.md` §5 a recovery test shows: no fabricated success, no double-count, no duplicate dispatch.
 - **SC-005** The full existing suite (428 tests at baseline) passes unchanged, and a new regression test proves a non-Harness execution reaches identical checkpoints (byte-compared modulo timestamps/ids) before and after the change.
 - **SC-006** No test, fixture or document in this feature touches Incito or Feature 009.
-- **SC-007** Mutating any pinned artifact in the fixture prevents the next dispatch (`PIN_MISMATCH`) in 100 % of the enumerated cases.
+- **SC-007** Mutating any pinned artifact in the fixture prevents the next dispatch (`PIN_MISMATCH`) in 100 % of the enumerated cases, while a checkbox-only change to `tasks.md` leaves every pin valid.
+- **SC-008** In the fixture, canary secrets planted in the test runner's environment and home directory are absent from every agent-mock and validator process environment and from every evidence file (FR-081).
+- **SC-009** 100 % of the path-matching test vectors in `contracts/path-matching.md` §7 pass, including traversal, symlink, separator and boundary cases.
+- **SC-010** Property test: every (`CoordinatorState`, `lifecycle_status`, `pending_action`, `HarnessStep`) combination outside the projection table fails closed with `STATE_INCOHERENT` and writes nothing (FR-087).
+- **SC-011** Package surface unchanged: `package.json` `exports`/`bin`/`files` byte-identical and `src/index.ts` exports unchanged (FR-077).
 
 ## 7. Feature 009 exclusion (unresolved H0 findings, treated as risks)
 
@@ -272,4 +313,4 @@ tree is dirty (including `tasks.md`), so the committed state of Feature 009's T0
 
 ## 9. Open decisions requiring owner input
 
-See `plan.md` §8 (OD-1 … OD-5). None blocks Gate A review; OD-1 blocks Gate B.
+`plan.md` §8: OD-1…OD-9 were all **approved on 2026-10-15**. None remains open.

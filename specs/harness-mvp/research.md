@@ -49,7 +49,7 @@ Simulation (scratchpad, against `dist/`): persistent blocking finding → remedi
 ### D-04 Snapshot / diff identity — *resolves open decision 7*
 **Choice**: `SnapshotIdentity = { baseCommit (HEAD sha), entries[] }`, entries sorted by path: `{path, kind: ADDED|MODIFIED|DELETED|MODE|RENAMED, mode, sha256 | tombstone}`; `snapshotId = sha256(canonical JSON)`. Built from git plumbing with structured argv (`rev-parse`, `status --porcelain=v1 -z --untracked-files=all`, `ls-files`), then hashing file bytes — works on uncommitted trees and does not require a commit.
 **Cycle semantics**: `taskBaseline` snapshot taken at first dispatch of the task; the reviewed diff is `delta(taskBaseline → subject)`, written as a content-addressed artifact; `ReviewRequest` carries `baselineSnapshotId`, `subjectSnapshotId`, `diffDigest`.
-**Pre-existing dirt** (e.g. a dirty consumer tree) is inside the baseline, so only the task's delta is reviewed. Concurrent unrelated edits during a cycle appear in the delta and, if outside allowed paths, trigger `OUT_OF_SCOPE_CHANGE`.
+**Baseline integrity (revised in revision 2)**: the earlier idea of absorbing pre-existing dirty files into the baseline is **withdrawn**: a dirty file can change validator behaviour while never appearing in the reviewed delta. Default is `CLEAN_REQUIRED` (FR-082) with a chain of custody on `treeDigest` between tasks; a dirty baseline needs an explicit, evidence-backed `DirtyBaselineApproval` that the reviewer must address (FR-083). **Ignored files** are not excluded wholesale: only policy-listed `ignoredExclusions` are, everything else is hashed (never copied) and changes are surfaced (FR-084). See D-24.
 **TOCTOU**: acceptance recomputes and compares (FR-035).
 **Rejected**: commit-based identity (not available pre-commit, and the Harness must not commit); mtime-based (unreliable).
 **Limit**: submodules, symlink targets and files above the policy size cap are recorded as opaque (`path`, `lstat` data) and flagged; binary diffs are digest-only (reviewer sees "binary changed").
@@ -64,6 +64,7 @@ Simulation (scratchpad, against `dist/`): persistent blocking finding → remedi
 ### D-06 Approval invalidation on upstream change
 **Choice**: pins in the envelope (policy digest, allowlist digest, per-task definition digests, pinned artifact digests). Recomputed at every boundary. Granularity table: see FR-061..064 and `contracts/authorization-envelope.md` §6.
 **Why fail-closed**: a changed upstream artifact silently re-scoping an approved task is the failure the Harness exists to prevent.
+**Revision 2**: `tasks.md` is pinned by canonical *structural* digests, never raw bytes (D-25), so checkbox reconciliation cannot invalidate or smuggle changes.
 **Rejected**: only pin at issuance and trust afterwards; invalidating everything on any file change (too noisy: unrelated spec edits would stall runs, so only *listed* artifacts are pinned).
 **Drives**: FR-008, FR-061..064.
 
@@ -88,20 +89,20 @@ Per-boundary table in `contracts/harness-controller.md` §5. Principles: (1) the
 
 ### D-11 Validator and snapshot execution port; boundary amendment — **needs owner approval (OD-1)**
 **Problem**: executing validators and computing snapshots needs `node:child_process`, and hashing (snapshot ids, digests, event chain) needs `node:crypto`; `package-boundary.test.ts` allows only `node:fs`/`node:path` in `src/`.
-**Choice (recommended)**: define `ValidatorExecutor` and `SnapshotProvider` as **ports** in the core (types only) and ship the Node implementation in a **separate, explicitly-scoped module** (`src/harness/node/…`, subpath export) whose allowed imports are enumerated in an amended boundary test. The amendment is narrow and test-enforced: `node:crypto` (pure, side-effect free) becomes allowed in core; `node:child_process` is allowed only under `src/harness/node/`; core stays free of process spawning. The controller refuses to start without both ports injected (fail closed).
+**Choice (recommended)**: define `ValidatorExecutor` and `SnapshotProvider` as **ports** in the core (types only) and ship the Node implementation in a **separate, explicitly-scoped module** (`src/harness/node/…`, **internal only, no subpath export** unless separately approved) whose allowed imports are enumerated in an amended boundary test. The amendment is narrow and test-enforced: `node:crypto` (pure, side-effect free) becomes allowed in core; `node:child_process` is allowed only under `src/harness/node/`; core stays free of process spawning. The controller refuses to start without both ports injected (fail closed).
 **Rejected**: (a) host executes validators and reports (violates FR-024: results would be assertions); (b) relaxing the boundary globally.
 
 ### D-12 Critical findings — *resolves open decision 4*
 `CRITICAL` ⇒ immediate suspension, never automatic remediation, no attempt consumed (FR-048).
 
-### D-13 Recurrence / no progress
-`fingerprint = sha256(category | normalised file | violatedCriterion | normalised title)`. Blocking set after attempt *n* not a strict subset-reduction of attempt *n−1* for two consecutive attempts ⇒ `NO_PROGRESS` suspension (default policy). Envelope may set `recurrence: EXHAUST_BUDGET` to disable early escalation. Fingerprints are best-effort heuristics and are documented as such.
+### D-13 Recurrence / no progress (precise in revision 2)
+Defined exactly in `contracts/remediation-budget.md` §6: versioned fingerprint (category | file | criterion | ruleKey, no line numbers, no severity), blocking *set* per attempt, progress iff **proper subset** of the previous set, streak counter, default streak 2. The policy value is a **floor** that an envelope cannot weaken (FR-092). Fingerprints remain heuristic and the contract requires reviewers to supply stable `ruleKey`s.
 
 ### D-14 Reviewer independence claim
 Guaranteed: separate step, separate `reviewInvocationId`, no implementer narrative, own contract, bound to exact diff, `isolationEvidence` recorded. Not guaranteed: process/model isolation or absence of shared hidden state. Host that cannot supply a distinct invocation identity ⇒ policy `requireDistinctInvocationId` (default true) rejects its reviews.
 
-### D-15 Public API compatibility — *resolves open decision 9*
-Contracts remain **internal** until Gate D. If exposed, only through an experimental subpath, never the package root, with `public-api-surface` and consumer-type-fixture tests extended first.
+### D-15 Public API compatibility — *resolves open decision 9 (tightened in revision 2)*
+Contracts remain **internal** (`src/harness/`). The **Gate B slice adds no exports at all**: no root export, no new `exports` subpath, no new `bin`/CLI subcommand, no new public types; `package.json` `exports`/`bin`/`files` stay byte-identical (tested, SC-011). Human-only operations are internal functions at Gate B. Exposure to hosts or the CLI is a separate approval at Gate C; a public/subpath API, if ever wanted, is a separate approval after Gate D with `public-api-surface` and consumer-type fixtures extended first.
 
 ### D-16 Time / cost limits
 Enforceable now: `timeout_ms` per dispatch (existing option), validator timeouts, `dispatchTtlMs`, `maxTaskElapsedMs` (checked at boundaries, not preemptive). Not enforceable: tokens/cost — declared `unsupported` (FR-009).
@@ -122,10 +123,36 @@ Documented as E-1/E-2; the Harness preset ignores the engine's remediation count
 Parse Spec Kit task lines `- [ ] T### [P]? [US#]? description`, `DEPENDS ON T###(, T###)*` clauses and gate markers present in the consumer's existing tasks (e.g. `OWNER GATE`). Anything not matched is ignored and surfaced in a `GraphParseReport` (never guessed). Format drift ⇒ `GRAPH_INVALID`.
 
 ### D-22 Human-only operations
-`issueEnvelope`, `amendEnvelope`, `revokeEnvelope`, `adoptExecution`, `recordGateDecision`, `attestDependency`, `acknowledgeUpstreamChange`, `grantRemediationBudget`, `abandonPendingAction`, `extendPendingAction`, `resumeSuspension`. All take an `actor`, are idempotent on a client-supplied `decisionId`, are recorded as ledger events, and are not exposed through the agent-facing step API.
+`issueEnvelope`, `amendEnvelope`, `revokeEnvelope`, `adoptExecution`, `recordGateDecision`, `attestDependency`, `acknowledgeUpstreamChange`, `grantRemediationBudget`, `abandonPendingAction`, `extendPendingAction`, `resumeSuspension`, `reconcileCycle`, `approveDirtyBaseline`. All take an `actor`, are idempotent on a client-supplied `decisionId`, are recorded as ledger events, and are not exposed through the agent-facing step API.
 
 ## C. Rejected global alternatives
 
 - **Adopt an external agent framework / SDK**: violates NG-3.
 - **Make the Harness a host-side skill only** (instructions to the agent): this is today's weakness (E-4, E-5).
 - **Put task cycles in a second state machine**: duplicates authority (see D-10).
+
+## D. Decisions added in revision 2 (correction pass)
+
+### D-23 Logical enforcement vs technical prevention
+Every rule carries an enforcement class: **E1** engine-refused, **E2** detected after the fact, **E3** not enforced unless host/environment does (FR-079). Text must not say "prevented" for E2/E3. `OPERATION_NOT_PERMITTED` requires visible evidence (FR-080). Human-only operations are logically separated, not authenticated (NG-8). Validators have no network or filesystem isolation (E3). Fixture hygiene: no unnecessary secrets or credentials for agent/validator processes, canary-tested (FR-081, SC-008).
+**Why**: an honest security model is the precondition for relying on any other guarantee. **Rejected**: describing the allowlist or the "prohibited operations" list as sandboxing.
+
+### D-24 Baseline integrity and ignored files
+Clean tree required at issuance; chain of custody on `treeDigest`; dirty baseline only by evidence-backed approval; ignored files hashed unless explicitly excluded; validator side effects on ignored files are reported, not treated as drift (FR-082..084, verification-pipeline §6).
+**Consequence for sequential tasks**: uncommitted accepted work from task *n* is a legitimate baseline for task *n+1* only through the chain-of-custody rule; any out-of-band change is `BASELINE_DRIFT`.
+**Feature 009**: its dirty tree is never a baseline or fixture.
+
+### D-25 Structural pinning of `tasks.md`
+Canonical per-task records (text, acceptance text, sorted deps/gates/markers), `parserVersion`, dependency-closure digests; checkbox state, headings, ordering and unrelated prose excluded. Resolves the whole-file vs per-task conflict: there is **no whole-file digest**. A `tasks.md` diff is acceptable only if no structural digest changed and only the own checkbox toggled (FR-085, FR-086).
+
+### D-26 One source of truth: `HarnessStep` as refinement
+The embedded step refines the engine's `state`/`lifecycle_status`/`pending_action`; the allowed combinations form a closed projection table; anything else fails closed; recovery only by the human `reconcileCycle` (to `SUSPENDED`) (FR-087, FR-088, controller §3a). `TASK_ACCEPTED` is a transient event, not a resting step. A held pending action lives in `harness.cycle.heldAction` because the engine clears `pending_action` on non-awaiting checkpoints.
+
+### D-27 Pending action vs envelope validity
+Evaluation step 6 (envelope validity) precedes step 7 (pending action); a submission against a non-valid envelope is refused and not applied, the action is held or abandoned (revocation chooses), and the same `step_id` becomes valid again only after re-authorisation (FR-089, controller §2a).
+
+### D-28 Policy location and limit relations
+Policy at `.project-run/harness/policy.json`: tracked, next to the already-tracked `.project-run/config.json`, separate from the ignored mutable dirs `runs/` and `evidence/`; must be committed and unmodified at issuance; mandatory protected set built into the engine (FR-090). Limits: policy ceiling 3 ≥ envelope limit (initial attempts) and grants strictly additional separate authorisations, capped cumulatively, consumption shared across lineages (FR-091). Recurrence floor (FR-092). Verified: `.project-run/` is already a tracked config root (`project-config.ts`, `bootstrap.ts`), and `CONSUMER-GUIDE.md` instructs ignoring only `.project-run/runs/`.
+
+### D-29 Path matching
+Closed glob subset, anchored, case-sensitive, POSIX only, validated-not-normalised candidates, deny-wins, symlink and traversal rules, 30 normative vectors (`contracts/path-matching.md`, FR-093, FR-094).

@@ -24,6 +24,9 @@ interface ReviewRequest {
   validatorResults: ValidatorResultSummary[];           // only engine-produced, with log refs (redacted only)
   priorFindings?: HarnessFinding[];                     // for re-review: findings to re-check, status OPEN
   sensitivePathTouches: string[];                       // forces verifierTampering disposition
+  baselineDirtyFiles?: { path: string; sha256: string; patchRef: EvidenceReference }[];  // only with an approved dirty baseline: forces baselineInfluence
+  ignoredFileChanges: { path: string; before?: string; after?: string }[];            // path + hash only, never content
+  excludedByPolicy: { rule: string; sample?: string }[];                              // what was NOT examined
   implementerSummary?: never;                           // excluded in the MVP (default) – bias control
 }
 ```
@@ -39,6 +42,8 @@ interface ReviewResult {
   criteria: { criterionId: string; verdict: "MET" | "NOT_MET" | "NOT_VERIFIABLE"; evidence: EvidenceItem[] }[];
   fileDispositions: { path: string; disposition: "REVIEWED_OK" | "FINDING" | "NOT_APPLICABLE_OPAQUE"; note?: string }[];
   verifierTampering?: { disposition: "NONE_FOUND" | "FINDING"; note: string };
+  baselineInfluence?: { disposition: "NONE_FOUND" | "FINDING"; note: string };   // required iff baselineDirtyFiles present
+  ignoredFileDispositions?: { path: string; disposition: "NO_IMPACT" | "FINDING"; note: string }[];  // required for every ignoredFileChanges entry
   findings: HarnessFinding[];
 }
 ```
@@ -47,7 +52,7 @@ Rejection reasons (result is **not applied**, pending action stays — FR-068): 
 criterion) · `REVIEW_NOT_INDEPENDENT` (reviewer invocation id equals an implementer id, or missing while required) ·
 `CONTRACT_MISMATCH` · `PASS_WITH_BLOCKING_FINDINGS` · `UNKNOWN_FINDING_REFERENCE`.
 A `PASS` is valid iff: all criteria `MET` with evidence, every delta file dispositioned, `verifierTampering` answered when
-required, zero open blocking findings, snapshot/diff echoes match. The engine re-derives `blocking` itself (`blocking` flag from
+required, `baselineInfluence` answered when a dirty baseline was approved, every ignored-file change dispositioned, zero open blocking findings, snapshot/diff echoes match. The engine re-derives `blocking` itself (`blocking` flag from
 the reviewer is advisory input: an open `CRITICAL|HIGH|MEDIUM` finding is blocking unless the existing rules in
 `isFindingBlocking` say otherwise).
 
@@ -59,14 +64,15 @@ interface HarnessFinding extends StructuredFinding {       // id, severity, cate
   evidenceRefs: EvidenceReference[];                       // ≥1 required for blocking findings
   violatedCriterion?: string; violatedContract?: string;   // one of the two is required for blocking findings
   snapshotId: string; reviewer?: { identity: string; logicalVersion: string };
-  fingerprint: string;                                     // engine-computed (D-13)
+  ruleKey?: string;                                        // REQUIRED when blocking: stable key for the rule (remediation-budget.md §6)
+  fingerprint: string;                                     // engine-computed (remediation-budget.md §6), not reviewer-supplied
   preExisting?: boolean;                                   // reviewer claim, needs evidence; never lowers blocking status
   source: "REVIEW" | "VALIDATOR" | "HARNESS";              // HARNESS: result mismatch, out-of-scope, etc.
   firstSeenAttempt: number; lastSeenAttempt: number;
 }
 ```
 Severity vocabulary stays `CRITICAL|HIGH|MEDIUM|LOW|ADVISORY` (existing). Normalisation: unknown severities ⇒ `HIGH` blocking.
-A blocking finding without evidence refs or without a violated criterion/contract is rejected (`REVIEW_INCOMPLETE`), not downgraded.
+A blocking finding without evidence refs, without a violated criterion/contract, or without a `ruleKey` is rejected (`REVIEW_INCOMPLETE`), not downgraded.
 
 ## 5. Findings evaluation (`FINDINGS_EVALUATION`, pure function)
 
@@ -86,4 +92,4 @@ Always a **new** `ReviewRequest` (new invocation id) over the new subject snapsh
 
 ## 7. Test list (H4)
 
-PASS without evidence · PASS for earlier snapshot · PASS missing file disposition · reviewer id == implementer id · blocking finding without evidence · severity normalisation · CRITICAL ⇒ no remediation · fingerprint stable across rewording · NO_PROGRESS after two non-reducing attempts · human disposition does not clear a new-snapshot finding · re-review uses new invocation id · request contains no implementer summary.
+PASS without evidence · PASS for earlier snapshot · PASS missing file disposition · reviewer id == implementer id · blocking finding without evidence · severity normalisation · CRITICAL ⇒ no remediation · fingerprint stable across rewording · NO_PROGRESS per the table tests in remediation-budget.md §6 · missing ruleKey rejected · ignored-file change without disposition ⇒ REVIEW_INCOMPLETE · baselineInfluence required with dirty baseline · human disposition does not clear a new-snapshot finding · re-review uses new invocation id · request contains no implementer summary.
